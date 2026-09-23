@@ -1,5 +1,6 @@
 mod app;
 mod cache;
+mod finder;
 mod layout;
 mod renderer;
 mod sidebar;
@@ -14,9 +15,10 @@ use eframe::egui;
 
 fn main() -> eframe::Result {
     let files: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    finder::install();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("PDF Viewer")
+            .with_title("Lightweight PDF")
             .with_inner_size([960.0, 1080.0])
             .with_min_inner_size([480.0, 360.0])
             .with_fullsize_content_view(true)
@@ -27,7 +29,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "PDF Viewer",
+        "Lightweight PDF",
         options,
         Box::new(|cc| Ok(Box::new(app::App::new(cc, files)))),
     )

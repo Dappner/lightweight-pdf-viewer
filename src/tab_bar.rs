@@ -8,10 +8,13 @@ use eframe::egui::{
 use crate::tab::Tab;
 use crate::theme::Palette;
 
-pub const HEIGHT: f32 = 38.0;
+pub const HEIGHT: f32 = 30.0;
 /// Room for the traffic-light window buttons.
 const LEADING: f32 = 78.0;
-const TAB_TOP: f32 = 6.0;
+/// macOS draws the traffic lights centred ~16pt below the window's top edge; tabs are
+/// centred on the same line so titles, close buttons and `+` align with them.
+const TRAFFIC_LIGHT_CENTER_Y: f32 = 16.0;
+const TAB_TOP: f32 = 2.0 * TRAFFIC_LIGHT_CENTER_Y - HEIGHT;
 const MIN_TAB: f32 = 90.0;
 const MAX_TAB: f32 = 220.0;
 const STATUS_WIDTH: f32 = 130.0;

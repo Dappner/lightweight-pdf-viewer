@@ -7,6 +7,7 @@ use eframe::egui::{
 };
 
 use crate::cache::TextureCache;
+use crate::finder;
 use crate::layout::DocLayout;
 use crate::renderer::{DocId, Key, Output, Renderer};
 use crate::sidebar;
@@ -34,6 +35,7 @@ impl App {
     pub fn new(cc: &eframe::CreationContext, files: Vec<PathBuf>) -> Self {
         // ⌘+/⌘- zoom the document, not the UI.
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        finder::set_context(&cc.egui_ctx);
         let mut app = Self {
             tabs: Vec::new(),
             active: 0,
@@ -271,8 +273,9 @@ impl eframe::App for App {
         self.receive(ctx);
         self.cache.begin_frame();
 
-        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
-        for path in dropped {
+        let mut opened = finder::take();
+        opened.extend(ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect::<Vec<_>>()));
+        for path in opened {
             self.open(ctx, path);
         }
         self.shortcuts(ctx);

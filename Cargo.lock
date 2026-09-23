@@ -994,11 +994,13 @@ dependencies = [
 name = "lightweight-pdf-viewer"
 version = "0.1.0"
 dependencies = [
+ "block2 0.6.2",
  "eframe",
  "egui-wgpu",
  "objc2 0.6.4",
  "objc2-core-foundation",
  "objc2-core-graphics",
+ "objc2-foundation 0.3.2",
  "png",
  "qoi",
  "rfd",
@@ -1378,6 +1380,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
 dependencies = [
  "bitflags 2.13.2",
+ "block2 0.6.2",
  "objc2 0.6.4",
  "objc2-core-foundation",
 ]
