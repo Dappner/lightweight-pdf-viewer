@@ -11,6 +11,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Lightweight PDF")
+            // An empty icon keeps the bundle's icon; otherwise eframe swaps in egui's logo.
+            .with_icon(egui::IconData::default())
             .with_inner_size([960.0, 1080.0])
             .with_min_inner_size([480.0, 360.0])
             .with_fullsize_content_view(true)
