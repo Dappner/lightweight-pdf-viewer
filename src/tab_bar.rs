@@ -1,20 +1,26 @@
 //! Chrome-style tab strip drawn in the (transparent) macOS title bar.
 //!
 //! Tabs shrink to [`MIN_TAB`] and then scroll horizontally (trackpad or wheel over the strip).
-//! Dragging a tab reorders it.
+//! Dragging a tab reorders it. Left of the tabs, a Preview-style button opens a menu of
+//! sidebar and page layout options.
 
 use eframe::egui::{
-    Align2, CornerRadius, CursorIcon, FontId, Id, Painter, Rect, Response, Sense, Stroke, Ui,
-    ViewportCommand, pos2, text::LayoutJob, vec2,
+    Align2, Button, CornerRadius, CursorIcon, FontId, Id, Painter, Popup, Rect, Response, Sense,
+    Stroke, Ui, ViewportCommand, pos2, text::LayoutJob, vec2,
 };
 
+use crate::app::Command;
+use crate::layout::PageLayout;
 use crate::renderer::DocId;
+use crate::sidebar::Mode as SidebarMode;
 use crate::tab::Tab;
 use crate::theme::Palette;
 
 pub const HEIGHT: f32 = 30.0;
 /// Room for the traffic-light window buttons.
 const LEADING: f32 = 78.0;
+/// The view options button between the traffic lights and the tabs.
+const VIEW_BUTTON: f32 = 44.0;
 /// macOS draws the traffic lights centred ~16pt below the window's top edge; tabs are
 /// centred on the same line so titles, close buttons and `+` align with them.
 const TRAFFIC_LIGHT_CENTER_Y: f32 = 16.0;
@@ -22,13 +28,22 @@ const TAB_TOP: f32 = 2.0 * TRAFFIC_LIGHT_CENTER_Y - HEIGHT;
 const MIN_TAB: f32 = 110.0;
 const MAX_TAB: f32 = 220.0;
 const PLUS_WIDTH: f32 = 36.0;
-const STATUS_WIDTH: f32 = 130.0;
+const STATUS_WIDTH: f32 = 150.0;
 
 pub enum Action {
     Select(usize),
     Close(usize),
     Move { from: usize, to: usize },
     Open,
+    Run(Command),
+}
+
+/// What the view options menu shows as checked.
+pub struct ViewMenu {
+    /// `None` while the sidebar is hidden.
+    pub sidebar: Option<SidebarMode>,
+    /// `None` until the active tab has loaded.
+    pub layout: Option<PageLayout>,
 }
 
 /// `scroll` is the strip's horizontal scroll offset, kept by the caller between frames.
@@ -38,6 +53,7 @@ pub fn show(
     active: usize,
     scroll: &mut f32,
     status: Option<String>,
+    view_menu: ViewMenu,
     palette: &Palette,
 ) -> Option<Action> {
     let bar = ui.max_rect();
@@ -54,9 +70,10 @@ pub fn show(
     }
     ui.painter().rect_filled(bar, 0.0, palette.chrome);
 
+    let leading = LEADING + VIEW_BUTTON;
     let area = Rect::from_min_max(
-        pos2(bar.left() + LEADING, bar.top() + TAB_TOP),
-        pos2((bar.right() - STATUS_WIDTH - PLUS_WIDTH).max(bar.left() + LEADING), bar.bottom()),
+        pos2(bar.left() + leading, bar.top() + TAB_TOP),
+        pos2((bar.right() - STATUS_WIDTH - PLUS_WIDTH).max(bar.left() + leading), bar.bottom()),
     );
     let n = tabs.len();
     let tab_width = if n == 0 { 0.0 } else { (area.width() / n as f32).clamp(MIN_TAB, MAX_TAB) };
@@ -122,6 +139,11 @@ pub fn show(
         }
     }
 
+    let button = Rect::from_center_size(pos2(bar.left() + LEADING + VIEW_BUTTON / 2.0 - 4.0, area.center().y), vec2(36.0, 24.0));
+    if let Some(command) = view_button(ui, button, &view_menu, palette) {
+        action = Some(Action::Run(command));
+    }
+
     let painter = ui.painter_at(area);
     for (i, tab) in tabs.iter().enumerate() {
         if dragged.is_some_and(|(d, _)| d == i) {
@@ -168,6 +190,45 @@ pub fn show(
     }
 
     action
+}
+
+/// A sidebar icon with a chevron, like Preview's, that opens the view options.
+fn view_button(ui: &mut Ui, rect: Rect, menu: &ViewMenu, palette: &Palette) -> Option<Command> {
+    let response = ui.interact(rect, ui.id().with("view_menu"), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
+    let open = Popup::is_id_open(ui.ctx(), Popup::default_response_id(&response));
+    let painter = ui.painter();
+    if response.hovered() || open {
+        painter.rect_filled(rect, CornerRadius::same(6), palette.hover);
+    }
+    let stroke = Stroke::new(1.3, palette.text_weak);
+    let icon = Rect::from_center_size(rect.center() - vec2(5.0, 0.0), vec2(15.0, 12.0));
+    painter.rect_stroke(icon, CornerRadius::same(2), stroke, eframe::egui::StrokeKind::Inside);
+    painter.line_segment([pos2(icon.left() + 5.0, icon.top()), pos2(icon.left() + 5.0, icon.bottom())], stroke);
+    let chevron = pos2(icon.right() + 7.0, rect.center().y);
+    painter.line_segment([chevron + vec2(-3.0, -1.5), chevron + vec2(0.0, 1.5)], stroke);
+    painter.line_segment([chevron + vec2(0.0, 1.5), chevron + vec2(3.0, -1.5)], stroke);
+
+    let mut chosen = None;
+    Popup::menu(&response).width(170.0).show(|ui| {
+        let mut item = |ui: &mut Ui, label: &str, checked: bool, enabled: bool, command: Command| {
+            if ui.add_enabled(enabled, Button::selectable(checked, label)).clicked() {
+                chosen = Some(command);
+            }
+        };
+        let sidebar = menu.sidebar;
+        let hide = if sidebar.is_some() { "Hide Sidebar" } else { "Show Sidebar" };
+        item(ui, hide, false, true, Command::ToggleSidebar);
+        item(ui, "Pages", sidebar == Some(SidebarMode::Pages), true, Command::ShowSidebar(SidebarMode::Pages));
+        item(ui, "Outline", sidebar == Some(SidebarMode::Outline), true, Command::ShowSidebar(SidebarMode::Outline));
+        ui.separator();
+        for (label, layout) in
+            [("Single Page", PageLayout::Single), ("Two Pages", PageLayout::TwoPages), ("Book", PageLayout::Book)]
+        {
+            let loaded = menu.layout.is_some();
+            item(ui, label, menu.layout == Some(layout), loaded, Command::SetLayout(layout));
+        }
+    });
+    chosen
 }
 
 fn close_rect(tab: Rect) -> Rect {

@@ -10,7 +10,7 @@ use crate::cache::TextureCache;
 use crate::config::Config;
 use crate::finder;
 use crate::history::{self, History};
-use crate::layout::DocLayout;
+use crate::layout::{DocLayout, PageLayout};
 use crate::menu;
 use crate::quick_open::{Outcome, QuickOpen};
 use crate::renderer::{DocId, Key, Output, Renderer, Target};
@@ -18,7 +18,7 @@ use crate::sidebar::{self, Mode as SidebarMode};
 use crate::tab::{DocState, Snapshot, Tab};
 use crate::tab_bar::{self, Action};
 use crate::theme::{Palette, palette};
-use crate::view::{Canvas, Wants, fit_width_zoom};
+use crate::view::{Canvas, MAX_ZOOM, MIN_ZOOM, Wants, fit_width_zoom};
 
 /// Seconds a tab you switched away from keeps its tiles, so flipping straight back is sharp.
 const PARK_SECONDS: f64 = 3.0;
@@ -77,6 +77,10 @@ pub enum Command {
     ToggleSidebar,
     /// Switches the sidebar between page thumbnails and the outline.
     ToggleOutline,
+    /// Shows the sidebar with thumbnails or the outline.
+    ShowSidebar(SidebarMode),
+    /// Lays out the active tab's pages one per row or as spreads.
+    SetLayout(PageLayout),
     ZoomIn,
     ZoomOut,
     ZoomToFit,
@@ -172,7 +176,8 @@ impl App {
         let id = self.next_id;
         self.next_id += 1;
         self.renderer.open(id, path.clone());
-        self.tabs.push(Tab::new(id, path));
+        let restore = self.history.place(&path);
+        self.tabs.push(Tab::new(id, path, restore));
         self.activate(ctx, self.tabs.len() - 1);
     }
 
@@ -189,6 +194,9 @@ impl App {
     fn activate(&mut self, ctx: &Context, index: usize) {
         // Returning to the parked tab within the grace period: its tiles are still cached.
         let returning = self.parked.is_some_and(|(doc, _)| doc == self.tabs[index].id);
+        if index != self.active {
+            self.remember(self.active);
+        }
         if index != self.active
             && let Some(old) = self.tabs.get_mut(self.active)
         {
@@ -237,6 +245,7 @@ impl App {
                 && let DocState::Ready(layout) = &tab.doc
                 && tab.view.zoom > 0.0
             {
+                self.history.remember(&tab.path, tab.view.place(layout), history::now());
                 // The tiles go once the snapshot that replaces them arrives (see `receive`).
                 self.renderer.snapshot(tab.view.snapshot_job(layout, tab.id, ctx.pixels_per_point()));
                 self.sleep = Sleep::Falling;
@@ -265,7 +274,19 @@ impl App {
         }
     }
 
+    /// Saves where tab `index` is left, so reopening the file brings you back to it.
+    fn remember(&mut self, index: usize) {
+        let Some(tab) = self.tabs.get(index) else { return };
+        if let DocState::Ready(layout) = &tab.doc
+            && tab.view.zoom > 0.0
+            && layout.page_count() > 0
+        {
+            self.history.remember(&tab.path, tab.view.place(layout), history::now());
+        }
+    }
+
     fn close(&mut self, ctx: &Context, index: usize) {
+        self.remember(index);
         let tab = self.tabs.remove(index);
         self.renderer.forget(tab.id);
         self.cache.evict_doc(tab.id);
@@ -297,8 +318,19 @@ impl App {
             match output {
                 Output::Opened { doc, result } => {
                     if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == doc) {
+                        let restore = tab.restore.take();
                         tab.doc = match result {
-                            Ok(sizes) => DocState::Ready(DocLayout::new(sizes)),
+                            Ok(sizes) => {
+                                let layout = DocLayout::new(sizes, restore.map(|p| p.layout).unwrap_or_default());
+                                if let Some(place) = restore
+                                    && place.page < layout.page_count()
+                                {
+                                    tab.view.zoom = place.zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+                                    tab.view.render_zoom = tab.view.zoom;
+                                    tab.view.go_to_place(&layout, place.page, place.y);
+                                }
+                                DocState::Ready(layout)
+                            }
                             Err(e) => DocState::Failed(e),
                         };
                     }
@@ -360,6 +392,8 @@ impl App {
                 SidebarMode::Pages => SidebarMode::Outline,
                 SidebarMode::Outline => SidebarMode::Pages,
             }),
+            Command::ShowSidebar(mode) => self.set_sidebar_mode(mode),
+            Command::SetLayout(mode) => self.set_layout(ctx, mode),
             Command::ZoomIn | Command::ZoomOut | Command::ZoomToFit => self.zoom(ctx, command),
             Command::Quit => ctx.send_viewport_cmd(ViewportCommand::Close),
         }
@@ -422,6 +456,24 @@ impl App {
         }
     }
 
+    fn set_layout(&mut self, ctx: &Context, mode: PageLayout) {
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        let DocState::Ready(layout) = &mut tab.doc else { return };
+        if tab.view.zoom == 0.0 || layout.mode() == mode {
+            return;
+        }
+        tab.view.set_layout(layout, mode, ctx.input(|i| i.time));
+        tab.snapshot_texture = None;
+    }
+
+    /// The active tab's page layout, once it has loaded.
+    fn layout(&self) -> Option<PageLayout> {
+        match &self.tabs.get(self.active)?.doc {
+            DocState::Ready(layout) => Some(layout.mode()),
+            _ => None,
+        }
+    }
+
     fn zoom(&mut self, ctx: &Context, command: Command) {
         let Some(tab) = self.tabs.get_mut(self.active) else { return };
         let DocState::Ready(layout) = &tab.doc else { return };
@@ -468,6 +520,9 @@ impl App {
                 (cmd, KeyCode::Plus, Command::ZoomIn),
                 (cmd, KeyCode::Minus, Command::ZoomOut),
                 (cmd, KeyCode::Num0, Command::ZoomToFit),
+                (cmd | Modifiers::ALT, KeyCode::Num1, Command::SetLayout(PageLayout::Single)),
+                (cmd | Modifiers::ALT, KeyCode::Num2, Command::SetLayout(PageLayout::TwoPages)),
+                (cmd | Modifiers::ALT, KeyCode::Num3, Command::SetLayout(PageLayout::Book)),
             ];
             let mut commands: Vec<Command> =
                 bindings.into_iter().filter(|(m, k, _)| i.consume_key(*m, *k)).map(|(_, _, c)| c).collect();
@@ -519,11 +574,15 @@ impl App {
             if i.consume_key(none, KeyCode::ArrowDown) {
                 view.scroll_by(vec2(0.0, LINE_SCROLL));
             }
+            // From the row at the top, by a whole spread when pages are side by side. Several
+            // rows can fit on screen, so stepping from the current (middle) one would skip some.
             if i.consume_key(none, KeyCode::ArrowLeft) {
-                view.go_to_page(layout, view.current_page.saturating_sub(1));
+                let top = view.place(layout).page;
+                view.go_to_page(layout, layout.spread(top).start.saturating_sub(1));
             }
             if i.consume_key(none, KeyCode::ArrowRight) {
-                view.go_to_page(layout, view.current_page + 1);
+                let top = view.place(layout).page;
+                view.go_to_page(layout, layout.spread(top).end);
             }
         });
     }
@@ -549,18 +608,24 @@ impl App {
     fn status(&self) -> Option<String> {
         let tab = self.tabs.get(self.active)?;
         let DocState::Ready(layout) = &tab.doc else { return None };
-        Some(format!(
-            "{} / {}   {:.0}%",
-            tab.view.current_page + 1,
-            layout.page_count(),
-            tab.view.zoom * 100.0
-        ))
+        let spread = layout.spread(tab.view.current_page);
+        let pages = match spread.len() {
+            1 => format!("{}", spread.start + 1),
+            _ => format!("{}–{}", spread.start + 1, spread.end),
+        };
+        Some(format!("{pages} / {}   {:.0}%", layout.page_count(), tab.view.zoom * 100.0))
     }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.ui(ctx);
+    }
+
+    fn on_exit(&mut self) {
+        for i in 0..self.tabs.len() {
+            self.remember(i);
+        }
     }
 }
 
@@ -578,6 +643,7 @@ impl App {
         for path in opened {
             self.open(ctx, path);
         }
+        menu::set_layout(self.layout());
         for command in menu::take() {
             self.run(ctx, command);
         }
@@ -601,7 +667,8 @@ impl App {
             .show_separator_line(false)
             .show(ctx, |ui| {
                 let status = self.status();
-                tab_bar::show(ui, &self.tabs, self.active, &mut self.tab_scroll, status, &palette)
+                let view_menu = tab_bar::ViewMenu { sidebar: self.sidebar.then_some(self.sidebar_mode), layout: self.layout() };
+                tab_bar::show(ui, &self.tabs, self.active, &mut self.tab_scroll, status, view_menu, &palette)
             })
             .inner;
         match bar {
@@ -609,6 +676,7 @@ impl App {
             Some(Action::Close(i)) => self.close(ctx, i),
             Some(Action::Move { from, to }) => self.move_tab(from, to),
             Some(Action::Open) => self.open_dialog(ctx),
+            Some(Action::Run(command)) => self.run(ctx, command),
             None => {}
         }
 
@@ -640,10 +708,8 @@ impl App {
             if !ctx.input(|i| i.pointer.any_down()) {
                 self.sidebar_resized(ctx, panel.response.rect.width());
             }
-            match panel.inner {
-                Some(sidebar::Action::GoTo(target)) => self.follow(target),
-                Some(sidebar::Action::SetMode(mode)) => self.set_sidebar_mode(mode),
-                None => {}
+            if let Some(target) = panel.inner {
+                self.follow(target);
             }
         }
 

@@ -9,7 +9,8 @@ use eframe::egui::{
 };
 
 use crate::cache::TextureCache;
-use crate::layout::{DocLayout, MARGIN};
+use crate::history::Place;
+use crate::layout::{DocLayout, MARGIN, PageLayout};
 use crate::renderer::{DocId, Key, Link, SnapshotJob, SnapshotPage, TILE, Target, page_pixels, scale_key};
 use crate::tab::View;
 
@@ -43,7 +44,7 @@ pub fn snapshot_scale(pixels_per_point: f32) -> f32 {
 }
 
 pub fn fit_width_zoom(layout: &DocLayout, viewport_width: f32) -> f32 {
-    ((viewport_width - 2.0 * MARGIN) / layout.max_width()).clamp(MIN_ZOOM, MAX_ZOOM)
+    layout.fit_width(viewport_width).clamp(MIN_ZOOM, MAX_ZOOM)
 }
 
 impl View {
@@ -60,7 +61,7 @@ impl View {
         }
         let base = self.pending_offset.unwrap_or(self.offset);
         let point = base + anchor;
-        let page = layout.page_at(point.y, self.zoom);
+        let page = layout.page_near(point.to_pos2(), self.zoom, self.content_width(layout, self.zoom));
         let old_rect = layout.page_rect(page, self.zoom, self.content_width(layout, self.zoom));
         let in_page = (point - old_rect.min.to_vec2()) / self.zoom;
         let new_rect = layout.page_rect(page, zoom, self.content_width(layout, zoom));
@@ -92,6 +93,37 @@ impl View {
         if let (Some(y), Some(offset)) = (y, self.pending_offset.as_mut()) {
             offset.y += MARGIN + y * layout.page_size(page.min(layout.page_count() - 1)).y * self.zoom;
         }
+    }
+
+    /// Where the reader is: the first page of the top row, and how far down it the top of the
+    /// viewport is. A row scrolled to with [`Self::go_to_page`] counts as the top one even
+    /// though the margin above it is showing. Only meaningful once the zoom is set.
+    pub fn place(&self, layout: &DocLayout) -> Place {
+        let y = self.pending_offset.unwrap_or(self.offset).y + MARGIN;
+        let page = layout.page_at(y, self.zoom);
+        let rect = layout.page_rect(page, self.zoom, self.content_width(layout, self.zoom));
+        Place { layout: layout.mode(), page, y: ((y - rect.top()) / rect.height()).clamp(0.0, 1.0), zoom: self.zoom }
+    }
+
+    /// Scrolls back to a [`Self::place`].
+    pub fn go_to_place(&mut self, layout: &DocLayout, page: usize, y: f32) {
+        self.go_to_point(layout, page, Some(y));
+        if let Some(offset) = self.pending_offset.as_mut() {
+            offset.y = (offset.y - MARGIN).max(0.0);
+        }
+    }
+
+    /// Rearranges the pages, fitting the new rows to the window and keeping the page at the
+    /// top of the viewport in place.
+    pub fn set_layout(&mut self, layout: &mut DocLayout, mode: PageLayout, now: f64) {
+        if mode == layout.mode() || layout.page_count() == 0 {
+            return;
+        }
+        let place = self.place(layout);
+        layout.set_mode(mode);
+        self.zoom = fit_width_zoom(layout, self.viewport.width());
+        self.zoom_changed_at = now;
+        self.go_to_place(layout, place.page, place.y);
     }
 
     /// Describes the current viewport so the worker can render it into a snapshot.
@@ -321,4 +353,28 @@ fn tiles(
             (Key::Tile { doc, page: page as u32, scale, tx, ty }, rect)
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn places_round_trip() {
+        let layout = DocLayout::new(vec![vec2(612.0, 792.0); 9], PageLayout::Book);
+        for offset in [0.0, 300.0, 1234.5] {
+            let mut view = View { zoom: 0.8, offset: vec2(0.0, offset), ..View::default() };
+            let place = view.place(&layout);
+            view.go_to_place(&layout, place.page, place.y);
+            assert!((view.pending_offset.unwrap().y - offset).abs() < 0.01, "offset {offset}");
+        }
+    }
+
+    #[test]
+    fn a_row_scrolled_to_is_the_top_one() {
+        let layout = DocLayout::new(vec![vec2(612.0, 792.0); 9], PageLayout::Book);
+        let mut view = View { zoom: 0.8, ..View::default() };
+        view.go_to_page(&layout, 3);
+        assert_eq!(view.place(&layout).page, 3);
+    }
 }

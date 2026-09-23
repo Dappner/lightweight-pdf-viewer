@@ -1,4 +1,5 @@
-//! Sidebar (toggled with ⌘B): page thumbnails or the document outline.
+//! Sidebar (toggled with ⌘B): page thumbnails or the document outline, picked from the view
+//! menu in the tab bar.
 
 use std::collections::HashSet;
 
@@ -15,7 +16,7 @@ use crate::theme::Palette;
 use crate::view::Wants;
 
 pub const DEFAULT_WIDTH: f32 = 160.0;
-/// Narrow enough to keep the Pages/Outline switch readable.
+/// Narrow enough to keep thumbnails and outline titles readable.
 pub const MIN_WIDTH: f32 = 150.0;
 pub const MAX_WIDTH: f32 = 480.0;
 /// Space either side of a thumbnail.
@@ -23,18 +24,12 @@ const THUMB_INSET: f32 = 26.0;
 const LABEL_HEIGHT: f32 = 22.0;
 const SPACING: f32 = 12.0;
 const PADDING: f32 = 12.0;
-const HEADER: f32 = 36.0;
 const OUTLINE_ROW: f32 = 24.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     Pages,
     Outline,
-}
-
-pub enum Action {
-    GoTo(Target),
-    SetMode(Mode),
 }
 
 pub fn clamp_width(width: f32) -> f32 {
@@ -67,40 +62,16 @@ pub fn show(
     failed: &HashSet<Key>,
     wants: &mut Wants,
     palette: &Palette,
-) -> Option<Action> {
+) -> Option<Target> {
     // Keep scroll bars clear of the panel's resize handle. Otherwise the two fight over the
     // pointer (the bar widens when hovered) and the cursor flickers.
     let interaction = &ui.style().interaction;
     ui.spacing_mut().scroll.bar_outer_margin = interaction.resize_grab_radius_side + interaction.interact_radius;
-    let switched = mode_switch(ui, mode, palette).map(Action::SetMode);
-    let clicked = match mode {
+    match mode {
         Mode::Pages => thumbnails(ui, doc, layout, view, thumb_px, cache, failed, wants, palette)
             .map(|page| Target::Page { page: page as u32, y: None }),
         Mode::Outline => outline_list(ui, doc, outline, view.current_page, palette),
-    };
-    switched.or(clicked.map(Action::GoTo))
-}
-
-/// "Pages | Outline" segmented control.
-fn mode_switch(ui: &mut Ui, mode: Mode, palette: &Palette) -> Option<Mode> {
-    let (header, _) = ui.allocate_exact_size(vec2(ui.available_width(), HEADER), Sense::hover());
-    let track = Rect::from_center_size(header.center(), vec2(136.0, 24.0));
-    ui.painter().rect_filled(track, CornerRadius::same(7), palette.chrome);
-    let mut chosen = None;
-    for (i, (label, option)) in [("Pages", Mode::Pages), ("Outline", Mode::Outline)].into_iter().enumerate() {
-        let half = Rect::from_min_size(track.min + vec2(i as f32 * track.width() / 2.0, 0.0), vec2(track.width() / 2.0, track.height()));
-        let response = ui.interact(half, ui.id().with(("sidebar_mode", i)), Sense::click());
-        let selected = option == mode;
-        if selected {
-            ui.painter().rect_filled(half.shrink(2.0), CornerRadius::same(5), palette.separator);
-        }
-        let color = if selected || response.hovered() { palette.text } else { palette.text_weak };
-        ui.painter().text(half.center(), Align2::CENTER_CENTER, label, FontId::proportional(12.0), color);
-        if response.clicked() && !selected {
-            chosen = Some(option);
-        }
     }
-    chosen
 }
 
 fn outline_list(
@@ -222,7 +193,7 @@ fn thumbnails(
             let th = thumb_height(tw, layout.page_size(page));
             let thumb = Rect::from_min_size(pos2(center_x - tw / 2.0, origin.y + top), vec2(tw, th));
             let item = Rect::from_min_max(pos2(ui.max_rect().left(), thumb.top()), pos2(ui.max_rect().right(), thumb.bottom() + LABEL_HEIGHT));
-            let selected = page == view.current_page;
+            let selected = layout.spread(view.current_page).contains(&page);
             let painter = ui.painter();
 
             if selected {

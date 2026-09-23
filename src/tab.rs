@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use eframe::egui::{Rect, TextureHandle, Vec2};
 
+use crate::history::Place;
 use crate::layout::DocLayout;
 use crate::renderer::{DocId, Link, OutlineEntry};
 
@@ -27,6 +28,8 @@ pub struct Tab {
     /// Loaded the first time the outline is shown.
     pub outline: Option<Vec<OutlineEntry>>,
     pub outline_requested: bool,
+    /// Where the file was left last time, applied once it loads.
+    pub restore: Option<Place>,
 }
 
 pub struct Snapshot {
@@ -53,7 +56,7 @@ pub struct View {
 }
 
 impl Tab {
-    pub fn new(id: DocId, path: PathBuf) -> Self {
+    pub fn new(id: DocId, path: PathBuf, restore: Option<Place>) -> Self {
         let title = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -69,6 +72,7 @@ impl Tab {
             links: HashMap::new(),
             outline: None,
             outline_requested: false,
+            restore,
         }
     }
 }

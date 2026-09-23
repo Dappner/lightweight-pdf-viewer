@@ -2,13 +2,14 @@
 //! `~/Library/Application Support/Lightweight PDF/history.json`.
 //!
 //! Each file has a score that halves every [`HALF_LIFE`] and grows by one per open, so files
-//! opened often and lately rank first.
+//! opened often and lately rank first. Each file also remembers where you left it.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::{support_file, write_atomically};
+use crate::layout::PageLayout;
 
 const HALF_LIFE: f64 = 5.0 * 24.0 * 60.0 * 60.0;
 /// The lowest-ranked files are forgotten past this many.
@@ -27,6 +28,19 @@ struct Entry {
     score: f64,
     /// Unix seconds when `score` was last brought up to date.
     updated: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    place: Option<Place>,
+}
+
+/// Where a file was left: how its pages were laid out and what was on screen.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Place {
+    pub layout: PageLayout,
+    /// The page at the top of the window.
+    pub page: usize,
+    /// How far down `page` the top of the window was, 0 = its top and 1 = its bottom.
+    pub y: f32,
+    pub zoom: f32,
 }
 
 impl Entry {
@@ -54,11 +68,26 @@ impl History {
                 entry.score = entry.score_at(now) + 1.0;
                 entry.updated = now;
             }
-            None => self.entries.push(Entry { path: path.to_path_buf(), score: 1.0, updated: now }),
+            None => self.entries.push(Entry { path: path.to_path_buf(), score: 1.0, updated: now, place: None }),
         }
         if self.entries.len() > MAX_ENTRIES {
             self.sort(now);
             self.entries.truncate(MAX_ENTRIES);
+        }
+        self.save();
+    }
+
+    /// Where `path` was left, if it has been open before.
+    pub fn place(&self, path: &Path) -> Option<Place> {
+        self.entries.iter().find(|e| e.path == path)?.place
+    }
+
+    /// Records where `path` was left. Doesn't count as opening it.
+    pub fn remember(&mut self, path: &Path, place: Place, now: u64) {
+        match self.entries.iter_mut().find(|e| e.path == path) {
+            Some(entry) if entry.place == Some(place) => return,
+            Some(entry) => entry.place = Some(place),
+            None => self.entries.push(Entry { path: path.to_path_buf(), score: 0.0, updated: now, place: Some(place) }),
         }
         self.save();
     }
@@ -132,7 +161,12 @@ mod tests {
         h.visit(Path::new("/a.pdf"), 5);
         h.visit(Path::new("/b.pdf"), 5);
         h.visit(Path::new("/b.pdf"), 5);
-        assert_eq!(names(&History::load_from(path.clone()), 5), ["/b.pdf", "/a.pdf"]);
+        let place = Place { layout: PageLayout::Book, page: 12, y: 0.25, zoom: 1.5 };
+        h.remember(Path::new("/a.pdf"), place, 6);
+        let loaded = History::load_from(path.clone());
+        assert_eq!(names(&loaded, 5), ["/b.pdf", "/a.pdf"]);
+        assert_eq!(loaded.place(Path::new("/a.pdf")), Some(place));
+        assert_eq!(loaded.place(Path::new("/b.pdf")), None);
         let _ = std::fs::remove_file(path);
     }
 }

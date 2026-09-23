@@ -7,8 +7,10 @@ use eframe::egui::{
 use lightweight_pdf_viewer::{app::App, config::Config, history::History};
 
 /// Tab geometry for a 1000pt-wide window with two tabs (see `tab_bar.rs`): tabs start at
-/// x = 78 and are 220pt wide; the strip's vertical centre is y = 16.
-const SECOND_TAB: Pos2 = pos2(78.0 + 220.0 + 110.0, 16.0);
+/// x = 122 (after the traffic lights and view button) and are 220pt wide; the strip's
+/// vertical centre is y = 16.
+const FIRST_TAB: Pos2 = pos2(122.0 + 110.0, 16.0);
+const SECOND_TAB: Pos2 = pos2(122.0 + 220.0 + 110.0, 16.0);
 const EMPTY_STRIP: Pos2 = pos2(700.0, 16.0);
 
 struct Harness {
@@ -68,8 +70,8 @@ fn starts_window_drag(commands: &[ViewportCommand]) -> bool {
 fn clicking_a_tab_selects_it() {
     let mut h = Harness::new();
     assert_eq!(h.app.stats().active, 1, "the last opened tab starts active");
-    h.button(pos2(78.0 + 110.0, 16.0), true);
-    let commands = h.button(pos2(78.0 + 110.0, 16.0), false);
+    h.button(FIRST_TAB, true);
+    let commands = h.button(FIRST_TAB, false);
     assert_eq!(h.app.stats().active, 0);
     assert!(!starts_window_drag(&commands));
 }
