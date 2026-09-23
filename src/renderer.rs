@@ -5,8 +5,8 @@
 //! touching a different document closes the previous one, which frees its per-document
 //! caches (decoded images, fonts, parsed content streams). CoreGraphics keeps every page it
 //! has drawn in that cache until the document is released, so a document is also closed
-//! once it has drawn [`PAGES_PER_OPEN`] distinct pages, and reopened (in a millisecond or
-//! two) on its next job.
+//! once it has drawn a set number of distinct pages (see [`crate::memory::Tuning::pages_per_open`]), and
+//! reopened in a millisecond or two on its next job.
 //!
 //! The UI replaces the whole render queue every frame with what it currently wants, so
 //! work for pages that scrolled out of view is dropped without explicit cancellation.
@@ -27,10 +27,6 @@ use objc2_foundation::NSURL;
 use objc2_pdf_kit::{PDFActionGoTo, PDFActionURL, PDFDestination, PDFDocument, PDFOutline};
 
 pub type DocId = u64;
-
-/// Distinct pages a document may draw before it is closed to release CoreGraphics' cache of
-/// them (about 0.3 MB per page for a typical textbook, and far more for scanned pages).
-const PAGES_PER_OPEN: usize = 16;
 
 /// Tile edge length in physical pixels.
 pub const TILE: u32 = 512;
@@ -183,12 +179,13 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn spawn(ctx: egui::Context) -> Self {
+    /// `pages_per_open`: see [`crate::memory::Tuning::pages_per_open`].
+    pub fn spawn(ctx: egui::Context, pages_per_open: usize) -> Self {
         let shared = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
         let worker_shared = shared.clone();
         std::thread::Builder::new()
             .name("pdf-render".into())
-            .spawn(move || worker(&worker_shared, &ctx))
+            .spawn(move || worker(&worker_shared, &ctx, pages_per_open))
             .expect("spawn render thread");
         Self { shared }
     }
@@ -247,7 +244,7 @@ struct OpenDoc {
     pages: HashSet<u32>,
 }
 
-fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context) {
+fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context, pages_per_open: usize) {
     let mut open: Option<OpenDoc> = None;
 
     loop {
@@ -306,7 +303,7 @@ fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context) {
             };
             if let Some(o) = &mut open {
                 o.pages.extend(pages.iter().flatten());
-                if pages.is_none() || o.pages.len() > std::env::var("DIAG_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(PAGES_PER_OPEN) {
+                if pages.is_none() || o.pages.len() > pages_per_open {
                     open = None;
                 }
             }
@@ -586,29 +583,6 @@ mod tests {
     }
 
     /// Headless render check: `RENDER_TEST_PDF=<pdf> RENDER_TEST_OUT=<dir> cargo test`.
-    #[test]
-    fn diag_open_cost() {
-        let Ok(list) = std::env::var("DIAG_PDFS") else { return };
-        for pdf in list.split('|') {
-            for round in 0..3 {
-                let t = std::time::Instant::now();
-                let d = open_document(std::path::Path::new(pdf)).unwrap();
-                let t_open = t.elapsed();
-                let page = get_page(&d.cg, 500).unwrap();
-                let t_page = t.elapsed();
-                let n = CGPDFDocument::number_of_pages(Some(&d.cg));
-                let t2 = std::time::Instant::now();
-                for i in 0..n { let _ = get_page(&d.cg, i as u32).map(|p| PageGeometry::of(&p).size()); }
-                let t_sizes = t2.elapsed();
-                let g = PageGeometry::of(&page);
-                let t3 = std::time::Instant::now();
-                render_key(&page, &g, Key::Tile { doc: 0, page: 500, scale: 512, tx: 0, ty: 0 });
-                let t_render = t3.elapsed();
-                println!("DIAG {round} open {:?} first page {:?} all sizes {:?} tile {:?} {}", t_open, t_page, t_sizes, t_render, pdf.rsplit('/').next().unwrap());
-            }
-        }
-    }
-
     #[test]
     fn renders_tiles_thumbs_and_snapshots() {
         let (Ok(pdf), Ok(out)) = (std::env::var("RENDER_TEST_PDF"), std::env::var("RENDER_TEST_OUT")) else {

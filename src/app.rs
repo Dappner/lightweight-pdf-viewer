@@ -20,8 +20,6 @@ use crate::tab_bar::{self, Action};
 use crate::theme::{Palette, palette};
 use crate::view::{Canvas, Wants, fit_width_zoom};
 
-/// GPU budget for rendered tiles and thumbnails, shared by every tab.
-const TEXTURE_BUDGET: usize = 64 * 1024 * 1024;
 /// Seconds a tab you switched away from keeps its tiles, so flipping straight back is sharp.
 const PARK_SECONDS: f64 = 3.0;
 const ZOOM_STEP: f32 = 1.25;
@@ -33,6 +31,8 @@ pub struct App {
     next_id: DocId,
     renderer: Renderer,
     cache: TextureCache,
+    /// Screen heights rendered ahead of the visible area (see [`crate::memory::Tuning`]).
+    prefetch: f32,
     failed: HashSet<Key>,
     config: Config,
     history: History,
@@ -88,12 +88,14 @@ impl App {
         // ⌘+/⌘- zoom the document, not the UI.
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
         finder::set_context(ctx);
+        let tuning = config.memory.tuning();
         let mut app = Self {
             tabs: Vec::new(),
             active: 0,
             next_id: 0,
-            renderer: Renderer::spawn(ctx.clone()),
-            cache: TextureCache::new(TEXTURE_BUDGET),
+            renderer: Renderer::spawn(ctx.clone(), tuning.pages_per_open),
+            cache: TextureCache::new(tuning.texture_budget),
+            prefetch: tuning.prefetch,
             failed: HashSet::new(),
             thumb_px: sidebar::thumb_width_px(config.sidebar_width, ctx.pixels_per_point()),
             config,
@@ -605,6 +607,7 @@ impl App {
                         failed: &self.failed,
                         links: &tab.links,
                         thumb_px: self.thumb_px,
+                        prefetch: self.prefetch,
                         page_border: palette.page_border,
                     }
                     .show(ui, &mut wants);
@@ -629,7 +632,14 @@ impl App {
 
         self.save_tabs();
         self.renderer.set_wanted(wants.into_queue());
-        self.cache.trim();
+        // A parked tab that has lost tiles to the budget would come back with holes, so it
+        // gives up the rest and shows its snapshot when switched back to instead.
+        if let Some((parked, _)) = self.parked
+            && self.cache.trim().contains(&parked)
+        {
+            self.cache.evict_doc(parked);
+            self.parked = None;
+        }
     }
 }
 

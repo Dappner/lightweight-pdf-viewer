@@ -66,9 +66,11 @@ impl TextureCache {
         self.retain(|k| k.doc() != doc);
     }
 
-    pub fn trim(&mut self) {
+    /// Evicts down to the budget; returns the documents that lost entries.
+    pub fn trim(&mut self) -> Vec<DocId> {
+        let mut evicted = Vec::new();
         if self.bytes <= self.budget {
-            return;
+            return evicted;
         }
         let mut candidates: Vec<(u64, Key)> = self
             .entries
@@ -83,8 +85,10 @@ impl TextureCache {
             }
             if let Some(e) = self.entries.remove(&key) {
                 self.bytes -= e.bytes;
+                evicted.push(key.doc());
             }
         }
+        evicted
     }
 
     pub fn bytes(&self) -> usize {

@@ -10,7 +10,7 @@ Most PDF apps are heavy. This one does one thing: shows PDFs, quickly and cheapl
 
 - **Tabs.** Keep a stack of PDFs open in one window.
 - **Idle tabs cost almost nothing.** When you switch away from a tab, it keeps a small compressed snapshot of what was on screen and closes the document. Switching back shows the snapshot straight away while the pages redraw.
-- **Light on memory.** Rendered pages share one fixed 64 MB GPU budget across all tabs. Only the pages on screen are rendered.
+- **Light on memory.** Rendered pages share one fixed GPU budget across all tabs, and only the pages near the screen are rendered. Pages you have scrolled past are let go instead of piling up, so memory stays flat however long you read.
 - **Light on CPU.** Nothing redraws unless something changes. Pages are drawn with macOS's built-in PDF engine, the same one Preview uses.
 - **Native.** Real macOS menu bar, Finder "Open With", drag and drop.
 
@@ -38,6 +38,14 @@ Open PDFs with ⌘O, by dragging them onto the window, or from Finder. Drag the 
 
 The app reopens the tabs you had open last time. Settings live in `~/Library/Application Support/Lightweight PDF/config.json`; set `"restore_tabs": false` there to start empty instead.
 
+`"memory"` trades memory for speed. It takes effect the next time the app starts:
+
+| Setting | Keeps | Good for |
+| --- | --- | --- |
+| `"low"` | Only what's on screen. Flipping back to a tab shows its snapshot for a moment while it redraws. | Macs short on memory |
+| `"balanced"` (default) | A few screens of pages, and the last tab for a few seconds after you leave it. | Most people |
+| `"fast"` | More rendered pages, and more of each document parsed. Uses several times the memory. | Plenty of free memory |
+
 | Shortcut | Action |
 | --- | --- |
 | ⌘O | Open |
@@ -58,6 +66,8 @@ A headless benchmark opens real PDFs through the app and reports speed and memor
 ```sh
 cargo bench --bench session -- a.pdf b.pdf
 ```
+
+Set `BENCH_MEMORY=low|balanced|fast` to pick the memory setting and `BENCH_PPP=2` for Retina.
 
 ## Requirements
 

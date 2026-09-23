@@ -1,9 +1,11 @@
 use std::path::PathBuf;
 
 use eframe::egui;
-use lightweight_pdf_viewer::{app::App, config::Config, finder, history::History, menu, titlebar};
+use lightweight_pdf_viewer::{app::App, config::Config, finder, history::History, memory, menu, titlebar};
 
 fn main() -> eframe::Result {
+    let config = Config::load();
+    memory::relaunch(config.memory);
     let files: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
     finder::install();
     let options = eframe::NativeOptions {
@@ -24,7 +26,7 @@ fn main() -> eframe::Result {
         Box::new(|cc| {
             menu::install(&cc.egui_ctx);
             titlebar::install();
-            Ok(Box::new(App::new(&cc.egui_ctx, Config::load(), History::load(), files)))
+            Ok(Box::new(App::new(&cc.egui_ctx, config, History::load(), files)))
         }),
     )
 }

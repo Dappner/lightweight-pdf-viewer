@@ -131,6 +131,8 @@ pub struct Canvas<'a> {
     pub links: &'a HashMap<u32, Vec<Link>>,
     /// Width of the sidebar's thumbnails, drawn as placeholders until tiles arrive.
     pub thumb_px: u32,
+    /// Screen heights rendered ahead, above and below the visible area.
+    pub prefetch: f32,
     pub page_border: Color32,
 }
 
@@ -142,7 +144,7 @@ pub struct CanvasOutput {
 
 impl Canvas<'_> {
     pub fn show(self, ui: &mut Ui, wants: &mut Wants) -> CanvasOutput {
-        let Canvas { doc, layout, view, snapshot, cache, failed, links, thumb_px, page_border } = self;
+        let Canvas { doc, layout, view, snapshot, cache, failed, links, thumb_px, prefetch, page_border } = self;
         let ppp = ui.ctx().pixels_per_point();
         let now = ui.input(|i| i.time);
         let area = ui.available_rect_before_wrap();
@@ -184,7 +186,7 @@ impl Canvas<'_> {
             let origin = ui.max_rect().min.to_vec2();
             let painter = ui.painter();
             let screen_viewport = viewport.translate(origin);
-            let prefetch = screen_viewport.expand2(vec2(0.0, viewport.height() * 0.5));
+            let prefetch = screen_viewport.expand2(vec2(0.0, viewport.height() * prefetch));
 
             if let Some(texture) = snapshot.as_ref() {
                 let size = Vec2::from(texture.size().map(|v| v as f32)) / snapshot_scale(ppp);

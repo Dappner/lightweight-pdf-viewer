@@ -7,6 +7,7 @@ pub mod config;
 pub mod finder;
 pub mod history;
 mod layout;
+pub mod memory;
 pub mod menu;
 mod quick_open;
 mod renderer;

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::memory::Memory;
 use crate::sidebar;
 
 #[derive(Serialize, Deserialize)]
@@ -15,6 +16,8 @@ pub struct Config {
     /// The tabs open when the app last changed them, and which one was active.
     pub tabs: Vec<PathBuf>,
     pub active_tab: usize,
+    /// How much to keep in memory to make scrolling and going back fast.
+    pub memory: Memory,
     /// Where the settings are saved; `None` keeps them in memory only (tests, benchmarks).
     #[serde(skip)]
     path: Option<PathBuf>,
@@ -27,6 +30,7 @@ impl Default for Config {
             restore_tabs: true,
             tabs: Vec::new(),
             active_tab: 0,
+            memory: Memory::default(),
             path: None,
         }
     }

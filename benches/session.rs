@@ -3,13 +3,15 @@
 //!
 //!   cargo bench --bench session -- a.pdf b.pdf [...]
 //!
-//! Environment: BENCH_PPP (pixels per point, default 1 = non-Retina), BENCH_SIZE
-//! (window size in points, default 1000x1000), BENCH_BREAKDOWN=1 prints `footprint`'s
-//! per-category breakdown after each phase.
+//! Environment: BENCH_MEMORY (memory preset: low, balanced or fast; default balanced),
+//! BENCH_PPP (pixels per point, default 1 = non-Retina), BENCH_SIZE (window size in points,
+//! default 1000x1000), BENCH_BREAKDOWN=1 prints `footprint`'s per-category breakdown after
+//! each phase.
 //!
 //! Memory is the process footprint without a window: GPU textures are not allocated, so
 //! the "textures" column reports what they would occupy on the GPU. A windowed app adds a
-//! roughly fixed ~35 MB (Metal, swapchain) on top.
+//! roughly fixed ~35 MB (Metal, swapchain) on top. Each phase ends with its CPU time (all
+//! threads) and the peak footprint seen during it, sampled every frame.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -20,6 +22,7 @@ use eframe::egui::{
 use lightweight_pdf_viewer::app::{App, Stats};
 use lightweight_pdf_viewer::config::Config;
 use lightweight_pdf_viewer::history::History;
+use lightweight_pdf_viewer::memory::{self, Memory};
 
 const TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -30,6 +33,9 @@ struct Harness {
     size: Vec2,
     ppp: f32,
     events: Vec<Event>,
+    /// Highest footprint seen since the phase began.
+    peak: f64,
+    phase_cpu: f64,
 }
 
 impl Harness {
@@ -47,6 +53,16 @@ impl Harness {
         let app = &mut self.app;
         // The output (including texture uploads) is dropped: there is no GPU.
         let _ = self.ctx.run(raw, |ctx| app.ui(ctx));
+        self.peak = self.peak.max(footprint_mb());
+    }
+
+    fn begin_phase(&mut self) {
+        self.peak = footprint_mb();
+        self.phase_cpu = cpu_seconds();
+    }
+
+    fn end_phase(&self) {
+        println!("  cpu {:.2} s   peak footprint {:.1} MB", cpu_seconds() - self.phase_cpu, self.peak);
     }
 
     fn stats(&self) -> Stats {
@@ -107,6 +123,14 @@ fn footprint_mb() -> f64 {
     info.ri_phys_footprint as f64 / 1_048_576.0
 }
 
+/// User plus system CPU time of the whole process, in seconds.
+fn cpu_seconds() -> f64 {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) }, 0, "getrusage failed");
+    let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    secs(usage.ru_utime) + secs(usage.ru_stime)
+}
+
 /// The largest memory categories of this process, from macOS's `footprint` tool.
 fn breakdown(phase: &str) {
     if std::env::var_os("BENCH_BREAKDOWN").is_none() {
@@ -139,6 +163,11 @@ fn summary(mut samples: Vec<Duration>) -> String {
 }
 
 fn main() {
+    let preset: Memory = std::env::var("BENCH_MEMORY")
+        .map(|v| serde_json::from_value(serde_json::Value::String(v)).expect("BENCH_MEMORY: low, balanced or fast"))
+        .unwrap_or_default();
+    // Like the app, so the allocator behaves as it would there.
+    memory::relaunch(preset);
     let files: Vec<PathBuf> =
         std::env::args().skip(1).filter(|a| !a.starts_with("--")).map(PathBuf::from).collect();
     if files.is_empty() {
@@ -153,13 +182,17 @@ fn main() {
         .unwrap_or(Vec2::new(1000.0, 1000.0));
 
     let ctx = egui::Context::default();
-    let app = App::new(&ctx, Config::default(), History::default(), Vec::new());
-    let mut h = Harness { ctx, app, start: Instant::now(), size, ppp, events: Vec::new() };
+    let mut config = Config::default();
+    config.memory = preset;
+    let app = App::new(&ctx, config, History::default(), Vec::new());
+    let mut h = Harness { ctx, app, start: Instant::now(), size, ppp, events: Vec::new(), peak: 0.0, phase_cpu: 0.0 };
     h.frame();
-    println!("viewport {}x{} pt @ {ppp}x\n", size.x, size.y);
+    let malloc = std::env::var("MallocSpaceEfficient").map_or("default".into(), |v| format!("MallocSpaceEfficient={v}"));
+    println!("memory preset {preset:?} ({malloc}), viewport {}x{} pt @ {ppp}x\n", size.x, size.y);
     println!("startup footprint: {:.1} MB (no window)\n", footprint_mb());
 
     println!("{:<34} {:>6} {:>14} {:>10} {:>10} {:>11}", "open", "pages", "to sharp ms", "footprint", "textures", "snapshots");
+    h.begin_phase();
     for (i, file) in files.iter().enumerate() {
         let t = Instant::now();
         h.app.open(&h.ctx, file.clone());
@@ -177,10 +210,12 @@ fn main() {
         );
     }
     h.idle(Duration::from_millis(300));
+    h.end_phase();
     breakdown("after opening");
 
     if files.len() > 1 {
         println!("\ntab switching (ms: p50 / p95 / max; \"covered\" = something drawn on the first frame)");
+        h.begin_phase();
         let mut rapid = Vec::new();
         let mut covered = 0;
         let n = 40;
@@ -220,18 +255,13 @@ fn main() {
         }
         h.idle(Duration::from_millis(300));
         println!("  footprint over 100 more switches: {before:.1} -> {:.1} MB", footprint_mb());
-        if std::env::var_os("DIAG_SWITCHHEAP").is_some() {
-            let out = std::process::Command::new("heap").args(["-s", &std::process::id().to_string()]).output().unwrap();
-            for l in String::from_utf8_lossy(&out.stdout).lines().filter(|l| l.contains("zones:") || l.contains("footprint") ).take(4) { eprintln!("SH {l}"); }
-            for l in String::from_utf8_lossy(&out.stdout).lines().skip_while(|l| !l.contains("COUNT")).take(25) { eprintln!("SH {l}"); }
-            let out = std::process::Command::new("vmmap").args(["--summary", &std::process::id().to_string()]).output().unwrap();
-            for l in String::from_utf8_lossy(&out.stdout).lines().filter(|l| l.contains("Malloc") || l.contains("DefaultMalloc") || l.contains("TOTAL")) { eprintln!("SV {l}"); }
-        }
+        h.end_phase();
     }
 
     println!("\nscrolling the active document page by page");
     h.press(Key::Home, Modifiers::NONE);
     h.wait(|s| s.ready);
+    h.begin_phase();
     let mut steps = Vec::new();
     let mut peak = 0;
     // Pages taller than the viewport take several steps; stop if the page stops advancing.
@@ -248,23 +278,6 @@ fn main() {
         h.wait(|s| s.ready);
         steps.push(t.elapsed());
         peak = peak.max(h.stats().texture_bytes);
-        if steps.len() % 100 == 0 { eprintln!("DIAG step {} page {} footprint {:.1}", steps.len(), h.stats().current_page, footprint_mb()); if steps.len() % 300 == 0 { let out = std::process::Command::new("footprint").arg(std::process::id().to_string()).output().unwrap(); for l in String::from_utf8_lossy(&out.stdout).lines().take(14) { eprintln!("FP {l}"); } } }
-    }
-    {
-        unsafe extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; }
-        let before = footprint_mb();
-        let freed = unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
-        eprintln!("DIAG relief: {before:.1} -> {:.1} MB (released {:.1} MB)", footprint_mb(), freed as f64 / 1048576.0);
-    }
-    {
-        let out = std::process::Command::new("vmmap").args(["--summary", &std::process::id().to_string()]).output().unwrap();
-        let t = String::from_utf8_lossy(&out.stdout);
-        let mut on = false;
-        for l in t.lines() { if l.contains("MALLOC ZONE") { on = true; } if on { eprintln!("VM {l}"); } }
-    }
-    if std::env::var_os("DIAG_HEAP").is_some() {
-        let out = std::process::Command::new("malloc_history").args([&std::process::id().to_string(), "-allBySize"]).output().unwrap();
-        for l in String::from_utf8_lossy(&out.stdout).lines() { eprintln!("HEAP {l}"); }
     }
     println!(
         "  {} steps, to sharp {}   peak textures {:.1} MB   footprint {:.1} MB",
@@ -273,9 +286,11 @@ fn main() {
         mb(peak),
         footprint_mb()
     );
+    h.end_phase();
     breakdown("after scrolling");
 
     println!("\nzoom (includes the 150 ms settle delay before re-rendering)");
+    h.begin_phase();
     let mut zooms = Vec::new();
     for _ in 0..3 {
         h.press(Key::Equals, Modifiers::COMMAND);
@@ -290,4 +305,5 @@ fn main() {
         mb(h.stats().texture_bytes),
         footprint_mb()
     );
+    h.end_phase();
 }

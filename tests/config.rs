@@ -200,3 +200,15 @@ fn quick_open_reopens_a_recent_file() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn memory_preset_is_read_from_the_config_file() {
+    use lightweight_pdf_viewer::memory::Memory;
+
+    let dir = temp_dir("memory");
+    let config = dir.join("config.json");
+    assert_eq!(Config::load_from(config.clone()).memory, Memory::Balanced, "defaults to balanced");
+    std::fs::write(&config, r#"{ "memory": "low" }"#).unwrap();
+    assert_eq!(Config::load_from(config).memory, Memory::Low);
+    let _ = std::fs::remove_dir_all(dir);
+}
