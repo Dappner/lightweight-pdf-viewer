@@ -75,6 +75,8 @@ impl View {
     pub fn scroll_by(&mut self, delta: Vec2) {
         let base = self.pending_offset.unwrap_or(self.offset);
         self.pending_offset = Some((base + delta).max(Vec2::ZERO));
+        // Scrolling leaves the page navigated to; the most visible one becomes current.
+        self.landed_page = None;
     }
 
     pub fn go_to_page(&mut self, layout: &DocLayout, page: usize) {
