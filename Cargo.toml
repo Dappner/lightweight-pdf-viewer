@@ -1,0 +1,23 @@
+[package]
+name = "lightweight-pdf-viewer"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.33.3", default-features = false, features = ["wgpu", "default_fonts"] }
+# Only the Metal backend (eframe's defaults would also pull in GL/Vulkan backends).
+egui-wgpu = { version = "0.33.3", default-features = false, features = ["macos-window-resize-jitter-fix"] }
+objc2 = { version = "0.6.4", default-features = false, features = ["std"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFURL", "CFCGTypes"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGPDFDocument", "CGPDFPage", "CGContext", "CGBitmapContext", "CGColorSpace", "CGImage", "CGAffineTransform"] }
+qoi = "0.4.1"
+rfd = "0.17.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[dev-dependencies]
+png = "0.18.1"
