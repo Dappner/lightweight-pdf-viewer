@@ -11,7 +11,6 @@ use eframe::egui::{
 use crate::cache::TextureCache;
 use crate::layout::{DocLayout, MARGIN};
 use crate::renderer::{DocId, Key, Link, SnapshotJob, SnapshotPage, TILE, Target, page_pixels, scale_key};
-use crate::sidebar;
 use crate::tab::View;
 
 pub const MIN_ZOOM: f32 = 0.1;
@@ -130,6 +129,8 @@ pub struct Canvas<'a> {
     pub failed: &'a HashSet<Key>,
     /// Link annotations of the pages loaded so far.
     pub links: &'a HashMap<u32, Vec<Link>>,
+    /// Width of the sidebar's thumbnails, drawn as placeholders until tiles arrive.
+    pub thumb_px: u32,
     pub page_border: Color32,
 }
 
@@ -141,7 +142,7 @@ pub struct CanvasOutput {
 
 impl Canvas<'_> {
     pub fn show(self, ui: &mut Ui, wants: &mut Wants) -> CanvasOutput {
-        let Canvas { doc, layout, view, snapshot, cache, failed, links, page_border } = self;
+        let Canvas { doc, layout, view, snapshot, cache, failed, links, thumb_px, page_border } = self;
         let ppp = ui.ctx().pixels_per_point();
         let now = ui.input(|i| i.time);
         let area = ui.available_rect_before_wrap();
@@ -177,7 +178,6 @@ impl Canvas<'_> {
 
         let scale = scale_key(view.render_zoom * ppp);
         let prev_scale = view.prev_render_zoom.map(|z| scale_key(z * ppp)).filter(|s| *s != scale);
-        let thumb_width = sidebar::thumb_width_px(ppp);
 
         let output = scroll.show_viewport(ui, |ui, viewport| {
             ui.set_min_size(content);
@@ -207,7 +207,7 @@ impl Canvas<'_> {
                 if visible {
                     if snapshot.is_none() {
                         painter.rect_filled(rect, 0.0, Color32::WHITE);
-                        let thumb = Key::Thumb { doc, page: page as u32, width: thumb_width };
+                        let thumb = Key::Thumb { doc, page: page as u32, width: thumb_px };
                         if let Some(id) = cache.peek(&thumb) {
                             painter.image(id, rect, UV, Color32::WHITE);
                         }

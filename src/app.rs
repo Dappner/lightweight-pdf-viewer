@@ -7,6 +7,7 @@ use eframe::egui::{
 };
 
 use crate::cache::TextureCache;
+use crate::config::Config;
 use crate::finder;
 use crate::layout::DocLayout;
 use crate::menu;
@@ -31,8 +32,12 @@ pub struct App {
     renderer: Renderer,
     cache: TextureCache,
     failed: HashSet<Key>,
+    config: Config,
     sidebar: bool,
     sidebar_mode: SidebarMode,
+    /// Pixel width thumbnails are rendered at. Follows the sidebar's width once a resize
+    /// ends, so dragging stretches the existing thumbnails instead of re-rendering them.
+    thumb_px: u32,
     tab_scroll: f32,
     /// The last tab switched away from, whose tiles are kept until this time.
     parked: Option<(DocId, f64)>,
@@ -72,7 +77,7 @@ pub struct Stats {
 }
 
 impl App {
-    pub fn new(ctx: &Context, files: Vec<PathBuf>) -> Self {
+    pub fn new(ctx: &Context, config: Config, files: Vec<PathBuf>) -> Self {
         // ⌘+/⌘- zoom the document, not the UI.
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
         finder::set_context(ctx);
@@ -83,16 +88,40 @@ impl App {
             renderer: Renderer::spawn(ctx.clone()),
             cache: TextureCache::new(TEXTURE_BUDGET),
             failed: HashSet::new(),
+            thumb_px: sidebar::thumb_width_px(config.sidebar_width, ctx.pixels_per_point()),
+            config,
             sidebar: true,
             sidebar_mode: SidebarMode::Pages,
             tab_scroll: 0.0,
             parked: None,
             visible_ready: false,
         };
+        if app.config.restore_tabs {
+            let saved: Vec<PathBuf> = app.config.tabs.iter().filter(|p| p.exists()).cloned().collect();
+            let active = app.config.tabs.get(app.config.active_tab).cloned();
+            for file in saved {
+                app.open(ctx, file);
+            }
+            if let Some(i) = active.and_then(|path| app.tabs.iter().position(|t| t.path == path)) {
+                app.activate(ctx, i);
+            }
+        }
         for file in files {
             app.open(ctx, file);
         }
         app
+    }
+
+    /// Records the open tabs in the config, so the next launch can reopen them.
+    fn save_tabs(&mut self) {
+        let tabs: Vec<PathBuf> =
+            self.tabs.iter().filter(|t| !matches!(t.doc, DocState::Failed(_))).map(|t| t.path.clone()).collect();
+        let active = self.tabs.get(self.active).and_then(|a| tabs.iter().position(|p| *p == a.path)).unwrap_or(0);
+        if tabs != self.config.tabs || active != self.config.active_tab {
+            self.config.tabs = tabs;
+            self.config.active_tab = active;
+            self.config.save();
+        }
     }
 
     pub fn open(&mut self, ctx: &Context, path: PathBuf) {
@@ -260,6 +289,20 @@ impl App {
         self.sidebar = true;
         self.sidebar_mode = mode;
         if mode == SidebarMode::Outline {
+            self.cache.retain(|k| !matches!(k, Key::Thumb { .. }));
+        }
+    }
+
+    /// Saves a new sidebar width and re-renders thumbnails to match it.
+    fn sidebar_resized(&mut self, ctx: &Context, width: f32) {
+        let width = sidebar::clamp_width(width.round());
+        if width != self.config.sidebar_width {
+            self.config.sidebar_width = width;
+            self.config.save();
+        }
+        let thumb_px = sidebar::thumb_width_px(width, ctx.pixels_per_point());
+        if thumb_px != self.thumb_px {
+            self.thumb_px = thumb_px;
             self.cache.retain(|k| !matches!(k, Key::Thumb { .. }));
         }
     }
@@ -466,9 +509,10 @@ impl App {
             && let Some(tab) = self.tabs.get_mut(self.active)
             && let DocState::Ready(layout) = &tab.doc
         {
-            let action = SidePanel::left("sidebar")
-                .exact_width(sidebar::WIDTH)
-                .resizable(false)
+            let panel = SidePanel::left("sidebar")
+                .default_width(self.config.sidebar_width)
+                .width_range(sidebar::MIN_WIDTH..=sidebar::MAX_WIDTH)
+                .resizable(true)
                 .frame(content_frame)
                 .show(ctx, |ui| {
                     sidebar::show(
@@ -478,14 +522,17 @@ impl App {
                         layout,
                         &mut tab.view,
                         tab.outline.as_deref(),
+                        self.thumb_px,
                         &mut self.cache,
                         &self.failed,
                         &mut wants,
                         &palette,
                     )
-                })
-                .inner;
-            match action {
+                });
+            if !ctx.input(|i| i.pointer.any_down()) {
+                self.sidebar_resized(ctx, panel.response.rect.width());
+            }
+            match panel.inner {
                 Some(sidebar::Action::GoTo(target)) => self.follow(target),
                 Some(sidebar::Action::SetMode(mode)) => self.set_sidebar_mode(mode),
                 None => {}
@@ -513,6 +560,7 @@ impl App {
                         cache: &mut self.cache,
                         failed: &self.failed,
                         links: &tab.links,
+                        thumb_px: self.thumb_px,
                         page_border: palette.page_border,
                     }
                     .show(ui, &mut wants);
@@ -526,6 +574,7 @@ impl App {
             self.follow(target);
         }
 
+        self.save_tabs();
         self.renderer.set_wanted(wants.into_queue());
         self.cache.trim();
     }

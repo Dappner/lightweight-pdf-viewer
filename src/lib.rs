@@ -3,6 +3,7 @@
 
 pub mod app;
 mod cache;
+pub mod config;
 pub mod finder;
 mod layout;
 pub mod menu;

@@ -18,6 +18,7 @@ use eframe::egui::{
     self, Event, Key, Modifiers, RawInput, Rect, Vec2, ViewportId, ViewportInfo, pos2,
 };
 use lightweight_pdf_viewer::app::{App, Stats};
+use lightweight_pdf_viewer::config::Config;
 
 const TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -151,7 +152,7 @@ fn main() {
         .unwrap_or(Vec2::new(1000.0, 1000.0));
 
     let ctx = egui::Context::default();
-    let app = App::new(&ctx, Vec::new());
+    let app = App::new(&ctx, Config::default(), Vec::new());
     let mut h = Harness { ctx, app, start: Instant::now(), size, ppp, events: Vec::new() };
     h.frame();
     println!("viewport {}x{} pt @ {ppp}x\n", size.x, size.y);

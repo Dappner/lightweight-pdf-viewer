@@ -14,8 +14,12 @@ use crate::tab::View;
 use crate::theme::Palette;
 use crate::view::Wants;
 
-pub const WIDTH: f32 = 160.0;
-const THUMB_WIDTH: f32 = 108.0;
+pub const DEFAULT_WIDTH: f32 = 160.0;
+/// Narrow enough to keep the Pages/Outline switch readable.
+pub const MIN_WIDTH: f32 = 150.0;
+pub const MAX_WIDTH: f32 = 480.0;
+/// Space either side of a thumbnail.
+const THUMB_INSET: f32 = 26.0;
 const LABEL_HEIGHT: f32 = 22.0;
 const SPACING: f32 = 12.0;
 const PADDING: f32 = 12.0;
@@ -33,12 +37,21 @@ pub enum Action {
     SetMode(Mode),
 }
 
-pub fn thumb_width_px(pixels_per_point: f32) -> u32 {
-    (THUMB_WIDTH * pixels_per_point).round() as u32
+pub fn clamp_width(width: f32) -> f32 {
+    width.clamp(MIN_WIDTH, MAX_WIDTH)
 }
 
-fn thumb_height(size: eframe::egui::Vec2) -> f32 {
-    (THUMB_WIDTH * size.y / size.x).min(THUMB_WIDTH * 2.0)
+fn thumb_width(sidebar_width: f32) -> f32 {
+    sidebar_width - 2.0 * THUMB_INSET
+}
+
+/// Pixel width thumbnails are rendered at for a sidebar this wide.
+pub fn thumb_width_px(sidebar_width: f32, pixels_per_point: f32) -> u32 {
+    (thumb_width(sidebar_width) * pixels_per_point).round() as u32
+}
+
+fn thumb_height(width: f32, size: eframe::egui::Vec2) -> f32 {
+    (width * size.y / size.x).min(width * 2.0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -49,14 +62,19 @@ pub fn show(
     layout: &DocLayout,
     view: &mut View,
     outline: Option<&[OutlineEntry]>,
+    thumb_px: u32,
     cache: &mut TextureCache,
     failed: &HashSet<Key>,
     wants: &mut Wants,
     palette: &Palette,
 ) -> Option<Action> {
+    // Keep scroll bars clear of the panel's resize handle. Otherwise the two fight over the
+    // pointer (the bar widens when hovered) and the cursor flickers.
+    let interaction = &ui.style().interaction;
+    ui.spacing_mut().scroll.bar_outer_margin = interaction.resize_grab_radius_side + interaction.interact_radius;
     let switched = mode_switch(ui, mode, palette).map(Action::SetMode);
     let clicked = match mode {
-        Mode::Pages => thumbnails(ui, doc, layout, view, cache, failed, wants, palette)
+        Mode::Pages => thumbnails(ui, doc, layout, view, thumb_px, cache, failed, wants, palette)
             .map(|page| Target::Page { page: page as u32, y: None }),
         Mode::Outline => outline_list(ui, doc, outline, view.current_page, palette),
     };
@@ -159,25 +177,26 @@ fn outline_list(
     clicked
 }
 
-/// Returns the page the user clicked, if any.
+/// Returns the page the user clicked, if any. Thumbnails are drawn at the sidebar's width
+/// from textures `thumb_px` wide, which lags behind while the sidebar is being resized.
 #[allow(clippy::too_many_arguments)]
 fn thumbnails(
     ui: &mut Ui,
     doc: DocId,
     layout: &DocLayout,
     view: &mut View,
+    thumb_px: u32,
     cache: &mut TextureCache,
     failed: &HashSet<Key>,
     wants: &mut Wants,
     palette: &Palette,
 ) -> Option<usize> {
-    let ppp = ui.ctx().pixels_per_point();
-    let width_px = thumb_width_px(ppp);
+    let tw = thumb_width(ui.available_width());
     let mut tops = Vec::with_capacity(layout.page_count() + 1);
     let mut y = PADDING;
     for page in 0..layout.page_count() {
         tops.push(y);
-        y += thumb_height(layout.page_size(page)) + LABEL_HEIGHT + SPACING;
+        y += thumb_height(tw, layout.page_size(page)) + LABEL_HEIGHT + SPACING;
     }
     let content_height = y + PADDING;
     let follow = view.sidebar_page != Some(view.current_page);
@@ -191,7 +210,7 @@ fn thumbnails(
         let first = tops.partition_point(|t| *t <= viewport.top()).saturating_sub(1);
 
         if follow && let Some(&top) = tops.get(view.current_page) {
-            let height = thumb_height(layout.page_size(view.current_page)) + LABEL_HEIGHT;
+            let height = thumb_height(tw, layout.page_size(view.current_page)) + LABEL_HEIGHT;
             let rect = Rect::from_min_size(pos2(origin.x, origin.y + top), vec2(1.0, height));
             ui.scroll_to_rect(rect, None);
         }
@@ -200,8 +219,8 @@ fn thumbnails(
             if top > viewport.bottom() {
                 break;
             }
-            let th = thumb_height(layout.page_size(page));
-            let thumb = Rect::from_min_size(pos2(center_x - THUMB_WIDTH / 2.0, origin.y + top), vec2(THUMB_WIDTH, th));
+            let th = thumb_height(tw, layout.page_size(page));
+            let thumb = Rect::from_min_size(pos2(center_x - tw / 2.0, origin.y + top), vec2(tw, th));
             let item = Rect::from_min_max(pos2(ui.max_rect().left(), thumb.top()), pos2(ui.max_rect().right(), thumb.bottom() + LABEL_HEIGHT));
             let selected = page == view.current_page;
             let painter = ui.painter();
@@ -210,7 +229,7 @@ fn thumbnails(
                 painter.rect_filled(thumb.expand(4.0), CornerRadius::same(5), palette.separator);
             }
             painter.rect_filled(thumb, 0.0, Color32::WHITE);
-            let key = Key::Thumb { doc, page: page as u32, width: width_px };
+            let key = Key::Thumb { doc, page: page as u32, width: thumb_px };
             match cache.get(&key) {
                 Some(id) => {
                     let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));

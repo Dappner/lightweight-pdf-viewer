@@ -34,7 +34,9 @@ cargo run --release -- some.pdf another.pdf
 
 ## Using it
 
-Open PDFs with ⌘O, by dragging them onto the window, or from Finder.
+Open PDFs with ⌘O, by dragging them onto the window, or from Finder. Drag the sidebar's edge to resize it.
+
+The app reopens the tabs you had open last time. Settings live in `~/Library/Application Support/Lightweight PDF/config.json`; set `"restore_tabs": false` there to start empty instead.
 
 | Shortcut | Action |
 | --- | --- |
