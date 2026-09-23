@@ -1,6 +1,6 @@
 //! User settings, kept in `~/Library/Application Support/Lightweight PDF/config.json`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -35,10 +35,7 @@ impl Default for Config {
 impl Config {
     /// Loads the user's settings.
     pub fn load() -> Self {
-        match std::env::var_os("HOME") {
-            Some(home) => Self::load_from(PathBuf::from(home).join("Library/Application Support/Lightweight PDF/config.json")),
-            None => Self::default(),
-        }
+        support_file("config.json").map_or_else(Self::default, Self::load_from)
     }
 
     /// Loads settings saved at `path`, falling back to defaults if the file is missing or invalid.
@@ -55,9 +52,23 @@ impl Config {
     pub fn save(&self) {
         let Some(path) = &self.path else { return };
         let Ok(json) = serde_json::to_vec_pretty(self) else { return };
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::write(path, json);
+        write_atomically(path, &json);
+    }
+}
+
+/// A file in `~/Library/Application Support/Lightweight PDF/`, where the app keeps its state.
+pub(crate) fn support_file(name: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join("Library/Application Support/Lightweight PDF").join(name))
+}
+
+/// Writes through a temporary file and a rename, so a crash never leaves a half-written file.
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let temp = path.with_extension("tmp");
+    if std::fs::write(&temp, bytes).is_ok() {
+        let _ = std::fs::rename(&temp, path);
     }
 }

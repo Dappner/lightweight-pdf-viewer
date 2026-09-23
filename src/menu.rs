@@ -79,6 +79,7 @@ pub fn install(ctx: &egui::Context) {
         ]),
         ("File", vec![
             Item("Open…", Command::Open, "o", cmd),
+            Item("Open Recent…", Command::QuickOpen, "k", cmd),
             Separator,
             Item("Close Tab", Command::CloseTab, "w", cmd),
         ]),

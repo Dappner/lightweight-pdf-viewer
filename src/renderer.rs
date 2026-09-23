@@ -3,12 +3,15 @@
 //!
 //! Every document lives on this one thread. At most one document is kept open at a time:
 //! touching a different document closes the previous one, which frees its per-document
-//! caches (decoded images, fonts, parsed content streams).
+//! caches (decoded images, fonts, parsed content streams). CoreGraphics keeps every page it
+//! has drawn in that cache until the document is released, so a document is also closed
+//! once it has drawn [`PAGES_PER_OPEN`] distinct pages, and reopened (in a millisecond or
+//! two) on its next job.
 //!
 //! The UI replaces the whole render queue every frame with what it currently wants, so
 //! work for pages that scrolled out of view is dropped without explicit cancellation.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -24,6 +27,10 @@ use objc2_foundation::NSURL;
 use objc2_pdf_kit::{PDFActionGoTo, PDFActionURL, PDFDestination, PDFDocument, PDFOutline};
 
 pub type DocId = u64;
+
+/// Distinct pages a document may draw before it is closed to release CoreGraphics' cache of
+/// them (about 0.3 MB per page for a typical textbook, and far more for scanned pages).
+const PAGES_PER_OPEN: usize = 16;
 
 /// Tile edge length in physical pixels.
 pub const TILE: u32 = 512;
@@ -138,6 +145,30 @@ impl Control {
     }
 }
 
+enum Work {
+    Control(Control),
+    Render(Vec<Key>),
+}
+
+impl Work {
+    fn doc(&self) -> DocId {
+        match self {
+            Work::Control(c) => c.doc(),
+            Work::Render(batch) => batch[0].doc(),
+        }
+    }
+
+    /// The pages this job parses, or `None` if it may parse any number of them.
+    fn pages(&self) -> Option<Vec<u32>> {
+        match self {
+            // Reading every page size, or resolving outline destinations.
+            Work::Control(Control::Open(_) | Control::Outline(_)) => None,
+            Work::Control(Control::Snapshot(job)) => Some(job.pages.iter().map(|p| p.page).collect()),
+            Work::Render(batch) => Some(vec![batch[0].page()]),
+        }
+    }
+}
+
 #[derive(Default)]
 struct Queue {
     control: VecDeque<Control>,
@@ -209,20 +240,22 @@ impl Renderer {
     }
 }
 
-enum Work {
-    Control(Control),
-    Render(Vec<Key>),
+/// The document the worker has open, and the pages it has parsed since opening.
+struct OpenDoc {
+    id: DocId,
+    doc: Document,
+    pages: HashSet<u32>,
 }
 
 fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context) {
-    let mut open: Option<(DocId, Document)> = None;
+    let mut open: Option<OpenDoc> = None;
 
     loop {
         let (lock, cvar) = shared;
         let (work, path) = {
             let mut q = lock.lock().unwrap();
             loop {
-                if open.as_ref().is_some_and(|(id, _)| !q.paths.contains_key(id)) {
+                if open.as_ref().is_some_and(|o| !q.paths.contains_key(&o.id)) {
                     open = None;
                 }
                 if let Some(c) = q.control.pop_front() {
@@ -251,20 +284,18 @@ fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context) {
             }
         };
 
-        let doc_id = match &work {
-            Work::Control(c) => c.doc(),
-            Work::Render(batch) => batch[0].doc(),
-        };
+        let doc_id = work.doc();
+        let pages = work.pages();
         // CoreGraphics may autorelease internally; drain per job so nothing piles up on
         // this long-lived thread.
         let outputs = objc2::rc::autoreleasepool(|_| {
-            if open.as_ref().is_none_or(|(id, _)| *id != doc_id) {
+            if open.as_ref().is_none_or(|o| o.id != doc_id) {
                 // Close the previous document before opening the next one.
                 drop(open.take());
-                open = open_document(&path).map(|d| (doc_id, d));
+                open = open_document(&path).map(|doc| OpenDoc { id: doc_id, doc, pages: HashSet::new() });
             }
-            match (&open, work) {
-                (Some((_, doc)), work) => run(doc, doc_id, work),
+            let outputs = match (&open, work) {
+                (Some(o), work) => run(&o.doc, doc_id, work),
                 (None, Work::Control(Control::Open(doc))) => vec![Output::Opened {
                     doc,
                     result: Err(format!("Could not open {}", path.display())),
@@ -272,7 +303,14 @@ fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context) {
                 (None, Work::Control(Control::Snapshot(_))) => vec![],
                 (None, Work::Control(Control::Outline(doc))) => vec![Output::Outline { doc, entries: vec![] }],
                 (None, Work::Render(batch)) => batch.into_iter().map(Output::Failed).collect(),
+            };
+            if let Some(o) = &mut open {
+                o.pages.extend(pages.iter().flatten());
+                if pages.is_none() || o.pages.len() > std::env::var("DIAG_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(PAGES_PER_OPEN) {
+                    open = None;
+                }
             }
+            outputs
         });
 
         let mut q = lock.lock().unwrap();
@@ -548,6 +586,29 @@ mod tests {
     }
 
     /// Headless render check: `RENDER_TEST_PDF=<pdf> RENDER_TEST_OUT=<dir> cargo test`.
+    #[test]
+    fn diag_open_cost() {
+        let Ok(list) = std::env::var("DIAG_PDFS") else { return };
+        for pdf in list.split('|') {
+            for round in 0..3 {
+                let t = std::time::Instant::now();
+                let d = open_document(std::path::Path::new(pdf)).unwrap();
+                let t_open = t.elapsed();
+                let page = get_page(&d.cg, 500).unwrap();
+                let t_page = t.elapsed();
+                let n = CGPDFDocument::number_of_pages(Some(&d.cg));
+                let t2 = std::time::Instant::now();
+                for i in 0..n { let _ = get_page(&d.cg, i as u32).map(|p| PageGeometry::of(&p).size()); }
+                let t_sizes = t2.elapsed();
+                let g = PageGeometry::of(&page);
+                let t3 = std::time::Instant::now();
+                render_key(&page, &g, Key::Tile { doc: 0, page: 500, scale: 512, tx: 0, ty: 0 });
+                let t_render = t3.elapsed();
+                println!("DIAG {round} open {:?} first page {:?} all sizes {:?} tile {:?} {}", t_open, t_page, t_sizes, t_render, pdf.rsplit('/').next().unwrap());
+            }
+        }
+    }
+
     #[test]
     fn renders_tiles_thumbs_and_snapshots() {
         let (Ok(pdf), Ok(out)) = (std::env::var("RENDER_TEST_PDF"), std::env::var("RENDER_TEST_OUT")) else {

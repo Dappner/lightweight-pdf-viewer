@@ -41,6 +41,7 @@ The app reopens the tabs you had open last time. Settings live in `~/Library/App
 | Shortcut | Action |
 | --- | --- |
 | ⌘O | Open |
+| ⌘K | Open a recent file (type to filter; most-used and latest first) |
 | ⌘W | Close tab |
 | ⌘1 … ⌘9 | Go to tab (⌘9 is the last tab) |
 | ⌘⇧[ / ⌘⇧] or ⌃⇧Tab / ⌃Tab | Previous / next tab |

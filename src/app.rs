@@ -9,8 +9,10 @@ use eframe::egui::{
 use crate::cache::TextureCache;
 use crate::config::Config;
 use crate::finder;
+use crate::history::{self, History};
 use crate::layout::DocLayout;
 use crate::menu;
+use crate::quick_open::{Outcome, QuickOpen};
 use crate::renderer::{DocId, Key, Output, Renderer, Target};
 use crate::sidebar::{self, Mode as SidebarMode};
 use crate::tab::{DocState, Snapshot, Tab};
@@ -33,6 +35,9 @@ pub struct App {
     cache: TextureCache,
     failed: HashSet<Key>,
     config: Config,
+    history: History,
+    /// The ⌘K recent-files palette, while it is open.
+    quick_open: Option<QuickOpen>,
     sidebar: bool,
     sidebar_mode: SidebarMode,
     /// Pixel width thumbnails are rendered at. Follows the sidebar's width once a resize
@@ -49,6 +54,8 @@ pub struct App {
 #[derive(Clone, Copy, Debug)]
 pub enum Command {
     Open,
+    /// Shows or hides the recent-files palette.
+    QuickOpen,
     CloseTab,
     NextTab,
     PreviousTab,
@@ -77,7 +84,7 @@ pub struct Stats {
 }
 
 impl App {
-    pub fn new(ctx: &Context, config: Config, files: Vec<PathBuf>) -> Self {
+    pub fn new(ctx: &Context, config: Config, history: History, files: Vec<PathBuf>) -> Self {
         // ⌘+/⌘- zoom the document, not the UI.
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
         finder::set_context(ctx);
@@ -90,6 +97,8 @@ impl App {
             failed: HashSet::new(),
             thumb_px: sidebar::thumb_width_px(config.sidebar_width, ctx.pixels_per_point()),
             config,
+            history,
+            quick_open: None,
             sidebar: true,
             sidebar_mode: SidebarMode::Pages,
             tab_scroll: 0.0,
@@ -99,8 +108,10 @@ impl App {
         if app.config.restore_tabs {
             let saved: Vec<PathBuf> = app.config.tabs.iter().filter(|p| p.exists()).cloned().collect();
             let active = app.config.tabs.get(app.config.active_tab).cloned();
+            // Reopening a session isn't a choice to open these files, so it doesn't count
+            // towards their rank in the history.
             for file in saved {
-                app.open(ctx, file);
+                app.open_tab(ctx, file);
             }
             if let Some(i) = active.and_then(|path| app.tabs.iter().position(|t| t.path == path)) {
                 app.activate(ctx, i);
@@ -124,8 +135,15 @@ impl App {
         }
     }
 
+    /// Opens `path` in a tab (or switches to it) and records it in the history.
     pub fn open(&mut self, ctx: &Context, path: PathBuf) {
         let path = path.canonicalize().unwrap_or(path);
+        self.history.visit(&path, history::now());
+        self.open_tab(ctx, path);
+    }
+
+    /// `path` should already be canonical, as saved tabs are.
+    fn open_tab(&mut self, ctx: &Context, path: PathBuf) {
         if let Some(i) = self.tabs.iter().position(|t| t.path == path) {
             self.activate(ctx, i);
             return;
@@ -263,6 +281,7 @@ impl App {
         let n = self.tabs.len();
         match command {
             Command::Open => self.open_dialog(ctx),
+            Command::QuickOpen => self.toggle_quick_open(),
             Command::CloseTab if n == 0 => ctx.send_viewport_cmd(ViewportCommand::Close),
             Command::CloseTab => self.close(ctx, self.active),
             Command::NextTab if n > 0 => self.activate(ctx, (self.active + 1) % n),
@@ -283,6 +302,16 @@ impl App {
             Command::ZoomIn | Command::ZoomOut | Command::ZoomToFit => self.zoom(ctx, command),
             Command::Quit => ctx.send_viewport_cmd(ViewportCommand::Close),
         }
+    }
+
+    fn toggle_quick_open(&mut self) {
+        self.quick_open = match self.quick_open {
+            Some(_) => None,
+            None => {
+                let files = self.history.ranked(history::now()).into_iter().filter(|p| p.exists()).collect();
+                Some(QuickOpen::new(files))
+            }
+        };
     }
 
     fn set_sidebar_mode(&mut self, mode: SidebarMode) {
@@ -362,6 +391,7 @@ impl App {
                 (cmd | Modifiers::ALT, KeyCode::ArrowLeft, Command::PreviousTab),
                 (cmd | Modifiers::ALT, KeyCode::ArrowRight, Command::NextTab),
                 (cmd, KeyCode::O, Command::Open),
+                (cmd, KeyCode::K, Command::QuickOpen),
                 (cmd, KeyCode::W, Command::CloseTab),
                 (cmd | Modifiers::ALT, KeyCode::B, Command::ToggleOutline),
                 (cmd, KeyCode::B, Command::ToggleSidebar),
@@ -380,7 +410,10 @@ impl App {
         for command in commands {
             self.run(ctx, command);
         }
-        self.view_shortcuts(ctx);
+        // The palette's list and text field take the arrow and editing keys.
+        if self.quick_open.is_none() {
+            self.view_shortcuts(ctx);
+        }
     }
 
     fn view_shortcuts(&mut self, ctx: &Context) {
@@ -572,6 +605,15 @@ impl App {
         .inner;
         if let Some(target) = clicked_link {
             self.follow(target);
+        }
+
+        if let Some(quick_open) = &mut self.quick_open
+            && let Some(outcome) = quick_open.show(ctx, &palette)
+        {
+            self.quick_open = None;
+            if let Outcome::Open(path) = outcome {
+                self.open(ctx, path);
+            }
         }
 
         self.save_tabs();

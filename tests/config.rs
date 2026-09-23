@@ -1,10 +1,11 @@
-//! Headless checks of settings saved to the config file (no window; egui only).
+//! Headless checks of state saved between launches: settings and file history (no window; egui only).
 
 use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, Event, Modifiers, PointerButton, Pos2, RawInput, Rect, ViewportId, ViewportInfo, pos2, vec2};
 use lightweight_pdf_viewer::app::App;
 use lightweight_pdf_viewer::config::Config;
+use lightweight_pdf_viewer::history::History;
 
 struct Harness {
     ctx: egui::Context,
@@ -14,8 +15,12 @@ struct Harness {
 
 impl Harness {
     fn new(config: Config, files: Vec<PathBuf>) -> Self {
+        Self::with_history(config, History::default(), files)
+    }
+
+    fn with_history(config: Config, history: History, files: Vec<PathBuf>) -> Self {
         let ctx = egui::Context::default();
-        let app = App::new(&ctx, config, files);
+        let app = App::new(&ctx, config, history, files);
         let mut h = Self { ctx, app, time: 0.0 };
         for _ in 0..500 {
             let _ = h.frame(vec![]);
@@ -157,6 +162,35 @@ fn open_tabs_are_restored_at_launch() {
     off.restore_tabs = false;
     let h = Harness::new(off, vec![c]);
     assert_eq!(h.app.stats().tabs, 1);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn key(key: egui::Key, modifiers: Modifiers) -> Event {
+    Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
+}
+
+#[test]
+fn quick_open_reopens_a_recent_file() {
+    let dir = temp_dir("quick-open");
+    let [a, b] = ["alpha.pdf", "beta.pdf"].map(|name| dir.join(name));
+    for pdf in [&a, &b] {
+        write_pdf(pdf, 1);
+    }
+    let history = dir.join("history.json");
+    let _ = std::fs::remove_file(&history);
+
+    let mut h = Harness::with_history(Config::default(), History::load_from(history.clone()), vec![a.clone(), b]);
+    assert_eq!(h.app.stats().active, 1);
+    let _ = h.frame(vec![key(egui::Key::K, Modifiers::COMMAND)]);
+    let _ = h.frame(vec![Event::Text("alp".into())]);
+    let _ = h.frame(vec![key(egui::Key::Enter, Modifiers::NONE)]);
+    assert_eq!(h.app.stats().active, 0);
+
+    // Opening alpha twice ranks it above beta.
+    let ranked = History::load_from(history).ranked(u64::MAX / 2);
+    assert_eq!(ranked.len(), 2);
+    assert_eq!(ranked[0], a.canonicalize().unwrap());
 
     let _ = std::fs::remove_dir_all(dir);
 }

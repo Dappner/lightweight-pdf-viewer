@@ -4,7 +4,7 @@ use eframe::egui::{
     self, Event, Modifiers, PointerButton, Pos2, RawInput, Rect, ViewportCommand, ViewportId, ViewportInfo, pos2,
     vec2,
 };
-use lightweight_pdf_viewer::{app::App, config::Config};
+use lightweight_pdf_viewer::{app::App, config::Config, history::History};
 
 /// Tab geometry for a 1000pt-wide window with two tabs (see `tab_bar.rs`): tabs start at
 /// x = 78 and are 220pt wide; the strip's vertical centre is y = 16.
@@ -20,7 +20,7 @@ struct Harness {
 impl Harness {
     fn new() -> Self {
         let ctx = egui::Context::default();
-        let mut app = App::new(&ctx, Config::default(), Vec::new());
+        let mut app = App::new(&ctx, Config::default(), History::default(), Vec::new());
         app.open(&ctx, "/nonexistent/a.pdf".into());
         app.open(&ctx, "/nonexistent/b.pdf".into());
         let mut h = Self { ctx, app, time: 0.0 };

@@ -19,6 +19,7 @@ use eframe::egui::{
 };
 use lightweight_pdf_viewer::app::{App, Stats};
 use lightweight_pdf_viewer::config::Config;
+use lightweight_pdf_viewer::history::History;
 
 const TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -152,7 +153,7 @@ fn main() {
         .unwrap_or(Vec2::new(1000.0, 1000.0));
 
     let ctx = egui::Context::default();
-    let app = App::new(&ctx, Config::default(), Vec::new());
+    let app = App::new(&ctx, Config::default(), History::default(), Vec::new());
     let mut h = Harness { ctx, app, start: Instant::now(), size, ppp, events: Vec::new() };
     h.frame();
     println!("viewport {}x{} pt @ {ppp}x\n", size.x, size.y);
@@ -219,6 +220,13 @@ fn main() {
         }
         h.idle(Duration::from_millis(300));
         println!("  footprint over 100 more switches: {before:.1} -> {:.1} MB", footprint_mb());
+        if std::env::var_os("DIAG_SWITCHHEAP").is_some() {
+            let out = std::process::Command::new("heap").args(["-s", &std::process::id().to_string()]).output().unwrap();
+            for l in String::from_utf8_lossy(&out.stdout).lines().filter(|l| l.contains("zones:") || l.contains("footprint") ).take(4) { eprintln!("SH {l}"); }
+            for l in String::from_utf8_lossy(&out.stdout).lines().skip_while(|l| !l.contains("COUNT")).take(25) { eprintln!("SH {l}"); }
+            let out = std::process::Command::new("vmmap").args(["--summary", &std::process::id().to_string()]).output().unwrap();
+            for l in String::from_utf8_lossy(&out.stdout).lines().filter(|l| l.contains("Malloc") || l.contains("DefaultMalloc") || l.contains("TOTAL")) { eprintln!("SV {l}"); }
+        }
     }
 
     println!("\nscrolling the active document page by page");
@@ -240,6 +248,23 @@ fn main() {
         h.wait(|s| s.ready);
         steps.push(t.elapsed());
         peak = peak.max(h.stats().texture_bytes);
+        if steps.len() % 100 == 0 { eprintln!("DIAG step {} page {} footprint {:.1}", steps.len(), h.stats().current_page, footprint_mb()); if steps.len() % 300 == 0 { let out = std::process::Command::new("footprint").arg(std::process::id().to_string()).output().unwrap(); for l in String::from_utf8_lossy(&out.stdout).lines().take(14) { eprintln!("FP {l}"); } } }
+    }
+    {
+        unsafe extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; }
+        let before = footprint_mb();
+        let freed = unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+        eprintln!("DIAG relief: {before:.1} -> {:.1} MB (released {:.1} MB)", footprint_mb(), freed as f64 / 1048576.0);
+    }
+    {
+        let out = std::process::Command::new("vmmap").args(["--summary", &std::process::id().to_string()]).output().unwrap();
+        let t = String::from_utf8_lossy(&out.stdout);
+        let mut on = false;
+        for l in t.lines() { if l.contains("MALLOC ZONE") { on = true; } if on { eprintln!("VM {l}"); } }
+    }
+    if std::env::var_os("DIAG_HEAP").is_some() {
+        let out = std::process::Command::new("malloc_history").args([&std::process::id().to_string(), "-allBySize"]).output().unwrap();
+        for l in String::from_utf8_lossy(&out.stdout).lines() { eprintln!("HEAP {l}"); }
     }
     println!(
         "  {} steps, to sharp {}   peak textures {:.1} MB   footprint {:.1} MB",
