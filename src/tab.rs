@@ -50,7 +50,12 @@ pub struct View {
     pub pending_offset: Option<Vec2>,
     /// Screen rect of the page canvas in the last frame.
     pub viewport: Rect,
+    /// The page being read: the one last navigated to until you scroll, and otherwise the
+    /// one taking up the most of the viewport.
     pub current_page: usize,
+    /// The page last navigated to (thumbnail, outline, link, arrow keys), which stays current
+    /// until you scroll. Short pages can leave several on screen, the one navigated to at the top.
+    pub landed_page: Option<usize>,
     /// Page the sidebar last scrolled to.
     pub sidebar_page: Option<usize>,
 }
@@ -88,6 +93,7 @@ impl Default for View {
             pending_offset: None,
             viewport: Rect::NOTHING,
             current_page: 0,
+            landed_page: None,
             sidebar_page: None,
         }
     }

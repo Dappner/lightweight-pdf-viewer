@@ -1,6 +1,6 @@
 //! GPU texture cache shared by all tabs, bounded by a byte budget.
 //!
-//! Entries used in the current frame are never evicted; everything else is evicted
+//! Entries used in any window's latest frame are never evicted; everything else is evicted
 //! least-recently-used first once the budget is exceeded.
 
 use std::collections::HashMap;
@@ -27,8 +27,14 @@ impl TextureCache {
         Self { entries: HashMap::new(), bytes: 0, budget, frame: 0 }
     }
 
-    pub fn begin_frame(&mut self) {
+    /// Starts a window's frame; returns its number, for [`Self::trim`].
+    pub fn begin_frame(&mut self) -> u64 {
         self.frame += 1;
+        self.frame
+    }
+
+    pub fn set_budget(&mut self, budget: usize) {
+        self.budget = budget;
     }
 
     /// Returns the texture and marks it as in use this frame.
@@ -36,6 +42,10 @@ impl TextureCache {
         let entry = self.entries.get_mut(key)?;
         entry.last_used = self.frame;
         Some(entry.texture.id())
+    }
+
+    pub fn contains(&self, key: &Key) -> bool {
+        self.entries.contains_key(key)
     }
 
     /// Returns the texture without protecting it from eviction.
@@ -66,8 +76,9 @@ impl TextureCache {
         self.retain(|k| k.doc() != doc);
     }
 
-    /// Evicts down to the budget; returns the documents that lost entries.
-    pub fn trim(&mut self) -> Vec<DocId> {
+    /// Evicts down to the budget, sparing entries used since frame `keep_since`; returns the
+    /// documents that lost entries.
+    pub fn trim(&mut self, keep_since: u64) -> Vec<DocId> {
         let mut evicted = Vec::new();
         if self.bytes <= self.budget {
             return evicted;
@@ -75,7 +86,7 @@ impl TextureCache {
         let mut candidates: Vec<(u64, Key)> = self
             .entries
             .iter()
-            .filter(|(_, e)| e.last_used < self.frame)
+            .filter(|(_, e)| e.last_used < keep_since)
             .map(|(k, e)| (e.last_used, *k))
             .collect();
         candidates.sort_unstable_by_key(|(used, _)| *used);

@@ -1,66 +1,71 @@
-use std::collections::HashSet;
+//! The app: its windows (see [`crate::window`]) and what they share.
+//!
+//! eframe creates the main window; the others are deferred egui viewports, which eframe
+//! repaints on their own. Each window's frame runs [`State::pass`] with the state locked, so
+//! the app does the same work whichever window is drawing. Closing the main window would
+//! quit, so when other windows are open it takes over one of them instead: it moves to where
+//! that window was and shows its tabs.
+
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use eframe::egui::{
-    self, Align2, CentralPanel, ColorImage, Context, FontId, Frame, Key as KeyCode, Modifiers,
-    SidePanel, TextureHandle, TextureOptions, TopBottomPanel, Vec2, ViewportCommand, vec2,
+    ColorImage, Context, IconData, Pos2, TextureOptions, Vec2, ViewportBuilder, ViewportCommand, ViewportId,
+    vec2,
 };
 
 use crate::cache::TextureCache;
-use crate::config::Config;
+use crate::config::{Config, SavedWindow};
 use crate::finder;
 use crate::history::{self, History};
 use crate::layout::{DocLayout, PageLayout};
 use crate::menu;
-use crate::quick_open::{Outcome, QuickOpen};
-use crate::renderer::{DocId, Key, Output, Renderer, Target};
+use crate::renderer::{DocId, Key, Output, Renderer};
 use crate::sidebar::{self, Mode as SidebarMode};
-use crate::tab::{DocState, Snapshot, Tab};
-use crate::tab_bar::{self, Action};
-use crate::theme::{Palette, palette};
-use crate::view::{Canvas, MAX_ZOOM, MIN_ZOOM, Wants, fit_width_zoom};
+use crate::tab::{DocState, Snapshot};
+use crate::tab_bar;
+use crate::view::{MAX_ZOOM, MIN_ZOOM, Wants};
+use crate::window::{Request, Shared, Window, snapshot_texture};
 
-/// Seconds a tab you switched away from keeps its tiles, so flipping straight back is sharp.
-const PARK_SECONDS: f64 = 3.0;
-const ZOOM_STEP: f32 = 1.25;
-const LINE_SCROLL: f32 = 48.0;
+const DEFAULT_SIZE: Vec2 = vec2(960.0, 1080.0);
+/// How far a new window is offset from the one it was opened from.
+const CASCADE: Vec2 = vec2(28.0, 28.0);
 
+/// The app, shared with the other windows' frame callbacks.
 pub struct App {
-    tabs: Vec<Tab>,
-    active: usize,
-    next_id: DocId,
-    renderer: Renderer,
-    cache: TextureCache,
-    /// Screen heights rendered ahead of the visible area (see [`crate::memory::Tuning`]).
-    prefetch: f32,
-    failed: HashSet<Key>,
-    config: Config,
-    history: History,
-    /// The ⌘K recent-files palette, while it is open.
-    quick_open: Option<QuickOpen>,
-    sidebar: bool,
-    sidebar_mode: SidebarMode,
-    /// Pixel width thumbnails are rendered at. Follows the sidebar's width once a resize
-    /// ends, so dragging stretches the existing thumbnails instead of re-rendering them.
-    thumb_px: u32,
-    tab_scroll: f32,
-    /// The last tab switched away from, whose tiles are kept until this time.
-    parked: Option<(DocId, f64)>,
-    /// Whether every visible tile of the active tab was drawn sharp last frame.
-    visible_ready: bool,
+    state: Arc<Mutex<State>>,
+}
+
+pub struct State {
+    shared: Shared,
+    /// The main window first.
+    windows: Vec<Window>,
+    /// The window that menu commands and files opened from Finder go to.
+    focused: usize,
+    next_serial: u64,
+    /// Quitting closes the main window, which otherwise hands over to another window.
+    quitting: bool,
     sleep: Sleep,
     /// See [`crate::memory::Tuning::sleep_after`].
     sleep_after: Option<f64>,
     /// When the app was last focused, scrolled or zoomed.
     last_active: f64,
+    /// Texture budget per window.
+    texture_budget: usize,
+    /// Each window's latest frame number (see [`TextureCache::trim`]), by serial.
+    frames: HashMap<u64, u64>,
+    /// What each window wanted rendered in its latest frame, by serial.
+    wants: HashMap<u64, Wants>,
 }
 
 /// Whether the app has let go of its page tiles while in the background.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 enum Sleep {
     Awake,
-    /// Waiting for a snapshot of the active tab to show in place of its tiles.
-    Falling,
+    /// Waiting for snapshots of these tabs (each window's active one) to show in place of
+    /// their tiles.
+    Falling(HashSet<DocId>),
     Asleep,
 }
 
@@ -70,10 +75,13 @@ pub enum Command {
     Open,
     /// Shows or hides the recent-files palette.
     QuickOpen,
+    NewWindow,
     CloseTab,
     NextTab,
     PreviousTab,
     SelectTab(usize),
+    MoveTabToNewWindow,
+    MergeAllWindows,
     ToggleSidebar,
     /// Switches the sidebar between page thumbnails and the outline.
     ToggleOutline,
@@ -87,8 +95,9 @@ pub enum Command {
     Quit,
 }
 
-/// A snapshot of app state for benchmarks.
+/// A snapshot of app state for benchmarks, describing the focused window.
 pub struct Stats {
+    pub windows: usize,
     pub tabs: usize,
     pub active: usize,
     /// The active tab has loaded and every visible tile is sharp.
@@ -103,517 +112,66 @@ pub struct Stats {
     pub asleep: bool,
 }
 
+/// How every window is set up: a tab strip in place of the title bar.
+pub fn window_builder() -> ViewportBuilder {
+    ViewportBuilder::default()
+        .with_title("Lightweight PDF")
+        // An empty icon keeps the bundle's icon; otherwise eframe swaps in egui's logo.
+        .with_icon(IconData::default())
+        .with_inner_size(DEFAULT_SIZE)
+        .with_min_inner_size([480.0, 360.0])
+        .with_fullsize_content_view(true)
+        .with_titlebar_shown(false)
+        .with_title_shown(false)
+        .with_drag_and_drop(true)
+}
+
+/// A window whose top-left corner is at `position` on screen, with content `size` big.
+pub fn window_at(position: Pos2, size: Vec2) -> ViewportBuilder {
+    window_builder().with_position(position).with_inner_size(size)
+}
+
 impl App {
     pub fn new(ctx: &Context, config: Config, history: History, files: Vec<PathBuf>) -> Self {
-        // ⌘+/⌘- zoom the document, not the UI.
-        ctx.options_mut(|o| o.zoom_with_keyboard = false);
-        finder::set_context(ctx);
-        let tuning = config.memory.tuning();
-        let mut app = Self {
-            tabs: Vec::new(),
-            active: 0,
-            next_id: 0,
-            renderer: Renderer::spawn(ctx.clone(), tuning.pages_per_open),
-            cache: TextureCache::new(tuning.texture_budget),
-            prefetch: tuning.prefetch,
-            failed: HashSet::new(),
-            thumb_px: sidebar::thumb_width_px(config.sidebar_width, ctx.pixels_per_point()),
-            config,
-            history,
-            quick_open: None,
-            sidebar: true,
-            sidebar_mode: SidebarMode::Pages,
-            tab_scroll: 0.0,
-            parked: None,
-            visible_ready: false,
-            sleep: Sleep::Awake,
-            sleep_after: tuning.sleep_after,
-            last_active: 0.0,
-        };
-        if app.config.restore_tabs {
-            let saved: Vec<PathBuf> = app.config.tabs.iter().filter(|p| p.exists()).cloned().collect();
-            let active = app.config.tabs.get(app.config.active_tab).cloned();
-            // Reopening a session isn't a choice to open these files, so it doesn't count
-            // towards their rank in the history.
-            for file in saved {
-                app.open_tab(ctx, file);
-            }
-            if let Some(i) = active.and_then(|path| app.tabs.iter().position(|t| t.path == path)) {
-                app.activate(ctx, i);
-            }
-        }
-        for file in files {
-            app.open(ctx, file);
-        }
-        app
+        Self { state: Arc::new(Mutex::new(State::new(ctx, config, history, files))) }
     }
 
-    /// Records the open tabs in the config, so the next launch can reopen them.
-    fn save_tabs(&mut self) {
-        let tabs: Vec<PathBuf> =
-            self.tabs.iter().filter(|t| !matches!(t.doc, DocState::Failed(_))).map(|t| t.path.clone()).collect();
-        let active = self.tabs.get(self.active).and_then(|a| tabs.iter().position(|p| *p == a.path)).unwrap_or(0);
-        if tabs != self.config.tabs || active != self.config.active_tab {
-            self.config.tabs = tabs;
-            self.config.active_tab = active;
-            self.config.save();
-        }
+    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap()
     }
 
-    /// Opens `path` in a tab (or switches to it) and records it in the history.
+    /// Opens `path` in the focused window and records it in the history.
     pub fn open(&mut self, ctx: &Context, path: PathBuf) {
-        let path = path.canonicalize().unwrap_or(path);
-        self.history.visit(&path, history::now());
-        self.open_tab(ctx, path);
+        self.state().open(ctx, path);
     }
 
-    /// `path` should already be canonical, as saved tabs are.
-    fn open_tab(&mut self, ctx: &Context, path: PathBuf) {
-        if let Some(i) = self.tabs.iter().position(|t| t.path == path) {
-            self.activate(ctx, i);
-            return;
-        }
-        let id = self.next_id;
-        self.next_id += 1;
-        self.renderer.open(id, path.clone());
-        let restore = self.history.place(&path);
-        self.tabs.push(Tab::new(id, path, restore));
-        self.activate(ctx, self.tabs.len() - 1);
-    }
-
-    fn open_dialog(&mut self, ctx: &Context) {
-        let files = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).pick_files();
-        for file in files.unwrap_or_default() {
-            self.open(ctx, file);
-        }
-    }
-
-    /// Switching tabs is where memory is reclaimed: the outgoing tab keeps only a small
-    /// compressed snapshot, and its open PDF document is released. Its textures are kept for
-    /// a few seconds (see [`PARK_SECONDS`]) in case you flip straight back.
-    fn activate(&mut self, ctx: &Context, index: usize) {
-        // Returning to the parked tab within the grace period: its tiles are still cached.
-        let returning = self.parked.is_some_and(|(doc, _)| doc == self.tabs[index].id);
-        if index != self.active {
-            self.remember(self.active);
-        }
-        if index != self.active
-            && let Some(old) = self.tabs.get_mut(self.active)
-        {
-            if let DocState::Ready(layout) = &old.doc
-                && old.view.zoom > 0.0
-            {
-                self.renderer.snapshot(old.view.snapshot_job(layout, old.id, ctx.pixels_per_point()));
-            }
-            old.snapshot_texture = None;
-            old.links.clear();
-            if let Some((parked, _)) = self.parked.take()
-                && !returning
-            {
-                self.cache.evict_doc(parked);
-            }
-            self.parked = Some((old.id, ctx.input(|i| i.time) + PARK_SECONDS));
-        }
-        self.active = index;
-
-        let tab = &mut self.tabs[index];
-        if returning {
-            return;
-        }
-        if let Some(snapshot) = tab.snapshot.take() {
-            tab.snapshot_texture = snapshot_texture(ctx, &snapshot);
-        }
-    }
-
-    /// In the background, the page tiles (most of the app's GPU memory) are swapped for a
-    /// snapshot of the viewport once the app has been left alone for a while. Focusing,
-    /// scrolling or zooming wakes it; the snapshot shows until the tiles are redrawn.
-    fn sleep_or_wake(&mut self, ctx: &Context) {
-        let Some(after) = self.sleep_after else { return };
-        let (now, active) = ctx.input(|i| {
-            let focused = i.viewport().focused.unwrap_or(true);
-            (i.time, focused || i.raw_scroll_delta != Vec2::ZERO || i.zoom_delta() != 1.0)
-        });
-        if active {
-            self.last_active = now;
-            self.sleep = Sleep::Awake;
-        } else if self.sleep == Sleep::Awake {
-            let idle = now - self.last_active;
-            if idle < after {
-                ctx.request_repaint_after(std::time::Duration::from_secs_f64(after - idle));
-            } else if let Some(tab) = self.tabs.get(self.active)
-                && let DocState::Ready(layout) = &tab.doc
-                && tab.view.zoom > 0.0
-            {
-                self.history.remember(&tab.path, tab.view.place(layout), history::now());
-                // The tiles go once the snapshot that replaces them arrives (see `receive`).
-                self.renderer.snapshot(tab.view.snapshot_job(layout, tab.id, ctx.pixels_per_point()));
-                self.sleep = Sleep::Falling;
-            } else {
-                self.release_tiles();
-                self.sleep = Sleep::Asleep;
-            }
-        }
-    }
-
-    /// Drops every page tile (thumbnails are small and stay) and closes the open document.
-    fn release_tiles(&mut self) {
-        self.cache.retain(|k| !matches!(k, Key::Tile { .. }));
-        self.parked = None;
-        self.renderer.release();
-    }
-
-    fn expire_parked(&mut self, ctx: &Context) {
-        let Some((doc, until)) = self.parked else { return };
-        let now = ctx.input(|i| i.time);
-        if now >= until {
-            self.cache.evict_doc(doc);
-            self.parked = None;
-        } else {
-            ctx.request_repaint_after(std::time::Duration::from_secs_f64(until - now));
-        }
-    }
-
-    /// Saves where tab `index` is left, so reopening the file brings you back to it.
-    fn remember(&mut self, index: usize) {
-        let Some(tab) = self.tabs.get(index) else { return };
-        if let DocState::Ready(layout) = &tab.doc
-            && tab.view.zoom > 0.0
-            && layout.page_count() > 0
-        {
-            self.history.remember(&tab.path, tab.view.place(layout), history::now());
-        }
-    }
-
-    fn close(&mut self, ctx: &Context, index: usize) {
-        self.remember(index);
-        let tab = self.tabs.remove(index);
-        self.renderer.forget(tab.id);
-        self.cache.evict_doc(tab.id);
-        if self.parked.is_some_and(|(doc, _)| doc == tab.id) {
-            self.parked = None;
-        }
-        self.failed.retain(|k| k.doc() != tab.id);
-        if self.tabs.is_empty() {
-            self.active = 0;
-        } else if index < self.active {
-            self.active -= 1;
-        } else if index == self.active {
-            // The closed tab has nothing to park, so activate its neighbour directly.
-            self.active = usize::MAX;
-            self.activate(ctx, index.min(self.tabs.len() - 1));
-        }
-    }
-
-    fn move_tab(&mut self, from: usize, to: usize) {
-        let active_id = self.tabs[self.active].id;
-        let tab = self.tabs.remove(from);
-        self.tabs.insert(to, tab);
-        self.active = self.tabs.iter().position(|t| t.id == active_id).unwrap_or(0);
-    }
-
-    fn receive(&mut self, ctx: &Context) {
-        let active_id = self.tabs.get(self.active).map(|t| t.id);
-        for output in self.renderer.take_done() {
-            match output {
-                Output::Opened { doc, result } => {
-                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == doc) {
-                        let restore = tab.restore.take();
-                        tab.doc = match result {
-                            Ok(sizes) => {
-                                let layout = DocLayout::new(sizes, restore.map(|p| p.layout).unwrap_or_default());
-                                if let Some(place) = restore
-                                    && place.page < layout.page_count()
-                                {
-                                    tab.view.zoom = place.zoom.clamp(MIN_ZOOM, MAX_ZOOM);
-                                    tab.view.render_zoom = tab.view.zoom;
-                                    tab.view.go_to_place(&layout, place.page, place.y);
-                                }
-                                DocState::Ready(layout)
-                            }
-                            Err(e) => DocState::Failed(e),
-                        };
-                    }
-                }
-                // Tiles that were in flight when the app fell asleep.
-                Output::Image { key: Key::Tile { .. }, .. } if self.sleep != Sleep::Awake => {}
-                Output::Image { key, size, rgba } if Some(key.doc()) == active_id => {
-                    let image = ColorImage::from_rgba_premultiplied(size, &rgba);
-                    let texture = ctx.load_texture("page", image, TextureOptions::LINEAR);
-                    self.cache.insert(key, texture, size[0] * size[1] * 4);
-                }
-                Output::Image { .. } => {}
-                Output::Failed(key) => {
-                    self.failed.insert(key);
-                }
-                Output::Snapshot { doc, size, qoi } if Some(doc) == active_id && self.sleep == Sleep::Falling => {
-                    self.tabs[self.active].snapshot_texture = snapshot_texture(ctx, &Snapshot { size, qoi });
-                    self.release_tiles();
-                    self.sleep = Sleep::Asleep;
-                }
-                Output::Snapshot { doc, size, qoi } if Some(doc) != active_id => {
-                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == doc) {
-                        tab.snapshot = Some(Snapshot { size, qoi });
-                    }
-                }
-                Output::Snapshot { .. } => {}
-                Output::Links { doc, page, links } if Some(doc) == active_id => {
-                    self.tabs[self.active].links.insert(page, links);
-                }
-                Output::Links { .. } => {}
-                Output::Outline { doc, entries } => {
-                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == doc) {
-                        tab.outline = Some(entries);
-                    }
-                }
-            }
-        }
-    }
-
-    pub fn run(&mut self, ctx: &Context, command: Command) {
-        let n = self.tabs.len();
-        match command {
-            Command::Open => self.open_dialog(ctx),
-            Command::QuickOpen => self.toggle_quick_open(),
-            Command::CloseTab if n == 0 => ctx.send_viewport_cmd(ViewportCommand::Close),
-            Command::CloseTab => self.close(ctx, self.active),
-            Command::NextTab if n > 0 => self.activate(ctx, (self.active + 1) % n),
-            Command::PreviousTab if n > 0 => self.activate(ctx, (self.active + n - 1) % n),
-            // Like browsers, the ninth tab shortcut always selects the last tab.
-            Command::SelectTab(i) if n > 0 => self.activate(ctx, if i == 8 { n - 1 } else { i.min(n - 1) }),
-            Command::NextTab | Command::PreviousTab | Command::SelectTab(_) => {}
-            Command::ToggleSidebar => {
-                self.sidebar = !self.sidebar;
-                if !self.sidebar {
-                    self.cache.retain(|k| !matches!(k, Key::Thumb { .. }));
-                }
-            }
-            Command::ToggleOutline => self.set_sidebar_mode(match self.sidebar_mode {
-                SidebarMode::Pages => SidebarMode::Outline,
-                SidebarMode::Outline => SidebarMode::Pages,
-            }),
-            Command::ShowSidebar(mode) => self.set_sidebar_mode(mode),
-            Command::SetLayout(mode) => self.set_layout(ctx, mode),
-            Command::ZoomIn | Command::ZoomOut | Command::ZoomToFit => self.zoom(ctx, command),
-            Command::Quit => ctx.send_viewport_cmd(ViewportCommand::Close),
-        }
-    }
-
-    fn toggle_quick_open(&mut self) {
-        self.quick_open = match self.quick_open {
-            Some(_) => None,
-            None => {
-                // The file you're looking at is never the one you want to switch to.
-                let active = self.tabs.get(self.active).map(|t| t.path.as_path());
-                let files = self
-                    .history
-                    .ranked(history::now())
-                    .into_iter()
-                    .filter(|p| Some(p.as_path()) != active && p.exists())
-                    .collect();
-                Some(QuickOpen::new(files))
-            }
-        };
-    }
-
-    fn set_sidebar_mode(&mut self, mode: SidebarMode) {
-        self.sidebar = true;
-        self.sidebar_mode = mode;
-        if mode == SidebarMode::Outline {
-            self.cache.retain(|k| !matches!(k, Key::Thumb { .. }));
-        }
-    }
-
-    /// Saves a new sidebar width and re-renders thumbnails to match it.
-    fn sidebar_resized(&mut self, ctx: &Context, width: f32) {
-        let width = sidebar::clamp_width(width.round());
-        if width != self.config.sidebar_width {
-            self.config.sidebar_width = width;
-            self.config.save();
-        }
-        let thumb_px = sidebar::thumb_width_px(width, ctx.pixels_per_point());
-        if thumb_px != self.thumb_px {
-            self.thumb_px = thumb_px;
-            self.cache.retain(|k| !matches!(k, Key::Thumb { .. }));
-        }
-    }
-
-    /// Follows a link or outline entry.
-    fn follow(&mut self, target: Target) {
-        match target {
-            Target::Page { page, y } => {
-                if let Some(tab) = self.tabs.get_mut(self.active)
-                    && let DocState::Ready(layout) = &tab.doc
-                {
-                    tab.view.go_to_point(layout, page as usize, y);
-                }
-            }
-            Target::Url(url) => {
-                if ["http://", "https://", "mailto:"].iter().any(|scheme| url.starts_with(scheme)) {
-                    let _ = std::process::Command::new("open").arg(&url).spawn();
-                }
-            }
-        }
-    }
-
-    fn set_layout(&mut self, ctx: &Context, mode: PageLayout) {
-        let Some(tab) = self.tabs.get_mut(self.active) else { return };
-        let DocState::Ready(layout) = &mut tab.doc else { return };
-        if tab.view.zoom == 0.0 || layout.mode() == mode {
-            return;
-        }
-        tab.view.set_layout(layout, mode, ctx.input(|i| i.time));
-        tab.snapshot_texture = None;
-    }
-
-    /// The active tab's page layout, once it has loaded.
-    fn layout(&self) -> Option<PageLayout> {
-        match &self.tabs.get(self.active)?.doc {
-            DocState::Ready(layout) => Some(layout.mode()),
-            _ => None,
-        }
-    }
-
-    fn zoom(&mut self, ctx: &Context, command: Command) {
-        let Some(tab) = self.tabs.get_mut(self.active) else { return };
-        let DocState::Ready(layout) = &tab.doc else { return };
-        let view = &mut tab.view;
-        if view.zoom == 0.0 {
-            return;
-        }
-        let zoom = match command {
-            Command::ZoomIn => view.zoom * ZOOM_STEP,
-            Command::ZoomOut => view.zoom / ZOOM_STEP,
-            _ => fit_width_zoom(layout, view.viewport.width()),
-        };
-        let center = view.viewport.size() / 2.0;
-        view.zoom_about(layout, zoom, center, ctx.input(|i| i.time));
-    }
-
-    /// Keyboard shortcuts. In the app, the menu bar receives the ⌘ shortcuts before egui
-    /// does; these also cover them when running without a menu (benchmarks).
-    fn shortcuts(&mut self, ctx: &Context) {
-        let cmd = Modifiers::COMMAND;
-        let shift = Modifiers::SHIFT;
-        let numbers = [
-            KeyCode::Num1, KeyCode::Num2, KeyCode::Num3, KeyCode::Num4, KeyCode::Num5,
-            KeyCode::Num6, KeyCode::Num7, KeyCode::Num8, KeyCode::Num9,
-        ];
-        let palette_open = self.quick_open.is_some();
-        let commands: Vec<Command> = ctx.input_mut(|i| {
-            // Shifted variants first: consume_key ignores extra Shift.
-            let bindings = [
-                (Modifiers::CTRL | shift, KeyCode::Tab, Command::PreviousTab),
-                (Modifiers::CTRL, KeyCode::Tab, Command::NextTab),
-                (cmd | shift, KeyCode::OpenBracket, Command::PreviousTab),
-                (cmd | shift, KeyCode::OpenCurlyBracket, Command::PreviousTab),
-                (cmd | shift, KeyCode::CloseBracket, Command::NextTab),
-                (cmd | shift, KeyCode::CloseCurlyBracket, Command::NextTab),
-                (cmd | Modifiers::ALT, KeyCode::ArrowLeft, Command::PreviousTab),
-                (cmd | Modifiers::ALT, KeyCode::ArrowRight, Command::NextTab),
-                (cmd, KeyCode::O, Command::Open),
-                (cmd, KeyCode::K, Command::QuickOpen),
-                (cmd, KeyCode::W, Command::CloseTab),
-                (cmd | Modifiers::ALT, KeyCode::B, Command::ToggleOutline),
-                (cmd, KeyCode::B, Command::ToggleSidebar),
-                (cmd, KeyCode::Equals, Command::ZoomIn),
-                (cmd, KeyCode::Plus, Command::ZoomIn),
-                (cmd, KeyCode::Minus, Command::ZoomOut),
-                (cmd, KeyCode::Num0, Command::ZoomToFit),
-                (cmd | Modifiers::ALT, KeyCode::Num1, Command::SetLayout(PageLayout::Single)),
-                (cmd | Modifiers::ALT, KeyCode::Num2, Command::SetLayout(PageLayout::TwoPages)),
-                (cmd | Modifiers::ALT, KeyCode::Num3, Command::SetLayout(PageLayout::Book)),
-            ];
-            let mut commands: Vec<Command> =
-                bindings.into_iter().filter(|(m, k, _)| i.consume_key(*m, *k)).map(|(_, _, c)| c).collect();
-            // While the palette is open, ⌘1–9 pick its results instead of tabs.
-            if !palette_open {
-                commands.extend(
-                    numbers.iter().enumerate().filter(|(_, k)| i.consume_key(cmd, **k)).map(|(n, _)| Command::SelectTab(n)),
-                );
-            }
-            commands
-        });
-        for command in commands {
-            self.run(ctx, command);
-        }
-        // The palette's list and text field take the arrow and editing keys.
-        if self.quick_open.is_none() {
-            self.view_shortcuts(ctx);
-        }
-    }
-
-    fn view_shortcuts(&mut self, ctx: &Context) {
-        let Some(tab) = self.tabs.get_mut(self.active) else { return };
-        let DocState::Ready(layout) = &tab.doc else { return };
-        let view = &mut tab.view;
-        if view.zoom == 0.0 {
-            return;
-        }
-        let cmd = Modifiers::COMMAND;
-        let none = Modifiers::NONE;
-        let shift = Modifiers::SHIFT;
-        let page_scroll = (view.viewport.height() - LINE_SCROLL).max(LINE_SCROLL);
-
-        ctx.input_mut(|i| {
-            if i.consume_key(cmd, KeyCode::ArrowUp) || i.consume_key(none, KeyCode::Home) {
-                view.go_to_page(layout, 0);
-            }
-            if i.consume_key(cmd, KeyCode::ArrowDown) || i.consume_key(none, KeyCode::End) {
-                view.go_to_page(layout, layout.page_count() - 1);
-            }
-            if i.consume_key(shift, KeyCode::Space) || i.consume_key(none, KeyCode::PageUp) {
-                view.scroll_by(vec2(0.0, -page_scroll));
-            }
-            if i.consume_key(none, KeyCode::Space) || i.consume_key(none, KeyCode::PageDown) {
-                view.scroll_by(vec2(0.0, page_scroll));
-            }
-            if i.consume_key(none, KeyCode::ArrowUp) {
-                view.scroll_by(vec2(0.0, -LINE_SCROLL));
-            }
-            if i.consume_key(none, KeyCode::ArrowDown) {
-                view.scroll_by(vec2(0.0, LINE_SCROLL));
-            }
-            // From the row at the top, by a whole spread when pages are side by side. Several
-            // rows can fit on screen, so stepping from the current (middle) one would skip some.
-            if i.consume_key(none, KeyCode::ArrowLeft) {
-                let top = view.place(layout).page;
-                view.go_to_page(layout, layout.spread(top).start.saturating_sub(1));
-            }
-            if i.consume_key(none, KeyCode::ArrowRight) {
-                let top = view.place(layout).page;
-                view.go_to_page(layout, layout.spread(top).end);
-            }
-        });
+    /// Runs `command` in window `w`.
+    pub fn run(&mut self, ctx: &Context, w: usize, command: Command) {
+        self.state().run(ctx, w, command);
     }
 
     pub fn stats(&self) -> Stats {
-        let active = self.tabs.get(self.active);
-        Stats {
-            tabs: self.tabs.len(),
-            active: self.active,
-            ready: self.visible_ready,
-            snapshot_shown: active.is_some_and(|t| t.snapshot_texture.is_some()),
-            current_page: active.map_or(0, |t| t.view.current_page),
-            page_count: active.map_or(0, |t| match &t.doc {
-                DocState::Ready(layout) => layout.page_count(),
-                _ => 0,
-            }),
-            texture_bytes: self.cache.bytes(),
-            snapshot_bytes: self.tabs.iter().filter_map(|t| t.snapshot.as_ref()).map(|s| s.qoi.len()).sum(),
-            asleep: self.sleep == Sleep::Asleep,
-        }
+        self.state().stats()
     }
 
-    fn status(&self) -> Option<String> {
-        let tab = self.tabs.get(self.active)?;
-        let DocState::Ready(layout) = &tab.doc else { return None };
-        let spread = layout.spread(tab.view.current_page);
-        let pages = match spread.len() {
-            1 => format!("{}", spread.start + 1),
-            _ => format!("{}–{}", spread.start + 1, spread.end),
+    /// One frame of the main window, which also keeps the other windows open. Separate from
+    /// `eframe::App::update` so it can run headless.
+    pub fn ui(&mut self, ctx: &Context) {
+        let others = {
+            let mut state = self.state();
+            state.pass(ctx, 0);
+            state.windows[1..].iter().map(|w| (w.serial, w.viewport, w.builder.clone())).collect::<Vec<_>>()
         };
-        Some(format!("{pages} / {}   {:.0}%", layout.page_count(), tab.view.zoom * 100.0))
+        // Unlocked: without native windows (headless), egui runs these right away.
+        for (serial, viewport, builder) in others {
+            let state = self.state.clone();
+            ctx.show_viewport_deferred(viewport, builder, move |ctx, _| {
+                let mut state = state.lock().unwrap();
+                if let Some(w) = state.index_of(serial).filter(|w| *w > 0) {
+                    state.pass(ctx, w);
+                }
+            });
+        }
     }
 }
 
@@ -623,173 +181,550 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
-        for i in 0..self.tabs.len() {
-            self.remember(i);
+        let state = &mut *self.state();
+        for tab in state.windows.iter().flat_map(|w| &w.tabs) {
+            state.shared.remember(tab);
+        }
+        state.save_session(true);
+    }
+}
+
+impl State {
+    fn new(ctx: &Context, config: Config, history: History, files: Vec<PathBuf>) -> Self {
+        // ⌘+/⌘- zoom the document, not the UI.
+        ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        finder::set_context(ctx);
+        let tuning = config.memory.tuning();
+        let mut app = Self {
+            shared: Shared {
+                renderer: Renderer::spawn(ctx.clone(), tuning.pages_per_open),
+                cache: TextureCache::new(tuning.texture_budget),
+                prefetch: tuning.prefetch,
+                failed: HashSet::new(),
+                thumb_px: sidebar::thumb_width_px(config.sidebar_width, ctx.pixels_per_point()),
+                config,
+                history,
+                next_id: 0,
+            },
+            windows: vec![Window::new(0, ViewportId::ROOT, window_builder())],
+            focused: 0,
+            next_serial: 1,
+            quitting: false,
+            sleep: Sleep::Awake,
+            sleep_after: tuning.sleep_after,
+            last_active: 0.0,
+            texture_budget: tuning.texture_budget,
+            frames: HashMap::new(),
+            wants: HashMap::new(),
+        };
+        if app.shared.config.restore_tabs {
+            // Reopening a session isn't a choice to open these files, so it doesn't count
+            // towards their rank in the history.
+            for (i, saved) in app.shared.config.windows.clone().into_iter().enumerate() {
+                let w = match i {
+                    0 => 0,
+                    _ => app.add_window(ctx, saved.frame.map_or_else(window_builder, |[x, y, w, h]| {
+                        window_at(Pos2::new(x, y), vec2(w, h))
+                    })),
+                };
+                let active = saved.tabs.get(saved.active).cloned();
+                for file in saved.tabs.into_iter().filter(|p| p.exists()) {
+                    if app.find_path(&file).is_none() {
+                        app.windows[w].open_tab(ctx, &mut app.shared, file);
+                    }
+                }
+                let window = &mut app.windows[w];
+                if let Some(i) = active.and_then(|path| window.tabs.iter().position(|t| t.path == path)) {
+                    window.activate(ctx, &mut app.shared, i);
+                }
+                if w > 0 && app.windows[w].tabs.is_empty() {
+                    app.windows.pop();
+                }
+            }
+        }
+        for file in files {
+            app.open(ctx, file);
+        }
+        app
+    }
+
+    fn add_window(&mut self, ctx: &Context, builder: ViewportBuilder) -> usize {
+        let serial = self.next_serial;
+        self.next_serial += 1;
+        self.windows.push(Window::new(serial, ViewportId::from_hash_of(("window", serial)), builder));
+        // The main window's frame is what creates the others.
+        ctx.request_repaint_of(ViewportId::ROOT);
+        self.windows.len() - 1
+    }
+
+    /// Redraws every window, after a change that may touch any of them.
+    fn repaint_all(&self, ctx: &Context) {
+        for window in &self.windows {
+            ctx.request_repaint_of(window.viewport);
+        }
+    }
+
+    fn index_of(&self, serial: u64) -> Option<usize> {
+        self.windows.iter().position(|w| w.serial == serial)
+    }
+
+    /// The window and tab showing `path`.
+    fn find_path(&self, path: &std::path::Path) -> Option<(usize, usize)> {
+        self.windows.iter().enumerate().find_map(|(w, window)| {
+            window.tabs.iter().position(|t| t.path == path).map(|i| (w, i))
+        })
+    }
+
+    /// The window and tab showing document `doc`.
+    fn find_doc(&self, doc: DocId) -> Option<(usize, usize)> {
+        self.windows.iter().enumerate().find_map(|(w, window)| {
+            window.tabs.iter().position(|t| t.id == doc).map(|i| (w, i))
+        })
+    }
+
+    fn is_active(&self, doc: DocId) -> bool {
+        self.windows.iter().any(|w| w.active_tab().is_some_and(|t| t.id == doc))
+    }
+
+    fn focus(&mut self, ctx: &Context, w: usize) {
+        self.focused = w;
+        ctx.send_viewport_cmd_to(self.windows[w].viewport, ViewportCommand::Focus);
+    }
+
+    /// Opens `path` in the focused window and records it in the history.
+    pub fn open(&mut self, ctx: &Context, path: PathBuf) {
+        self.open_in(ctx, self.focused, path);
+    }
+
+    /// Opens `path` in window `w`, or switches to it wherever it's already open.
+    fn open_in(&mut self, ctx: &Context, w: usize, path: PathBuf) {
+        let path = path.canonicalize().unwrap_or(path);
+        self.shared.history.visit(&path, history::now());
+        if let Some((x, i)) = self.find_path(&path) {
+            self.windows[x].activate(ctx, &mut self.shared, i);
+            if x != w {
+                self.focus(ctx, x);
+            }
+            return;
+        }
+        self.windows[w].open_tab(ctx, &mut self.shared, path);
+    }
+
+    fn open_dialog(&mut self, ctx: &Context, w: usize) {
+        let files = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).pick_files();
+        for file in files.unwrap_or_default() {
+            self.open_in(ctx, w, file);
+        }
+    }
+
+    /// Where a window opened from window `w` goes: a little below and right of it.
+    fn cascade(&self, w: usize) -> ViewportBuilder {
+        let window = &self.windows[w];
+        match (window.outer_rect, window.inner_rect) {
+            (Some(outer), Some(inner)) => window_at(outer.min + CASCADE, inner.size()),
+            _ => window_builder(),
+        }
+    }
+
+    /// Moves tab `index` of window `from` into its own window, or into the window whose tab
+    /// strip it was dropped on (`pointer` is in screen coordinates).
+    fn detach(&mut self, ctx: &Context, from: usize, index: usize, pointer: Option<Pos2>) {
+        if index >= self.windows[from].tabs.len() {
+            return;
+        }
+        let target = pointer.and_then(|p| {
+            (0..self.windows.len()).filter(|w| *w != from).find_map(|w| {
+                let rect = self.windows[w].inner_rect?;
+                let local = p - rect.min.to_vec2();
+                tab_bar::contains(rect.width(), local).then(|| {
+                    let window = &self.windows[w];
+                    (w, tab_bar::drop_index(rect.width(), window.tabs.len(), window.tab_scroll, local.x))
+                })
+            })
+        });
+        let (to, at) = match target {
+            Some(target) => target,
+            // A window's only tab dropped away from other windows: just move the window.
+            None if self.windows[from].tabs.len() == 1 => {
+                if let Some(p) = pointer {
+                    let position = p - tab_bar::NEW_WINDOW_GRAB;
+                    ctx.send_viewport_cmd_to(self.windows[from].viewport, ViewportCommand::OuterPosition(position));
+                }
+                return;
+            }
+            None => {
+                let builder = match (pointer, self.windows[from].inner_rect) {
+                    (Some(p), Some(inner)) => window_at(p - tab_bar::NEW_WINDOW_GRAB, inner.size()),
+                    _ => self.cascade(from),
+                };
+                (self.add_window(ctx, builder), 0)
+            }
+        };
+        let tab = self.windows[from].take(ctx, &mut self.shared, index);
+        self.windows[to].adopt(ctx, &mut self.shared, tab, at);
+        let to_serial = self.windows[to].serial;
+        if self.windows[from].tabs.is_empty() {
+            self.close_window(ctx, from);
+        }
+        if let Some(to) = self.index_of(to_serial) {
+            self.focus(ctx, to);
+        }
+    }
+
+    /// Moves every tab into window `w` and closes the other windows.
+    fn merge_into(&mut self, ctx: &Context, w: usize) {
+        let target = self.windows[w].serial;
+        let others: Vec<u64> = self.windows.iter().map(|w| w.serial).filter(|s| *s != target).collect();
+        for serial in others {
+            let Some(from) = self.index_of(serial) else { continue };
+            while !self.windows[from].tabs.is_empty() {
+                let tab = self.windows[from].take(ctx, &mut self.shared, 0);
+                let to = self.index_of(target).unwrap_or(0);
+                let end = self.windows[to].tabs.len();
+                self.windows[to].adopt(ctx, &mut self.shared, tab, end);
+            }
+            self.close_window(ctx, from);
+        }
+    }
+
+    /// Closes window `w` and its tabs. The last window quits the app.
+    fn close_window(&mut self, ctx: &Context, w: usize) {
+        if self.windows.len() == 1 {
+            self.quitting = true;
+            ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::Close);
+            return;
+        }
+        let focused = self.windows[self.focused].serial;
+        let mut closed = if w == 0 {
+            // The main window can't close without quitting, so it takes over the next window.
+            let mut next = self.windows.remove(1);
+            next.viewport = ViewportId::ROOT;
+            if let (Some(outer), Some(inner)) = (next.outer_rect, next.inner_rect) {
+                ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::OuterPosition(outer.min));
+                ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::InnerSize(inner.size()));
+            }
+            ctx.request_repaint_of(ViewportId::ROOT);
+            std::mem::replace(&mut self.windows[0], next)
+        } else {
+            self.windows.remove(w)
+        };
+        closed.close_all(&mut self.shared);
+        self.frames.remove(&closed.serial);
+        self.wants.remove(&closed.serial);
+        self.focused = self.index_of(focused).unwrap_or(0);
+    }
+
+    fn receive(&mut self, ctx: &Context) {
+        for output in self.shared.renderer.take_done() {
+            let doc = match &output {
+                Output::Opened { doc, .. }
+                | Output::Snapshot { doc, .. }
+                | Output::Links { doc, .. }
+                | Output::Outline { doc, .. } => *doc,
+                Output::Image { key, .. } | Output::Failed(key) => key.doc(),
+            };
+            if let Some((w, _)) = self.find_doc(doc) {
+                ctx.request_repaint_of(self.windows[w].viewport);
+            }
+            match output {
+                Output::Opened { doc, result } => {
+                    let Some((w, i)) = self.find_doc(doc) else { continue };
+                    let tab = &mut self.windows[w].tabs[i];
+                    let restore = tab.restore.take();
+                    tab.doc = match result {
+                        Ok(sizes) => {
+                            let layout = DocLayout::new(sizes, restore.map(|p| p.layout).unwrap_or_default());
+                            if let Some(place) = restore
+                                && place.page < layout.page_count()
+                            {
+                                tab.view.zoom = place.zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+                                tab.view.render_zoom = tab.view.zoom;
+                                tab.view.go_to_place(&layout, place.page, place.y);
+                            }
+                            DocState::Ready(layout)
+                        }
+                        Err(e) => DocState::Failed(e),
+                    };
+                }
+                // Tiles that were in flight when the app fell asleep.
+                Output::Image { key: Key::Tile { .. }, .. } if self.sleep != Sleep::Awake => {}
+                Output::Image { key, size, rgba } if self.is_active(key.doc()) => {
+                    let image = ColorImage::from_rgba_premultiplied(size, &rgba);
+                    let texture = ctx.load_texture("page", image, TextureOptions::LINEAR);
+                    self.shared.cache.insert(key, texture, size[0] * size[1] * 4);
+                }
+                Output::Image { .. } => {}
+                Output::Failed(key) => {
+                    self.shared.failed.insert(key);
+                }
+                Output::Snapshot { doc, size, qoi } => {
+                    let Some((w, i)) = self.find_doc(doc) else { continue };
+                    let snapshot = Snapshot { size, qoi };
+                    if self.windows[w].active != i {
+                        self.windows[w].tabs[i].snapshot = Some(snapshot);
+                    } else if let Sleep::Falling(pending) = &mut self.sleep
+                        && pending.remove(&doc)
+                    {
+                        self.windows[w].tabs[i].snapshot_texture = snapshot_texture(ctx, &snapshot);
+                        if pending.is_empty() {
+                            self.release_tiles();
+                            self.sleep = Sleep::Asleep;
+                        }
+                    }
+                }
+                Output::Links { doc, page, links } => {
+                    if let Some((w, i)) = self.find_doc(doc)
+                        && self.windows[w].active == i
+                    {
+                        self.windows[w].tabs[i].links.insert(page, links);
+                    }
+                }
+                Output::Outline { doc, entries } => {
+                    if let Some((w, i)) = self.find_doc(doc) {
+                        self.windows[w].tabs[i].outline = Some(entries);
+                    }
+                }
+            }
+        }
+    }
+
+    /// In the background, the page tiles (most of the app's GPU memory) are swapped for a
+    /// snapshot of each window once the app has been left alone for a while. Focusing,
+    /// scrolling or zooming wakes it; the snapshots show until the tiles are redrawn.
+    fn sleep_or_wake(&mut self, ctx: &Context) {
+        let Some(after) = self.sleep_after else { return };
+        let now = ctx.input(|i| i.time);
+        let active = self.windows.iter().any(|w| {
+            ctx.input_for(w.viewport, |i| {
+                i.viewport().focused.unwrap_or(true) || i.raw_scroll_delta != Vec2::ZERO || i.zoom_delta() != 1.0
+            })
+        });
+        if active {
+            self.last_active = now;
+            self.sleep = Sleep::Awake;
+        } else if self.sleep == Sleep::Awake {
+            let idle = now - self.last_active;
+            if idle < after {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(after - idle));
+                return;
+            }
+            // The tiles go once the snapshots that replace them arrive (see `receive`).
+            let mut pending = HashSet::new();
+            for window in &self.windows {
+                if let Some(tab) = window.active_tab()
+                    && let DocState::Ready(layout) = &tab.doc
+                    && tab.view.zoom > 0.0
+                {
+                    self.shared.remember(tab);
+                    self.shared.renderer.snapshot(tab.view.snapshot_job(layout, tab.id, ctx.pixels_per_point()));
+                    pending.insert(tab.id);
+                }
+            }
+            if pending.is_empty() {
+                self.release_tiles();
+                self.sleep = Sleep::Asleep;
+            } else {
+                self.sleep = Sleep::Falling(pending);
+            }
+        }
+    }
+
+    /// Drops every page tile (thumbnails are small and stay) and closes the open documents.
+    fn release_tiles(&mut self) {
+        self.shared.cache.retain(|k| !matches!(k, Key::Tile { .. }));
+        for window in &mut self.windows {
+            window.parked = None;
+        }
+        self.shared.renderer.release();
+    }
+
+    /// Runs `command` in window `w`.
+    pub fn run(&mut self, ctx: &Context, w: usize, command: Command) {
+        match command {
+            Command::Open => self.open_dialog(ctx, w),
+            Command::NewWindow => {
+                let builder = self.cascade(w);
+                self.focused = self.add_window(ctx, builder);
+            }
+            Command::MoveTabToNewWindow if self.windows[w].tabs.len() > 1 => {
+                self.detach(ctx, w, self.windows[w].active, None);
+            }
+            Command::MergeAllWindows => self.merge_into(ctx, w),
+            Command::CloseTab if self.windows[w].tabs.is_empty() => self.close_window(ctx, w),
+            Command::Quit => {
+                self.quitting = true;
+                ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::Close);
+            }
+            _ => self.windows[w].run(ctx, &mut self.shared, command),
+        }
+    }
+
+    /// Records the windows and their tabs in the config, so the next launch can reopen
+    /// them. Moving or resizing a window alone doesn't save, unless `always`.
+    fn save_session(&mut self, always: bool) {
+        let windows: Vec<SavedWindow> = self
+            .windows
+            .iter()
+            .filter_map(|window| {
+                let tabs: Vec<PathBuf> = window
+                    .tabs
+                    .iter()
+                    .filter(|t| !matches!(t.doc, DocState::Failed(_)))
+                    .map(|t| t.path.clone())
+                    .collect();
+                if tabs.is_empty() {
+                    return None;
+                }
+                let active = window.active_tab().and_then(|a| tabs.iter().position(|p| *p == a.path)).unwrap_or(0);
+                let frame = match (window.outer_rect, window.inner_rect) {
+                    (Some(outer), Some(inner)) => Some([outer.min.x, outer.min.y, inner.width(), inner.height()]),
+                    _ => None,
+                };
+                Some(SavedWindow { tabs, active, frame })
+            })
+            .collect();
+        let saved = &self.shared.config.windows;
+        let changed = windows.len() != saved.len()
+            || windows.iter().zip(saved).any(|(a, b)| a.tabs != b.tabs || a.active != b.active);
+        if always || changed {
+            self.shared.config.windows = windows;
+            self.shared.config.save();
+        }
+    }
+
+    pub fn stats(&self) -> Stats {
+        let window = &self.windows[self.focused];
+        let active = window.active_tab();
+        Stats {
+            windows: self.windows.len(),
+            tabs: window.tabs.len(),
+            active: window.active,
+            ready: window.visible_ready,
+            snapshot_shown: active.is_some_and(|t| t.snapshot_texture.is_some()),
+            current_page: active.map_or(0, |t| t.view.current_page),
+            page_count: active.map_or(0, |t| match &t.doc {
+                DocState::Ready(layout) => layout.page_count(),
+                _ => 0,
+            }),
+            texture_bytes: self.shared.cache.bytes(),
+            snapshot_bytes: self
+                .windows
+                .iter()
+                .flat_map(|w| &w.tabs)
+                .filter_map(|t| t.snapshot.as_ref())
+                .map(|s| s.qoi.len())
+                .sum(),
+            asleep: self.sleep == Sleep::Asleep,
         }
     }
 }
 
-impl App {
-    /// One frame of the app. Separate from `eframe::App::update` so it can run headless.
-    pub fn ui(&mut self, ctx: &Context) {
+impl State {
+    /// One frame of window `w`: the work shared by all windows, then the window itself.
+    fn pass(&mut self, ctx: &Context, w: usize) {
         // Before `receive`, so a snapshot that arrives as the app wakes is ignored.
         self.sleep_or_wake(ctx);
         self.receive(ctx);
-        self.expire_parked(ctx);
-        self.cache.begin_frame();
+        self.windows[w].expire_parked(ctx, &mut self.shared);
+        let serial = self.windows[w].serial;
+        self.frames.insert(serial, self.shared.cache.begin_frame());
 
-        let mut opened = finder::take();
-        opened.extend(ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect::<Vec<_>>()));
+        let opened = finder::take();
+        let commands = menu::take();
+        let external = !opened.is_empty() || !commands.is_empty();
         for path in opened {
             self.open(ctx, path);
         }
-        menu::set_layout(self.layout());
-        for command in menu::take() {
-            self.run(ctx, command);
+        for command in commands {
+            self.run(ctx, self.focused, command);
         }
-        self.shortcuts(ctx);
-        if self.sidebar
-            && self.sidebar_mode == SidebarMode::Outline
-            && let Some(tab) = self.tabs.get_mut(self.active)
-            && matches!(tab.doc, DocState::Ready(_))
-            && !tab.outline_requested
-        {
-            tab.outline_requested = true;
-            self.renderer.outline(tab.id);
+        if w == 0 && ctx.input(|i| i.viewport().close_requested()) && !self.quitting && self.windows.len() > 1 {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            self.close_window(ctx, 0);
         }
+        let Some(w) = self.index_of(serial) else { return };
 
-        let palette = palette(ctx.style().visuals.dark_mode);
         let mut wants = Wants::default();
-
-        let bar = TopBottomPanel::top("tabs")
-            .exact_height(tab_bar::HEIGHT)
-            .frame(Frame::NONE)
-            .show_separator_line(false)
-            .show(ctx, |ui| {
-                let status = self.status();
-                let view_menu = tab_bar::ViewMenu { sidebar: self.sidebar.then_some(self.sidebar_mode), layout: self.layout() };
-                tab_bar::show(ui, &self.tabs, self.active, &mut self.tab_scroll, status, view_menu, &palette)
-            })
-            .inner;
-        match bar {
-            Some(Action::Select(i)) => self.activate(ctx, i),
-            Some(Action::Close(i)) => self.close(ctx, i),
-            Some(Action::Move { from, to }) => self.move_tab(from, to),
-            Some(Action::Open) => self.open_dialog(ctx),
-            Some(Action::Run(command)) => self.run(ctx, command),
-            None => {}
+        let requests = self.windows[w].ui(ctx, &mut self.shared, &mut wants);
+        self.wants.insert(serial, wants);
+        let (focused, close) = ctx.input(|i| (i.viewport().focused == Some(true), i.viewport().close_requested()));
+        if focused {
+            self.focused = w;
         }
+        menu::set_layout(self.windows[self.focused].layout());
 
-        let content_frame = Frame::NONE.fill(palette.content);
-        if self.sidebar
-            && let Some(tab) = self.tabs.get_mut(self.active)
-            && let DocState::Ready(layout) = &tab.doc
-        {
-            let panel = SidePanel::left("sidebar")
-                .default_width(self.config.sidebar_width)
-                .width_range(sidebar::MIN_WIDTH..=sidebar::MAX_WIDTH)
-                .resizable(true)
-                .frame(content_frame)
-                .show(ctx, |ui| {
-                    sidebar::show(
-                        ui,
-                        self.sidebar_mode,
-                        tab.id,
-                        layout,
-                        &mut tab.view,
-                        tab.outline.as_deref(),
-                        self.thumb_px,
-                        &mut self.cache,
-                        &self.failed,
-                        &mut wants,
-                        &palette,
-                    )
-                });
-            if !ctx.input(|i| i.pointer.any_down()) {
-                self.sidebar_resized(ctx, panel.response.rect.width());
-            }
-            if let Some(target) = panel.inner {
-                self.follow(target);
-            }
-        }
-
-        let clicked_link = CentralPanel::default().frame(content_frame).show(ctx, |ui| {
-            self.visible_ready = false;
-            let Some(tab) = self.tabs.get_mut(self.active) else {
-                empty_state(ui, &palette, "Drop a PDF here or press ⌘O");
-                return None;
-            };
-            match &tab.doc {
-                DocState::Loading => None,
-                DocState::Failed(e) => {
-                    empty_state(ui, &palette, e);
-                    None
-                }
-                DocState::Ready(layout) => {
-                    let out = Canvas {
-                        doc: tab.id,
-                        layout,
-                        view: &mut tab.view,
-                        snapshot: &mut tab.snapshot_texture,
-                        cache: &mut self.cache,
-                        failed: &self.failed,
-                        links: &tab.links,
-                        thumb_px: self.thumb_px,
-                        prefetch: self.prefetch,
-                        page_border: palette.page_border,
+        let changed = external || close || !requests.is_empty();
+        for request in requests {
+            let Some(w) = self.index_of(serial) else { break };
+            match request {
+                Request::Run(command) => self.run(ctx, w, command),
+                Request::Open(paths) => {
+                    for path in paths {
+                        self.open_in(ctx, w, path);
                     }
-                    .show(ui, &mut wants);
-                    self.visible_ready = out.ready;
-                    out.clicked_link
                 }
+                Request::OpenDialog => self.open_dialog(ctx, w),
+                Request::Detach { index, pointer } => self.detach(ctx, w, index, Some(pointer)),
             }
-        })
-        .inner;
-        if let Some(target) = clicked_link {
-            self.follow(target);
         }
-
-        if let Some(quick_open) = &mut self.quick_open
-            && let Some(outcome) = quick_open.show(ctx, &palette)
+        if close
+            && w > 0
+            && let Some(w) = self.index_of(serial)
         {
-            self.quick_open = None;
-            if let Outcome::Open(path) = outcome {
-                self.open(ctx, path);
-            }
+            self.close_window(ctx, w);
+        }
+        if changed {
+            self.repaint_all(ctx);
         }
 
-        self.save_tabs();
-        if self.sleep != Sleep::Awake {
-            // The snapshot stands in for the page; only thumbnails are still drawn.
-            wants.visible.clear();
-            wants.prefetch.clear();
+        self.save_session(false);
+        self.request_renders();
+    }
+
+    /// Hands the render thread what every window wants, the focused window's pages first.
+    /// Windows that haven't drawn since their wants were met still list them, so what's
+    /// already rendered is left out.
+    fn request_renders(&mut self) {
+        let focused = self.windows[self.focused].serial;
+        let mut order: Vec<u64> = self.windows.iter().map(|w| w.serial).collect();
+        order.sort_by_key(|serial| *serial != focused);
+        let mut merged = Wants::default();
+        for serial in &order {
+            if let Some(w) = self.wants.get(serial) {
+                merged.visible.extend(&w.visible);
+                merged.thumbs.extend(&w.thumbs);
+                merged.prefetch.extend(&w.prefetch);
+            }
         }
-        self.renderer.set_wanted(wants.into_queue());
+        if self.sleep != Sleep::Awake {
+            // The snapshots stand in for the pages; only thumbnails are still drawn.
+            merged.visible.clear();
+            merged.prefetch.clear();
+        }
+        let mut queue = merged.into_queue();
+        queue.retain(|key| {
+            !self.shared.cache.contains(key)
+                && !self.shared.failed.contains(key)
+                && !matches!(*key, Key::Links { doc, page } if self.find_doc(doc).is_some_and(|(w, i)| {
+                    self.windows[w].tabs[i].links.contains_key(&page)
+                }))
+        });
+        let showing = self.windows.iter().filter(|w| !w.tabs.is_empty()).count().max(1);
+        self.shared.renderer.set_open_limit(showing);
+        self.shared.renderer.set_wanted(queue);
+
         // A parked tab that has lost tiles to the budget would come back with holes, so it
         // gives up the rest and shows its snapshot when switched back to instead.
-        let evicted = self.cache.trim();
-        if let Some((parked, _)) = self.parked
-            && evicted.contains(&parked)
-        {
-            self.cache.evict_doc(parked);
-            self.parked = None;
+        self.shared.cache.set_budget(self.texture_budget * showing);
+        let keep_since = self.frames.values().copied().min().unwrap_or(0);
+        let evicted = self.shared.cache.trim(keep_since);
+        for window in &mut self.windows {
+            if let Some((parked, _)) = window.parked
+                && evicted.contains(&parked)
+            {
+                self.shared.cache.evict_doc(parked);
+                window.parked = None;
+            }
         }
     }
-}
-
-fn snapshot_texture(ctx: &Context, snapshot: &Snapshot) -> Option<TextureHandle> {
-    let (_, rgba) = qoi::decode_to_vec(&snapshot.qoi).ok()?;
-    let [w, h] = snapshot.size.map(|v| v as usize);
-    let image = ColorImage::from_rgba_premultiplied([w, h], &rgba);
-    Some(ctx.load_texture("snapshot", image, TextureOptions::LINEAR))
-}
-
-fn empty_state(ui: &mut egui::Ui, palette: &Palette, text: &str) {
-    ui.painter().text(
-        ui.max_rect().center(),
-        Align2::CENTER_CENTER,
-        text,
-        FontId::proportional(14.0),
-        palette.text_weak,
-    );
 }

@@ -104,6 +104,7 @@ pub fn install(ctx: &egui::Context) {
             Item("Quit Lightweight PDF", Command::Quit, "q", cmd),
         ]),
         ("File", vec![
+            Item("New Window", Command::NewWindow, "n", cmd),
             Item("Open…", Command::Open, "o", cmd),
             Item("Open Recent…", Command::QuickOpen, "k", cmd),
             Separator,
@@ -127,6 +128,9 @@ pub fn install(ctx: &egui::Context) {
             Separator,
             Item("Show Previous Tab", Command::PreviousTab, "[", cmd_shift),
             Item("Show Next Tab", Command::NextTab, "]", cmd_shift),
+            Separator,
+            Item("Move Tab to New Window", Command::MoveTabToNewWindow, "", none),
+            Item("Merge All Windows", Command::MergeAllWindows, "", none),
         ]),
     ];
 

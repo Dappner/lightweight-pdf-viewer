@@ -148,8 +148,9 @@ fn open_tabs_are_restored_at_launch() {
         modifiers: Modifiers::COMMAND,
     }]);
     let saved = Config::load_from(config.clone());
-    assert_eq!(saved.tabs.len(), 3);
-    assert_eq!(saved.active_tab, 0);
+    assert_eq!(saved.windows.len(), 1);
+    assert_eq!(saved.windows[0].tabs.len(), 3);
+    assert_eq!(saved.windows[0].active, 0);
 
     // Files that have since been deleted are skipped; the active tab is kept.
     std::fs::remove_file(&b).unwrap();

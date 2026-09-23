@@ -11,11 +11,10 @@ use crate::sidebar;
 #[serde(default)]
 pub struct Config {
     pub sidebar_width: f32,
-    /// Reopen the last session's tabs at launch.
+    /// Reopen the last session's windows and tabs at launch.
     pub restore_tabs: bool,
-    /// The tabs open when the app last changed them, and which one was active.
-    pub tabs: Vec<PathBuf>,
-    pub active_tab: usize,
+    /// The windows open when the app last changed them, the main one first.
+    pub windows: Vec<SavedWindow>,
     /// How much to keep in memory to make scrolling and going back fast.
     pub memory: Memory,
     /// Where the settings are saved; `None` keeps them in memory only (tests, benchmarks).
@@ -28,12 +27,21 @@ impl Default for Config {
         Self {
             sidebar_width: sidebar::DEFAULT_WIDTH,
             restore_tabs: true,
-            tabs: Vec::new(),
-            active_tab: 0,
+            windows: Vec::new(),
             memory: Memory::default(),
             path: None,
         }
     }
+}
+
+/// A window's tabs, which one was active, and where the window was.
+#[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SavedWindow {
+    pub tabs: Vec<PathBuf>,
+    pub active: usize,
+    /// Screen position of the window's top-left corner and the size of its content, in points.
+    pub frame: Option<[f32; 4]>,
 }
 
 impl Config {

@@ -17,3 +17,4 @@ mod tab_bar;
 mod theme;
 pub mod titlebar;
 mod view;
+mod window;

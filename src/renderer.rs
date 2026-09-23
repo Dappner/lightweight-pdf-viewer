@@ -1,9 +1,9 @@
 //! Background render thread: rasterizes pages with CoreGraphics (Preview's engine) and reads
 //! document structure (outline, links) with PDFKit.
 //!
-//! Every document lives on this one thread. At most one document is kept open at a time:
-//! touching a different document closes the previous one, which frees its per-document
-//! caches (decoded images, fonts, parsed content streams). CoreGraphics keeps every page it
+//! Every document lives on this one thread. At most one document per window is kept open:
+//! touching another one closes the least recently used, which frees its per-document caches
+//! (decoded images, fonts, parsed content streams). CoreGraphics keeps every page it
 //! has drawn in that cache until the document is released, so a document is also closed
 //! once it has drawn a set number of distinct pages (see [`crate::memory::Tuning::pages_per_open`]), and
 //! reopened in a millisecond or two on its next job.
@@ -172,8 +172,10 @@ struct Queue {
     busy: Vec<Key>,
     done: Vec<Output>,
     paths: HashMap<DocId, PathBuf>,
-    /// Close the open document, releasing CoreGraphics' caches for it.
+    /// Close the open documents, releasing CoreGraphics' caches for them.
     release: bool,
+    /// How many documents may be open at once: one for each window showing one.
+    open_limit: usize,
 }
 
 pub struct Renderer {
@@ -213,7 +215,12 @@ impl Renderer {
         });
     }
 
-    /// Drops queued work and closes the open document; the next job reopens it.
+    /// Lets `limit` documents stay open at once, one for each window.
+    pub fn set_open_limit(&self, limit: usize) {
+        self.shared.0.lock().unwrap().open_limit = limit;
+    }
+
+    /// Drops queued work and closes the open documents; the next job reopens what it needs.
     pub fn release(&self) {
         self.with_queue(|q| {
             q.wanted.clear();
@@ -247,7 +254,7 @@ impl Renderer {
     }
 }
 
-/// The document the worker has open, and the pages it has parsed since opening.
+/// A document the worker has open, and the pages it has parsed since opening.
 struct OpenDoc {
     id: DocId,
     doc: Document,
@@ -255,19 +262,21 @@ struct OpenDoc {
 }
 
 fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context, pages_per_open: usize) {
-    let mut open: Option<OpenDoc> = None;
+    // Least recently used first.
+    let mut open: Vec<OpenDoc> = Vec::new();
 
     loop {
         let (lock, cvar) = shared;
-        let (work, path) = {
+        let (work, path, limit) = {
             let mut q = lock.lock().unwrap();
             loop {
-                if std::mem::take(&mut q.release) || open.as_ref().is_some_and(|o| !q.paths.contains_key(&o.id)) {
-                    open = None;
+                if std::mem::take(&mut q.release) {
+                    open.clear();
                 }
+                open.retain(|o| q.paths.contains_key(&o.id));
                 if let Some(c) = q.control.pop_front() {
                     match q.paths.get(&c.doc()) {
-                        Some(path) => break (Work::Control(c), path.clone()),
+                        Some(path) => break (Work::Control(c), path.clone(), q.open_limit.max(1)),
                         None => continue,
                     }
                 }
@@ -284,7 +293,7 @@ fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context, pages_per_open:
                     });
                     if let Some(path) = q.paths.get(&first.doc()).cloned() {
                         q.busy = batch.clone();
-                        break (Work::Render(batch), path);
+                        break (Work::Render(batch), path, q.open_limit.max(1));
                     }
                 }
                 q = cvar.wait(q).unwrap();
@@ -296,12 +305,16 @@ fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context, pages_per_open:
         // CoreGraphics may autorelease internally; drain per job so nothing piles up on
         // this long-lived thread.
         let outputs = objc2::rc::autoreleasepool(|_| {
-            if open.as_ref().is_none_or(|o| o.id != doc_id) {
-                // Close the previous document before opening the next one.
-                drop(open.take());
-                open = open_document(&path).map(|doc| OpenDoc { id: doc_id, doc, pages: HashSet::new() });
-            }
-            let outputs = match (&open, work) {
+            let current = match open.iter().position(|o| o.id == doc_id) {
+                Some(i) => Some(open.remove(i)),
+                None => {
+                    // Close documents over the limit before opening another.
+                    let excess = (open.len() + 1).saturating_sub(limit);
+                    open.drain(..excess);
+                    open_document(&path).map(|doc| OpenDoc { id: doc_id, doc, pages: HashSet::new() })
+                }
+            };
+            let outputs = match (&current, work) {
                 (Some(o), work) => run(&o.doc, doc_id, work),
                 (None, Work::Control(Control::Open(doc))) => vec![Output::Opened {
                     doc,
@@ -311,10 +324,10 @@ fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context, pages_per_open:
                 (None, Work::Control(Control::Outline(doc))) => vec![Output::Outline { doc, entries: vec![] }],
                 (None, Work::Render(batch)) => batch.into_iter().map(Output::Failed).collect(),
             };
-            if let Some(o) = &mut open {
+            if let Some(mut o) = current {
                 o.pages.extend(pages.iter().flatten());
-                if pages.is_none() || o.pages.len() > pages_per_open {
-                    open = None;
+                if pages.is_some() && o.pages.len() <= pages_per_open {
+                    open.push(o);
                 }
             }
             outputs

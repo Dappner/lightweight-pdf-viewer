@@ -4,7 +4,8 @@ use eframe::egui::{
     self, Event, Modifiers, PointerButton, Pos2, RawInput, Rect, ViewportCommand, ViewportId, ViewportInfo, pos2,
     vec2,
 };
-use lightweight_pdf_viewer::{app::App, config::Config, history::History};
+use lightweight_pdf_viewer::app::{App, Command};
+use lightweight_pdf_viewer::{config::Config, history::History};
 
 /// Tab geometry for a 1000pt-wide window with two tabs (see `tab_bar.rs`): tabs start at
 /// x = 122 (after the traffic lights and view button) and are 220pt wide; the strip's
@@ -88,4 +89,38 @@ fn dragging_empty_strip_moves_the_window() {
     let mut h = Harness::new();
     let commands = h.drag(EMPTY_STRIP, EMPTY_STRIP + vec2(50.0, 0.0));
     assert!(starts_window_drag(&commands));
+}
+
+#[test]
+fn dragging_a_tab_down_detaches_it_into_a_new_window() {
+    let mut h = Harness::new();
+    // A small tug down stays a reorder.
+    h.drag(SECOND_TAB, SECOND_TAB + vec2(0.0, 40.0));
+    assert_eq!(h.app.stats().windows, 1);
+
+    h.drag(SECOND_TAB, SECOND_TAB + vec2(0.0, 300.0));
+    let stats = h.app.stats();
+    assert_eq!(stats.windows, 2);
+    assert_eq!(stats.tabs, 1, "the new window, focused, holds the dragged tab");
+}
+
+#[test]
+fn a_lone_tab_dropped_away_moves_its_window() {
+    let mut h = Harness::new();
+    h.drag(SECOND_TAB, SECOND_TAB + vec2(0.0, 300.0));
+    // The main window now has a single tab: dropping it elsewhere moves the window there.
+    let commands = h.drag(FIRST_TAB, FIRST_TAB + vec2(0.0, 300.0));
+    assert!(commands.iter().any(|c| matches!(c, ViewportCommand::OuterPosition(_))));
+    assert_eq!(h.app.stats().windows, 2);
+}
+
+#[test]
+fn merging_brings_every_tab_back_into_one_window() {
+    let mut h = Harness::new();
+    h.drag(SECOND_TAB, SECOND_TAB + vec2(0.0, 300.0));
+    assert_eq!(h.app.stats().windows, 2);
+    h.app.run(&h.ctx, 0, Command::MergeAllWindows);
+    h.frame(vec![]);
+    let stats = h.app.stats();
+    assert_eq!((stats.windows, stats.tabs), (1, 2));
 }

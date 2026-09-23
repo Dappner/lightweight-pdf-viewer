@@ -85,6 +85,7 @@ impl View {
         let rect = layout.page_rect(page, self.zoom, self.content_width(layout, self.zoom));
         let x = self.pending_offset.unwrap_or(self.offset).x;
         self.pending_offset = Some(vec2(x, (rect.top() - MARGIN).max(0.0)));
+        self.landed_page = Some(page);
     }
 
     /// Scrolls so `y` (0 = top of the page, 1 = bottom) sits at the top of the viewport.
@@ -206,6 +207,7 @@ impl Canvas<'_> {
 
         let content = layout.content_size(view.zoom, area.width());
         let mut scroll = ScrollArea::both().id_salt(("doc", doc)).auto_shrink(false);
+        let jumped = view.pending_offset.is_some();
         if let Some(offset) = view.pending_offset.take() {
             scroll = scroll.scroll_offset(offset);
         }
@@ -227,6 +229,8 @@ impl Canvas<'_> {
 
             let mut all_visible_ready = true;
             let mut clicked_link = None;
+            // The page taking up the most of the viewport; the first one on a tie.
+            let mut most_visible = (0.0, layout.page_at(viewport.top(), view.zoom));
             let pages = layout.pages_in(prefetch.top() - origin.y, prefetch.bottom() - origin.y, view.zoom);
             for page in pages {
                 let size = layout.page_size(page);
@@ -239,6 +243,10 @@ impl Canvas<'_> {
                 let visible = rect.intersects(screen_viewport);
 
                 if visible {
+                    let shown = rect.intersect(screen_viewport).area();
+                    if shown > most_visible.0 + 0.5 {
+                        most_visible = (shown, page);
+                    }
                     if snapshot.is_none() {
                         painter.rect_filled(rect, 0.0, Color32::WHITE);
                         let thumb = Key::Thumb { doc, page: page as u32, width: thumb_px };
@@ -290,12 +298,15 @@ impl Canvas<'_> {
                 }
             }
 
-            view.current_page = layout.page_at(viewport.center().y, view.zoom);
-            (all_visible_ready, clicked_link)
+            (all_visible_ready, clicked_link, most_visible.1)
         });
-        let (all_visible_ready, clicked_link) = output.inner;
+        let (all_visible_ready, clicked_link, most_visible) = output.inner;
 
         let scrolled = output.state.offset != view.offset;
+        if scrolled && !jumped {
+            view.landed_page = None;
+        }
+        view.current_page = view.landed_page.unwrap_or(most_visible);
         view.offset = output.state.offset;
         view.viewport = output.inner_rect;
 

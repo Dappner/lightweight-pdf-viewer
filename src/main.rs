@@ -1,24 +1,21 @@
 use std::path::PathBuf;
 
 use eframe::egui;
-use lightweight_pdf_viewer::{app::App, config::Config, finder, history::History, memory, menu, titlebar};
+use lightweight_pdf_viewer::app::{self, App};
+use lightweight_pdf_viewer::{config::Config, finder, history::History, memory, menu, titlebar};
 
 fn main() -> eframe::Result {
     let config = Config::load();
     memory::relaunch(config.memory);
     let files: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
     finder::install();
+    // The main window reopens where the first saved window was.
+    let main_window = match config.windows.first().and_then(|w| w.frame).filter(|_| config.restore_tabs) {
+        Some([x, y, w, h]) => app::window_at(egui::pos2(x, y), egui::vec2(w, h)),
+        None => app::window_builder(),
+    };
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Lightweight PDF")
-            // An empty icon keeps the bundle's icon; otherwise eframe swaps in egui's logo.
-            .with_icon(egui::IconData::default())
-            .with_inner_size([960.0, 1080.0])
-            .with_min_inner_size([480.0, 360.0])
-            .with_fullsize_content_view(true)
-            .with_titlebar_shown(false)
-            .with_title_shown(false)
-            .with_drag_and_drop(true),
+        viewport: main_window,
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: egui_wgpu::WgpuConfiguration {
             // Two drawables instead of three. Each is a full-window buffer (28 MB for a

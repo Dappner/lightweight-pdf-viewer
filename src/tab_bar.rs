@@ -1,12 +1,14 @@
 //! Chrome-style tab strip drawn in the (transparent) macOS title bar.
 //!
 //! Tabs shrink to [`MIN_TAB`] and then scroll horizontally (trackpad or wheel over the strip).
-//! Dragging a tab reorders it. Left of the tabs, a Preview-style button opens a menu of
-//! sidebar and page layout options.
+//! Dragging a tab reorders it; dragging it well below the strip, or out of the window,
+//! detaches it: released over another window's strip it joins that window, and anywhere
+//! else it gets a window of its own (a window's only tab just moves its window there).
+//! Left of the tabs, a Preview-style button opens a menu of sidebar and page layout options.
 
 use eframe::egui::{
-    Align2, Button, CornerRadius, CursorIcon, FontId, Id, Painter, Popup, Rect, Response, Sense,
-    Stroke, Ui, ViewportCommand, pos2, text::LayoutJob, vec2,
+    Align2, Button, CornerRadius, CursorIcon, FontId, LayerId, Order, Painter, Popup, Pos2, Rect,
+    Response, Sense, Stroke, Ui, Vec2, ViewportCommand, pos2, text::LayoutJob, vec2,
 };
 
 use crate::app::Command;
@@ -29,11 +31,18 @@ const MIN_TAB: f32 = 110.0;
 const MAX_TAB: f32 = 220.0;
 const PLUS_WIDTH: f32 = 36.0;
 const STATUS_WIDTH: f32 = 150.0;
+/// How far below the strip a dragged tab must go to detach.
+const DETACH_DISTANCE: f32 = 60.0;
+/// Where a detached tab's new window goes relative to the pointer: the pointer ends up
+/// over the start of the new window's first tab.
+pub const NEW_WINDOW_GRAB: Vec2 = vec2(LEADING + VIEW_BUTTON + 40.0, TRAFFIC_LIGHT_CENTER_Y);
 
 pub enum Action {
     Select(usize),
     Close(usize),
     Move { from: usize, to: usize },
+    /// A tab was dragged out and dropped at `pointer` (window coordinates).
+    Detach { index: usize, pointer: Pos2 },
     Open,
     Run(Command),
 }
@@ -70,13 +79,8 @@ pub fn show(
     }
     ui.painter().rect_filled(bar, 0.0, palette.chrome);
 
-    let leading = LEADING + VIEW_BUTTON;
-    let area = Rect::from_min_max(
-        pos2(bar.left() + leading, bar.top() + TAB_TOP),
-        pos2((bar.right() - STATUS_WIDTH - PLUS_WIDTH).max(bar.left() + leading), bar.bottom()),
-    );
     let n = tabs.len();
-    let tab_width = if n == 0 { 0.0 } else { (area.width() / n as f32).clamp(MIN_TAB, MAX_TAB) };
+    let (area, tab_width) = strip(bar, n);
     let total = tab_width * n as f32;
     let max_scroll = (total - area.width()).max(0.0);
 
@@ -87,7 +91,7 @@ pub fn show(
         *scroll -= delta.x + delta.y;
     }
     let active_id = tabs.get(active).map(|t| t.id);
-    let last_active_key = Id::new("tab_bar_last_active");
+    let last_active_key = ui.id().with("last_active");
     if ui.data(|d| d.get_temp::<Option<DocId>>(last_active_key)) != Some(active_id) {
         // Bring a newly active tab fully into view.
         let left = active as f32 * tab_width;
@@ -113,10 +117,28 @@ pub fn show(
         .map(|(i, tab)| ui.interact(close_rect(slot(i)).intersect(area), ui.id().with(("close", tab.id)), Sense::click()))
         .collect();
 
-    let grab_key = Id::new("tab_bar_grab");
-    let pointer_x = ui.input(|i| i.pointer.interact_pos()).map(|p| p.x);
+    let grab_key = ui.id().with("grab");
+    // The last known position: it goes stale rather than missing once the pointer leaves
+    // the window mid-drag.
+    let pointer = ui.input(|i| i.pointer.latest_pos());
+    let pointer_x = pointer.map(|p| p.x);
+    let window = ui.ctx().content_rect();
+    let detaching = |p: Pos2| p.y > bar.bottom() + DETACH_DISTANCE || !window.contains(p);
     let mut dragged = None;
+    let mut detached = None;
     for (i, response) in responses.iter().enumerate() {
+        if response.drag_stopped()
+            && let Some(p) = pointer.filter(|p| detaching(*p))
+        {
+            action = Some(Action::Detach { index: i, pointer: p });
+            continue;
+        }
+        if response.dragged()
+            && let Some(p) = pointer.filter(|p| detaching(*p))
+        {
+            detached = Some((i, p));
+            continue;
+        }
         if response.drag_started()
             && let Some(x) = pointer_x
         {
@@ -146,7 +168,7 @@ pub fn show(
 
     let painter = ui.painter_at(area);
     for (i, tab) in tabs.iter().enumerate() {
-        if dragged.is_some_and(|(d, _)| d == i) {
+        if dragged.is_some_and(|(d, _)| d == i) || detached.is_some_and(|(d, _)| d == i) {
             continue;
         }
         let hovered = responses[i].hovered() || closes[i].hovered();
@@ -155,6 +177,9 @@ pub fn show(
     }
     if let Some((i, rect)) = dragged {
         paint_tab(&painter, rect, &tabs[i], true, true, false, false, palette);
+    }
+    if let Some((i, p)) = detached {
+        paint_detached(ui, &tabs[i], p, tab_width, palette);
     }
 
     for (i, (response, close)) in responses.iter().zip(&closes).enumerate() {
@@ -190,6 +215,51 @@ pub fn show(
     }
 
     action
+}
+
+/// The tab area of a strip in `bar` holding `n` tabs, and the width of each tab.
+fn strip(bar: Rect, n: usize) -> (Rect, f32) {
+    let leading = LEADING + VIEW_BUTTON;
+    let area = Rect::from_min_max(
+        pos2(bar.left() + leading, bar.top() + TAB_TOP),
+        pos2((bar.right() - STATUS_WIDTH - PLUS_WIDTH).max(bar.left() + leading), bar.bottom()),
+    );
+    let tab_width = if n == 0 { 0.0 } else { (area.width() / n as f32).clamp(MIN_TAB, MAX_TAB) };
+    (area, tab_width)
+}
+
+/// Whether `pointer` (window coordinates) is over the strip of a window `width` wide.
+pub fn contains(width: f32, pointer: Pos2) -> bool {
+    pointer.x >= 0.0 && pointer.x <= width && pointer.y >= 0.0 && pointer.y <= HEIGHT
+}
+
+/// Where a tab dropped at `x` (window coordinates) goes among the `n` tabs of a strip in a
+/// window `width` wide, scrolled by `scroll`.
+pub fn drop_index(width: f32, n: usize, scroll: f32, x: f32) -> usize {
+    let (area, tab_width) = strip(Rect::from_min_size(Pos2::ZERO, vec2(width, HEIGHT)), n.max(1));
+    (((x - area.left() + scroll) / tab_width).round().max(0.0) as usize).min(n)
+}
+
+/// A dragged-out tab under the pointer, badged with a plus: releasing opens a new window.
+fn paint_detached(ui: &Ui, tab: &Tab, pointer: Pos2, tab_width: f32, palette: &Palette) {
+    let painter = ui.ctx().layer_painter(LayerId::new(Order::Tooltip, ui.id().with("detached")));
+    let rect = Rect::from_min_size(pointer - vec2(24.0, 12.0), vec2(tab_width.min(MAX_TAB), 26.0));
+    painter.rect_filled(rect.translate(vec2(0.0, 2.0)), CornerRadius::same(7), palette.separator);
+    painter.rect(rect, CornerRadius::same(7), palette.content, Stroke::new(1.0, palette.separator), eframe::egui::StrokeKind::Inside);
+
+    let badge = pos2(rect.left() + 13.0, rect.center().y);
+    painter.circle_filled(badge, 7.0, palette.accent);
+    let stroke = Stroke::new(1.5, eframe::egui::Color32::WHITE);
+    painter.line_segment([badge - vec2(3.5, 0.0), badge + vec2(3.5, 0.0)], stroke);
+    painter.line_segment([badge - vec2(0.0, 3.5), badge + vec2(0.0, 3.5)], stroke);
+
+    let mut job = LayoutJob::simple_singleline(tab.title.clone(), FontId::proportional(12.5), palette.text);
+    job.wrap.max_width = rect.right() - 8.0 - (badge.x + 12.0);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    let galley = painter.layout_job(job);
+    painter.galley(pos2(badge.x + 12.0, rect.center().y - galley.size().y / 2.0), galley, palette.text);
+    ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
 }
 
 /// A sidebar icon with a chevron, like Preview's, that opens the view options.
