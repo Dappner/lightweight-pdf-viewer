@@ -8,18 +8,27 @@
 //! default 1000x1000), BENCH_BREAKDOWN=1 prints `footprint`'s per-category breakdown after
 //! each phase, BENCH_FULL=1 runs the long version (see [`Rounds`]).
 //!
+//! With two or more files, a final phase moves one tab into a second window. It scrolls the
+//! first window while the second draws nothing, as an unfocused window does (the texture cache
+//! should stay within its budget), then scrolls the second while the first keeps drawing and
+//! so takes in the second window's tiles (which must survive until the second draws them).
+//!
+//! Every wait for sharp tiles that times out is counted; the run fails if any did.
+//!
 //! Memory is the process footprint without a window: GPU textures are not allocated, so
 //! the "textures" column reports what they would occupy on the GPU. A windowed app adds a
 //! roughly fixed ~35 MB (Metal, swapchain) on top. Each phase ends with its CPU time (all
 //! threads) and the peak footprint seen during it, sampled every frame.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Event, Key, Modifiers, RawInput, Rect, Vec2, ViewportId, ViewportInfo, pos2,
+    self, DeferredViewportUiCallback, Event, Key, Modifiers, RawInput, Rect, Vec2, ViewportId, ViewportInfo, pos2,
 };
-use lightweight_pdf_viewer::app::{App, Stats};
+use lightweight_pdf_viewer::app::{App, Command, Stats};
 use lightweight_pdf_viewer::config::Config;
 use lightweight_pdf_viewer::history::History;
 use lightweight_pdf_viewer::memory::{self, Memory};
@@ -61,6 +70,15 @@ struct Harness {
     /// Highest footprint seen since the phase began.
     peak: f64,
     phase_cpu: f64,
+    /// The other windows' frame callbacks, which run only when [`Self::window_frame`] asks,
+    /// as a native window only draws when something changes.
+    windows: HashMap<ViewportId, Arc<DeferredViewportUiCallback>>,
+    /// Whether [`Self::wait`] draws the other windows too.
+    draw_others: bool,
+    others_focused: bool,
+    other_events: Vec<Event>,
+    /// Waits that gave up before their condition held.
+    timeouts: usize,
 }
 
 impl Harness {
@@ -77,8 +95,35 @@ impl Harness {
         );
         let app = &mut self.app;
         // The output (including texture uploads) is dropped: there is no GPU.
-        let _ = self.ctx.run(raw, |ctx| app.ui(ctx));
+        let output = self.ctx.run(raw, |ctx| app.ui(ctx));
+        self.windows = output
+            .viewport_output
+            .into_iter()
+            .filter_map(|(id, v)| Some((id, v.viewport_ui_cb?)))
+            .collect();
         self.peak = self.peak.max(footprint_mb());
+    }
+
+    /// One frame of every window other than the main one.
+    fn window_frame(&mut self) {
+        for (id, ui) in self.windows.clone() {
+            let mut raw = RawInput {
+                viewport_id: id,
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), self.size)),
+                time: Some(self.start.elapsed().as_secs_f64()),
+                events: std::mem::take(&mut self.other_events),
+                ..Default::default()
+            };
+            raw.viewports.insert(
+                id,
+                ViewportInfo {
+                    native_pixels_per_point: Some(self.ppp),
+                    focused: Some(self.others_focused),
+                    ..Default::default()
+                },
+            );
+            let _ = self.ctx.run(raw, |ctx| ui(ctx));
+        }
     }
 
     fn begin_phase(&mut self) {
@@ -98,15 +143,25 @@ impl Harness {
         self.events.push(Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers });
     }
 
-    /// Runs frames until `done` holds; returns the elapsed time.
+    /// Presses a key in the other windows.
+    fn press_other(&mut self, key: Key) {
+        self.other_events.push(Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE });
+    }
+
+    /// Runs frames until `done` holds; returns the elapsed time, or `None` (counted in
+    /// `timeouts`) if it gave up.
     fn wait(&mut self, done: impl Fn(&Stats) -> bool) -> Option<Duration> {
         let t = Instant::now();
         loop {
             self.frame();
+            if self.draw_others {
+                self.window_frame();
+            }
             if done(&self.stats()) {
                 return Some(t.elapsed());
             }
             if t.elapsed() > TIMEOUT {
+                self.timeouts += 1;
                 return None;
             }
             std::thread::sleep(Duration::from_micros(500));
@@ -208,16 +263,25 @@ fn main() {
         .unwrap_or(Vec2::new(1000.0, 1000.0));
 
     let ctx = egui::Context::default();
+    // Other windows draw only when the harness runs them, as with native windows.
+    ctx.set_embed_viewports(false);
     let mut config = Config::default();
     config.memory = preset;
     let app = App::new(&ctx, config, History::default(), Vec::new());
-    let mut h = Harness { ctx, app, start: Instant::now(), size, ppp, focused: true, events: Vec::new(), peak: 0.0, phase_cpu: 0.0 };
+    let mut h = Harness { ctx, app, start: Instant::now(), size, ppp, focused: true, events: Vec::new(), peak: 0.0, phase_cpu: 0.0,
+        windows: HashMap::new(),
+        draw_others: false,
+        others_focused: false,
+        other_events: Vec::new(),
+        timeouts: 0,
+    };
     h.frame();
     let malloc = std::env::var("MallocSpaceEfficient").map_or("default".into(), |v| format!("MallocSpaceEfficient={v}"));
     println!("memory preset {preset:?} ({malloc}), viewport {}x{} pt @ {ppp}x\n", size.x, size.y);
     println!("startup footprint: {:.1} MB (no window)\n", footprint_mb());
 
     println!("{:<34} {:>6} {:>14} {:>10} {:>10} {:>11}", "open", "pages", "to sharp ms", "footprint", "textures", "snapshots");
+    println!("{:>101}", "(allocated)");
     h.begin_phase();
     for (i, file) in files.iter().enumerate() {
         let t = Instant::now();
@@ -226,13 +290,14 @@ fn main() {
         let s = h.stats();
         let name = file.file_name().unwrap_or_default().to_string_lossy();
         println!(
-            "{:<34} {:>6} {:>14} {:>7.1} MB {:>7.1} MB {:>8} KB",
+            "{:<34} {:>6} {:>14} {:>7.1} MB {:>7.1} MB {:>8} KB {:>8} KB",
             name.chars().take(34).collect::<String>(),
             s.page_count,
             ms(sharp),
             footprint_mb(),
             mb(s.texture_bytes),
-            s.snapshot_bytes / 1024
+            s.snapshot_bytes / 1024,
+            s.snapshot_capacity / 1024
         );
     }
     h.idle(Duration::from_millis(300));
@@ -282,6 +347,12 @@ fn main() {
         }
         h.idle(Duration::from_millis(300));
         println!("  footprint over {} more switches: {before:.1} -> {:.1} MB", rounds.more, footprint_mb());
+        let s = h.stats();
+        println!(
+            "  snapshots held: {} KB compressed, {} KB allocated",
+            s.snapshot_bytes / 1024,
+            s.snapshot_capacity / 1024
+        );
         h.end_phase();
     }
 
@@ -335,10 +406,23 @@ fn main() {
     h.end_phase();
 
     println!("\nbackground (unfocused and left alone; the snapshot texture is not counted)");
-    let Some(after) = preset.tuning().sleep_after else {
-        println!("  never drops tiles with this preset");
-        return;
-    };
+    match preset.tuning().sleep_after {
+        Some(after) => background(&mut h, after),
+        None => println!("  never drops tiles with this preset"),
+    }
+
+    if files.len() > 1 {
+        two_windows(&mut h, &rounds, preset);
+    }
+
+    if h.timeouts > 0 {
+        eprintln!("\n{} waits for sharp tiles timed out; the results above are not valid", h.timeouts);
+        std::process::exit(1);
+    }
+}
+
+/// Leaves the app unfocused until it drops its tiles, then focuses it again.
+fn background(h: &mut Harness, after: f64) {
     h.begin_phase();
     let textures = h.stats().texture_bytes;
     h.focused = false;
@@ -366,4 +450,69 @@ fn main() {
     let covered = h.stats().snapshot_shown || h.stats().ready;
     let sharp = h.wait(|s| s.ready).map(|_| t.elapsed());
     println!("  refocus: covered {covered}, to sharp {} ms", ms(sharp));
+}
+
+/// Moves the active tab into a second window and waits until both are sharp. Then scrolls the
+/// first window while the second draws nothing, and the second while the first keeps drawing.
+fn two_windows(h: &mut Harness, rounds: &Rounds, preset: Memory) {
+    println!("\ntwo windows");
+    h.app.run(&h.ctx.clone(), 0, Command::MoveTabToNewWindow);
+    h.draw_others = true;
+    let sharp = h.wait(|s| s.windows_ready);
+    let s = h.stats();
+    assert_eq!(s.windows, 2, "tab was not moved to a second window");
+    println!("  both windows sharp: {} ms", ms(sharp));
+    let budget = preset.tuning().texture_budget * s.windows;
+
+    println!("  the first window scrolls, the second draws nothing");
+    h.draw_others = false;
+    h.press(Key::Home, Modifiers::NONE);
+    h.wait(|s| s.ready);
+    scroll_both_windows(h, rounds, budget, |h| h.press(Key::PageDown, Modifiers::NONE));
+
+    println!("  the second window scrolls, the first keeps drawing");
+    h.draw_others = true;
+    h.focused = false;
+    h.others_focused = true;
+    h.press_other(Key::Home);
+    h.wait(|s| s.ready);
+    scroll_both_windows(h, rounds, budget, |h| h.press_other(Key::PageDown));
+    breakdown("two windows");
+}
+
+/// Pages down in the focused window with `page_down` and reports the texture peak and any
+/// steps that never became sharp.
+fn scroll_both_windows(h: &mut Harness, rounds: &Rounds, budget: usize, page_down: impl Fn(&mut Harness)) {
+    h.begin_phase();
+    let timeouts = h.timeouts;
+    let start = h.stats().texture_bytes;
+    let mut peak = start;
+    let mut steps = Vec::new();
+    let (mut last, mut stuck) = (usize::MAX, 0);
+    for _ in 0..rounds.scroll.min(5000) {
+        let s = h.stats();
+        stuck = if s.current_page == last { stuck + 1 } else { 0 };
+        // Each timeout takes 20 s; a few are enough to show the window isn't getting its tiles.
+        if s.current_page + 1 >= s.page_count || stuck > 8 || h.timeouts - timeouts >= 3 {
+            break;
+        }
+        last = s.current_page;
+        page_down(h);
+        let t = Instant::now();
+        if h.wait(|s| s.ready).is_some() {
+            steps.push(t.elapsed());
+        }
+        peak = peak.max(h.stats().texture_bytes);
+    }
+    println!(
+        "    {} steps sharp, {} timed out, to sharp {}   textures {:.1} -> peak {:.1} MB (budget {:.1} MB)   footprint {:.1} MB",
+        steps.len(),
+        h.timeouts - timeouts,
+        summary(steps),
+        mb(start),
+        mb(peak),
+        mb(budget),
+        footprint_mb()
+    );
+    h.end_phase();
 }

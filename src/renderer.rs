@@ -105,12 +105,18 @@ pub struct SnapshotJob {
     pub pages: Vec<SnapshotPage>,
 }
 
+/// QOI-compressed RGBA viewport image, kept while the tab is in the background.
+pub struct Snapshot {
+    pub size: [u32; 2],
+    pub qoi: Vec<u8>,
+}
+
 pub enum Output {
     Opened { doc: DocId, result: Result<Vec<Vec2>, String> },
     Image { key: Key, size: [usize; 2], rgba: Vec<u8> },
     Failed(Key),
-    /// QOI-compressed RGBA viewport image, kept while the tab is in the background.
-    Snapshot { doc: DocId, size: [u32; 2], qoi: Vec<u8> },
+    /// `None` if the viewport could not be drawn.
+    Snapshot { doc: DocId, snapshot: Option<Snapshot> },
     Links { doc: DocId, page: u32, links: Vec<Link> },
     Outline { doc: DocId, entries: Vec<OutlineEntry> },
 }
@@ -320,7 +326,7 @@ fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context, pages_per_open:
                     doc,
                     result: Err(format!("Could not open {}", path.display())),
                 }],
-                (None, Work::Control(Control::Snapshot(_))) => vec![],
+                (None, Work::Control(Control::Snapshot(job))) => vec![Output::Snapshot { doc: job.doc, snapshot: None }],
                 (None, Work::Control(Control::Outline(doc))) => vec![Output::Outline { doc, entries: vec![] }],
                 (None, Work::Render(batch)) => batch.into_iter().map(Output::Failed).collect(),
             };
@@ -365,7 +371,9 @@ fn run(doc: &Document, doc_id: DocId, work: Work) -> Vec<Output> {
                 .collect();
             vec![Output::Opened { doc: doc_id, result: Ok(sizes) }]
         }
-        Work::Control(Control::Snapshot(job)) => render_snapshot(&doc.cg, &job).into_iter().collect(),
+        Work::Control(Control::Snapshot(job)) => {
+            vec![Output::Snapshot { doc: job.doc, snapshot: render_snapshot(&doc.cg, &job) }]
+        }
         Work::Control(Control::Outline(_)) => vec![Output::Outline { doc: doc_id, entries: outline(doc) }],
         Work::Render(batch) => {
             let Some(page) = get_page(&doc.cg, batch[0].page()) else {
@@ -575,7 +583,7 @@ fn render_key(page: &CGPDFPage, geometry: &PageGeometry, key: Key) -> Option<Out
     Some(Output::Image { key, size: [w as usize, h as usize], rgba })
 }
 
-fn render_snapshot(doc: &CGPDFDocument, job: &SnapshotJob) -> Option<Output> {
+fn render_snapshot(doc: &CGPDFDocument, job: &SnapshotJob) -> Option<Snapshot> {
     let [w, h] = job.size;
     let mut rgba = vec![0u8; (w * h * 4) as usize];
     let ctx = bitmap_context(&mut rgba, w, h)?;
@@ -591,8 +599,11 @@ fn render_snapshot(doc: &CGPDFDocument, job: &SnapshotJob) -> Option<Output> {
         );
     }
     drop(ctx);
-    let qoi = qoi::encode_to_vec(&rgba, w, h).ok()?;
-    Some(Output::Snapshot { doc: job.doc, size: job.size, qoi })
+    let mut qoi = qoi::encode_to_vec(&rgba, w, h).ok()?;
+    // The encoder allocates for the worst case (5 bytes a pixel, more than uncompressed);
+    // snapshots are kept for as long as their tab is in the background.
+    qoi.shrink_to_fit();
+    Some(Snapshot { size: job.size, qoi })
 }
 
 #[cfg(test)]
@@ -654,7 +665,7 @@ mod tests {
                 SnapshotPage { page: 1, x: 20, y: 244, width: 576, height: 432 },
             ],
         };
-        let Some(Output::Snapshot { size, qoi, .. }) = render_snapshot(doc, &job) else { panic!("snapshot") };
+        let Some(Snapshot { size, qoi }) = render_snapshot(doc, &job) else { panic!("snapshot") };
         let (_, rgba) = qoi::decode_to_vec(&qoi).unwrap();
         println!("snapshot qoi {} KB (raw {} KB)", qoi.len() / 1024, rgba.len() / 1024);
         write_png(&format!("{out}/snapshot.png"), &rgba, size[0], size[1]);

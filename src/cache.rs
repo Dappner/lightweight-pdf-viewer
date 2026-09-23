@@ -1,9 +1,12 @@
 //! GPU texture cache shared by all tabs, bounded by a byte budget.
 //!
-//! Entries used in any window's latest frame are never evicted; everything else is evicted
-//! least-recently-used first once the budget is exceeded.
+//! Entries a window used in its latest frame are never evicted, however long ago that frame
+//! was (a window only draws when something in it changes), nor are tiles a window is still
+//! waiting for: any window's frame can take in another window's tiles, which that window
+//! only draws on its next frame. Everything else is evicted least-recently-used first once
+//! the budget is exceeded.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use eframe::egui::{TextureHandle, TextureId};
 
@@ -20,27 +23,38 @@ pub struct TextureCache {
     bytes: usize,
     budget: usize,
     frame: u64,
+    /// The window drawing now, by serial.
+    window: u64,
+    /// What each window used in its latest frame, by serial.
+    shown: HashMap<u64, HashSet<Key>>,
 }
 
 impl TextureCache {
     pub fn new(budget: usize) -> Self {
-        Self { entries: HashMap::new(), bytes: 0, budget, frame: 0 }
+        Self { entries: HashMap::new(), bytes: 0, budget, frame: 0, window: 0, shown: HashMap::new() }
     }
 
-    /// Starts a window's frame; returns its number, for [`Self::trim`].
-    pub fn begin_frame(&mut self) -> u64 {
+    /// Starts a frame of the window with this serial, replacing what it last showed.
+    pub fn begin_frame(&mut self, window: u64) {
         self.frame += 1;
-        self.frame
+        self.window = window;
+        self.shown.entry(window).or_default().clear();
+    }
+
+    /// Stops protecting what a closed window showed.
+    pub fn forget_window(&mut self, window: u64) {
+        self.shown.remove(&window);
     }
 
     pub fn set_budget(&mut self, budget: usize) {
         self.budget = budget;
     }
 
-    /// Returns the texture and marks it as in use this frame.
+    /// Returns the texture and marks it as shown by the window drawing now.
     pub fn get(&mut self, key: &Key) -> Option<TextureId> {
         let entry = self.entries.get_mut(key)?;
         entry.last_used = self.frame;
+        self.shown.entry(self.window).or_default().insert(*key);
         Some(entry.texture.id())
     }
 
@@ -76,9 +90,9 @@ impl TextureCache {
         self.retain(|k| k.doc() != doc);
     }
 
-    /// Evicts down to the budget, sparing entries used since frame `keep_since`; returns the
-    /// documents that lost entries.
-    pub fn trim(&mut self, keep_since: u64) -> Vec<DocId> {
+    /// Evicts down to the budget, sparing what each window showed in its latest frame and
+    /// the `awaited` keys it asked for then; returns the documents that lost entries.
+    pub fn trim(&mut self, awaited: &HashSet<Key>) -> Vec<DocId> {
         let mut evicted = Vec::new();
         if self.bytes <= self.budget {
             return evicted;
@@ -86,7 +100,7 @@ impl TextureCache {
         let mut candidates: Vec<(u64, Key)> = self
             .entries
             .iter()
-            .filter(|(_, e)| e.last_used < keep_since)
+            .filter(|(k, _)| !awaited.contains(*k) && !self.shown.values().any(|shown| shown.contains(*k)))
             .map(|(k, e)| (e.last_used, *k))
             .collect();
         candidates.sort_unstable_by_key(|(used, _)| *used);
@@ -104,5 +118,77 @@ impl TextureCache {
 
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use eframe::egui::{ColorImage, Context, TextureOptions};
+
+    use super::*;
+
+    fn tile(doc: DocId, page: u32) -> Key {
+        Key::Tile { doc, page, scale: 100, tx: 0, ty: 0 }
+    }
+
+    fn insert(cache: &mut TextureCache, ctx: &Context, key: Key) {
+        let texture = ctx.load_texture("t", ColorImage::filled([1, 1], Default::default()), TextureOptions::LINEAR);
+        cache.insert(key, texture, 1);
+    }
+
+    /// A window that stops drawing keeps what it shows, but no longer stops other windows'
+    /// old tiles from being evicted.
+    #[test]
+    fn idle_window_protects_only_what_it_shows() {
+        let ctx = Context::default();
+        let mut cache = TextureCache::new(3);
+        cache.begin_frame(1);
+        insert(&mut cache, &ctx, tile(1, 0));
+        cache.get(&tile(1, 0));
+
+        // Window 2 scrolls through ten pages while window 1 draws nothing.
+        for page in 0..10 {
+            cache.begin_frame(2);
+            insert(&mut cache, &ctx, tile(2, page));
+            cache.get(&tile(2, page));
+            cache.trim(&HashSet::new());
+            assert!(cache.bytes() <= 3, "{} bytes over a budget of 3 at page {page}", cache.bytes());
+        }
+        assert!(cache.contains(&tile(1, 0)), "idle window's tile was evicted");
+        assert!(cache.contains(&tile(2, 9)), "visible tile was evicted");
+
+        cache.forget_window(1);
+        cache.set_budget(1);
+        cache.trim(&HashSet::new());
+        assert!(!cache.contains(&tile(1, 0)), "closed window's tile is still protected");
+        assert!(cache.contains(&tile(2, 9)));
+    }
+
+    /// A tile rendered for a window arrives during another window's frame, which trims the
+    /// cache before the window it's for draws again.
+    #[test]
+    fn awaited_tile_survives_until_drawn() {
+        let ctx = Context::default();
+        let mut cache = TextureCache::new(1);
+        // Window 2 shows a tile and waits for another; window 1's tile fills the budget.
+        cache.begin_frame(2);
+        insert(&mut cache, &ctx, tile(2, 0));
+        cache.get(&tile(2, 0));
+        let awaited = HashSet::from([tile(2, 1)]);
+        cache.begin_frame(1);
+        insert(&mut cache, &ctx, tile(1, 0));
+        cache.get(&tile(1, 0));
+
+        // The awaited tile arrives during window 1's frame.
+        insert(&mut cache, &ctx, tile(2, 1));
+        cache.trim(&awaited);
+        assert!(cache.contains(&tile(2, 1)), "awaited tile was evicted before its window drew it");
+
+        // Window 2 draws it; its request is no longer outstanding.
+        cache.begin_frame(2);
+        cache.get(&tile(2, 1));
+        cache.trim(&HashSet::new());
+        assert!(cache.contains(&tile(2, 1)));
+        assert!(!cache.contains(&tile(2, 0)), "tile window 2 no longer shows was kept");
     }
 }

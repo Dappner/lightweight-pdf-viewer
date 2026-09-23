@@ -5,7 +5,7 @@ use eframe::egui::{Rect, TextureHandle, Vec2};
 
 use crate::history::Place;
 use crate::layout::DocLayout;
-use crate::renderer::{DocId, Link, OutlineEntry};
+use crate::renderer::{DocId, Link, OutlineEntry, Snapshot};
 
 pub enum DocState {
     Loading,
@@ -30,11 +30,6 @@ pub struct Tab {
     pub outline_requested: bool,
     /// Where the file was left last time, applied once it loads.
     pub restore: Option<Place>,
-}
-
-pub struct Snapshot {
-    pub size: [u32; 2],
-    pub qoi: Vec<u8>,
 }
 
 /// Scroll and zoom state of a tab. Survives while the tab is in the background.
