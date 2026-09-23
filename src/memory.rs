@@ -60,14 +60,19 @@ impl Memory {
 
 const SPACE_EFFICIENT: &str = "MallocSpaceEfficient";
 
-/// Restarts the process with `MallocSpaceEfficient=1` if the preset wants it. The system
-/// allocator otherwise keeps memory freed after rendering (half of it, after a long session)
-/// counted against the app. It only reads the setting at launch, so this must run first
-/// thing in `main`. Setting `MallocSpaceEfficient` yourself (to 0 or 1) skips the restart.
+/// Restarts the process if `MallocSpaceEfficient=1` is not set as the preset wants. Without
+/// it the system allocator keeps memory freed after rendering (half of it, after a long
+/// session) counted against the app. It only reads the setting at launch, so this must run
+/// first thing in `main`.
+///
+/// The app bundle's `LSEnvironment` sets it, so launching from Finder or the Dock with the
+/// default presets needs no restart; `fast` restarts to clear it. Launching the binary
+/// directly (`cargo run`) restarts to set it. A restart costs about 5 ms.
 pub fn relaunch(memory: Memory) {
     use std::os::unix::process::CommandExt;
 
-    if !memory.tuning().space_efficient_malloc || std::env::var_os(SPACE_EFFICIENT).is_some() {
+    let wanted = memory.tuning().space_efficient_malloc;
+    if std::env::var_os(SPACE_EFFICIENT).is_some_and(|v| v == "1") == wanted {
         return;
     }
     let Ok(exe) = std::env::current_exe() else { return };
@@ -76,6 +81,11 @@ pub fn relaunch(memory: Memory) {
     if let Some(arg0) = args.next() {
         command.arg0(arg0);
     }
-    // `exec` only returns on failure, in which case the app runs on without the setting.
-    let _ = command.args(args).env(SPACE_EFFICIENT, "1").exec();
+    if wanted {
+        command.env(SPACE_EFFICIENT, "1");
+    } else {
+        command.env_remove(SPACE_EFFICIENT);
+    }
+    // `exec` only returns on failure, in which case the app runs on as it is.
+    let _ = command.args(args).exec();
 }

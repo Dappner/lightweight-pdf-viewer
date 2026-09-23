@@ -18,6 +18,8 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "target/release/$EXECUTABLE" "$APP/Contents/MacOS/"
 cp assets/AppIcon.icns "$APP/Contents/Resources/"
 
+# LSEnvironment: LaunchServices starts the app with MallocSpaceEfficient=1 already set, so
+# the default memory presets need no relaunch (see src/memory.rs).
 # LSHandlerRank "Alternate" lists the app under "Open With" without taking over as the
 # default PDF viewer; pick it as the default in Finder's Get Info if you want that.
 cat > "$APP/Contents/Info.plist" <<EOF
@@ -37,6 +39,10 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+    <key>LSEnvironment</key>
+    <dict>
+        <key>MallocSpaceEfficient</key><string>1</string>
+    </dict>
     <key>CFBundleDocumentTypes</key>
     <array>
         <dict>
