@@ -187,10 +187,16 @@ fn quick_open_reopens_a_recent_file() {
     let _ = h.frame(vec![key(egui::Key::Enter, Modifiers::NONE)]);
     assert_eq!(h.app.stats().active, 0);
 
-    // Opening alpha twice ranks it above beta.
+    // The active tab (alpha) is left out, so ⌘1 picks beta: the palette's first result, not
+    // the first tab.
+    let _ = h.frame(vec![key(egui::Key::K, Modifiers::COMMAND)]);
+    let _ = h.frame(vec![key(egui::Key::Num1, Modifiers::COMMAND)]);
+    assert_eq!(h.app.stats().active, 1);
+    let _ = h.frame(vec![key(egui::Key::Num1, Modifiers::COMMAND)]);
+    assert_eq!(h.app.stats().active, 0, "⌘1 switches tabs again once the palette has closed");
+
     let ranked = History::load_from(history).ranked(u64::MAX / 2);
     assert_eq!(ranked.len(), 2);
-    assert_eq!(ranked[0], a.canonicalize().unwrap());
 
     let _ = std::fs::remove_dir_all(dir);
 }

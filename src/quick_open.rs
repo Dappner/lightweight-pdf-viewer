@@ -19,6 +19,10 @@ const WIDTH: f32 = 560.0;
 const TOP: f32 = 80.0;
 const ROW_HEIGHT: f32 = 38.0;
 const MAX_ROWS: usize = 12;
+const NUMBER_KEYS: [Key; 9] =
+    [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9];
+/// Room on the right of a row for its ⌘1–9 hint.
+const HINT_WIDTH: f32 = 36.0;
 
 pub struct QuickOpen {
     query: String,
@@ -60,11 +64,12 @@ impl QuickOpen {
 
     fn contents(&mut self, ui: &mut Ui, width: f32, palette: &Palette) -> Option<PathBuf> {
         ui.set_width(width);
-        let (down, up, enter) = ui.input_mut(|i| {
+        let (down, up, enter, number) = ui.input_mut(|i| {
             (
                 i.consume_key(Modifiers::NONE, Key::ArrowDown) || i.consume_key(Modifiers::CTRL, Key::N),
                 i.consume_key(Modifiers::NONE, Key::ArrowUp) || i.consume_key(Modifiers::CTRL, Key::P),
                 i.consume_key(Modifiers::NONE, Key::Enter),
+                NUMBER_KEYS.iter().position(|k| i.consume_key(Modifiers::COMMAND, *k)),
             )
         });
 
@@ -113,7 +118,7 @@ impl QuickOpen {
             if i == self.selected {
                 painter.rect_filled(rect, CornerRadius::same(6), palette.accent.gamma_multiply(0.22));
             }
-            let text_width = rect.width() - 20.0;
+            let text_width = rect.width() - 20.0 - HINT_WIDTH;
             let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
             let folder = path.parent().map(|p| self.tidy(p)).unwrap_or_default();
             let left = rect.left() + 10.0;
@@ -123,8 +128,18 @@ impl QuickOpen {
                 line(ui, folder, 11.0, palette.text_weak, text_width),
                 palette.text_weak,
             );
+            if i < NUMBER_KEYS.len() {
+                painter.text(
+                    pos2(rect.right() - 10.0, rect.center().y),
+                    Align2::RIGHT_CENTER,
+                    format!("⌘{}", i + 1),
+                    FontId::proportional(11.5),
+                    palette.text_weak,
+                );
+            }
         }
-        clicked.or_else(|| enter.then(|| matches[self.selected].clone()))
+        let numbered = number.and_then(|n| matches.get(n)).cloned();
+        clicked.or(numbered).or_else(|| enter.then(|| matches[self.selected].clone()))
     }
 
     fn tidy(&self, folder: &Path) -> String {

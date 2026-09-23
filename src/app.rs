@@ -308,7 +308,14 @@ impl App {
         self.quick_open = match self.quick_open {
             Some(_) => None,
             None => {
-                let files = self.history.ranked(history::now()).into_iter().filter(|p| p.exists()).collect();
+                // The file you're looking at is never the one you want to switch to.
+                let active = self.tabs.get(self.active).map(|t| t.path.as_path());
+                let files = self
+                    .history
+                    .ranked(history::now())
+                    .into_iter()
+                    .filter(|p| Some(p.as_path()) != active && p.exists())
+                    .collect();
                 Some(QuickOpen::new(files))
             }
         };
@@ -379,6 +386,7 @@ impl App {
             KeyCode::Num1, KeyCode::Num2, KeyCode::Num3, KeyCode::Num4, KeyCode::Num5,
             KeyCode::Num6, KeyCode::Num7, KeyCode::Num8, KeyCode::Num9,
         ];
+        let palette_open = self.quick_open.is_some();
         let commands: Vec<Command> = ctx.input_mut(|i| {
             // Shifted variants first: consume_key ignores extra Shift.
             let bindings = [
@@ -402,9 +410,12 @@ impl App {
             ];
             let mut commands: Vec<Command> =
                 bindings.into_iter().filter(|(m, k, _)| i.consume_key(*m, *k)).map(|(_, _, c)| c).collect();
-            commands.extend(
-                numbers.iter().enumerate().filter(|(_, k)| i.consume_key(cmd, **k)).map(|(n, _)| Command::SelectTab(n)),
-            );
+            // While the palette is open, ⌘1–9 pick its results instead of tabs.
+            if !palette_open {
+                commands.extend(
+                    numbers.iter().enumerate().filter(|(_, k)| i.consume_key(cmd, **k)).map(|(n, _)| Command::SelectTab(n)),
+                );
+            }
             commands
         });
         for command in commands {
