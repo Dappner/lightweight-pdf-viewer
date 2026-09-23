@@ -10,8 +10,8 @@ use crate::cache::TextureCache;
 use crate::finder;
 use crate::layout::DocLayout;
 use crate::menu;
-use crate::renderer::{DocId, Key, Output, Renderer};
-use crate::sidebar;
+use crate::renderer::{DocId, Key, Output, Renderer, Target};
+use crate::sidebar::{self, Mode as SidebarMode};
 use crate::tab::{DocState, Snapshot, Tab};
 use crate::tab_bar::{self, Action};
 use crate::theme::{Palette, palette};
@@ -32,6 +32,7 @@ pub struct App {
     cache: TextureCache,
     failed: HashSet<Key>,
     sidebar: bool,
+    sidebar_mode: SidebarMode,
     tab_scroll: f32,
     /// The last tab switched away from, whose tiles are kept until this time.
     parked: Option<(DocId, f64)>,
@@ -48,6 +49,8 @@ pub enum Command {
     PreviousTab,
     SelectTab(usize),
     ToggleSidebar,
+    /// Switches the sidebar between page thumbnails and the outline.
+    ToggleOutline,
     ZoomIn,
     ZoomOut,
     ZoomToFit,
@@ -81,6 +84,7 @@ impl App {
             cache: TextureCache::new(TEXTURE_BUDGET),
             failed: HashSet::new(),
             sidebar: true,
+            sidebar_mode: SidebarMode::Pages,
             tab_scroll: 0.0,
             parked: None,
             visible_ready: false,
@@ -126,6 +130,7 @@ impl App {
                 self.renderer.snapshot(old.view.snapshot_job(layout, old.id, ctx.pixels_per_point()));
             }
             old.snapshot_texture = None;
+            old.links.clear();
             if let Some((parked, _)) = self.parked.take()
                 && !returning
             {
@@ -212,6 +217,15 @@ impl App {
                     }
                 }
                 Output::Snapshot { .. } => {}
+                Output::Links { doc, page, links } if Some(doc) == active_id => {
+                    self.tabs[self.active].links.insert(page, links);
+                }
+                Output::Links { .. } => {}
+                Output::Outline { doc, entries } => {
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == doc) {
+                        tab.outline = Some(entries);
+                    }
+                }
             }
         }
     }
@@ -233,8 +247,38 @@ impl App {
                     self.cache.retain(|k| !matches!(k, Key::Thumb { .. }));
                 }
             }
+            Command::ToggleOutline => self.set_sidebar_mode(match self.sidebar_mode {
+                SidebarMode::Pages => SidebarMode::Outline,
+                SidebarMode::Outline => SidebarMode::Pages,
+            }),
             Command::ZoomIn | Command::ZoomOut | Command::ZoomToFit => self.zoom(ctx, command),
             Command::Quit => ctx.send_viewport_cmd(ViewportCommand::Close),
+        }
+    }
+
+    fn set_sidebar_mode(&mut self, mode: SidebarMode) {
+        self.sidebar = true;
+        self.sidebar_mode = mode;
+        if mode == SidebarMode::Outline {
+            self.cache.retain(|k| !matches!(k, Key::Thumb { .. }));
+        }
+    }
+
+    /// Follows a link or outline entry.
+    fn follow(&mut self, target: Target) {
+        match target {
+            Target::Page { page, y } => {
+                if let Some(tab) = self.tabs.get_mut(self.active)
+                    && let DocState::Ready(layout) = &tab.doc
+                {
+                    tab.view.go_to_point(layout, page as usize, y);
+                }
+            }
+            Target::Url(url) => {
+                if ["http://", "https://", "mailto:"].iter().any(|scheme| url.starts_with(scheme)) {
+                    let _ = std::process::Command::new("open").arg(&url).spawn();
+                }
+            }
         }
     }
 
@@ -276,6 +320,7 @@ impl App {
                 (cmd | Modifiers::ALT, KeyCode::ArrowRight, Command::NextTab),
                 (cmd, KeyCode::O, Command::Open),
                 (cmd, KeyCode::W, Command::CloseTab),
+                (cmd | Modifiers::ALT, KeyCode::B, Command::ToggleOutline),
                 (cmd, KeyCode::B, Command::ToggleSidebar),
                 (cmd, KeyCode::Equals, Command::ZoomIn),
                 (cmd, KeyCode::Plus, Command::ZoomIn),
@@ -386,6 +431,15 @@ impl App {
             self.run(ctx, command);
         }
         self.shortcuts(ctx);
+        if self.sidebar
+            && self.sidebar_mode == SidebarMode::Outline
+            && let Some(tab) = self.tabs.get_mut(self.active)
+            && matches!(tab.doc, DocState::Ready(_))
+            && !tab.outline_requested
+        {
+            tab.outline_requested = true;
+            self.renderer.outline(tab.id);
+        }
 
         let palette = palette(ctx.style().visuals.dark_mode);
         let mut wants = Wants::default();
@@ -412,43 +466,65 @@ impl App {
             && let Some(tab) = self.tabs.get_mut(self.active)
             && let DocState::Ready(layout) = &tab.doc
         {
-            let clicked = SidePanel::left("sidebar")
+            let action = SidePanel::left("sidebar")
                 .exact_width(sidebar::WIDTH)
                 .resizable(false)
                 .frame(content_frame)
                 .show(ctx, |ui| {
-                    sidebar::show(ui, tab.id, layout, &mut tab.view, &mut self.cache, &self.failed, &mut wants, &palette)
+                    sidebar::show(
+                        ui,
+                        self.sidebar_mode,
+                        tab.id,
+                        layout,
+                        &mut tab.view,
+                        tab.outline.as_deref(),
+                        &mut self.cache,
+                        &self.failed,
+                        &mut wants,
+                        &palette,
+                    )
                 })
                 .inner;
-            if let Some(page) = clicked {
-                tab.view.go_to_page(layout, page);
+            match action {
+                Some(sidebar::Action::GoTo(target)) => self.follow(target),
+                Some(sidebar::Action::SetMode(mode)) => self.set_sidebar_mode(mode),
+                None => {}
             }
         }
 
-        self.visible_ready = CentralPanel::default().frame(content_frame).show(ctx, |ui| {
+        let clicked_link = CentralPanel::default().frame(content_frame).show(ctx, |ui| {
+            self.visible_ready = false;
             let Some(tab) = self.tabs.get_mut(self.active) else {
                 empty_state(ui, &palette, "Drop a PDF here or press ⌘O");
-                return false;
+                return None;
             };
             match &tab.doc {
-                DocState::Loading => false,
+                DocState::Loading => None,
                 DocState::Failed(e) => {
                     empty_state(ui, &palette, e);
-                    false
+                    None
                 }
-                DocState::Ready(layout) => Canvas {
-                    doc: tab.id,
-                    layout,
-                    view: &mut tab.view,
-                    snapshot: &mut tab.snapshot_texture,
-                    cache: &mut self.cache,
-                    failed: &self.failed,
-                    page_border: palette.page_border,
+                DocState::Ready(layout) => {
+                    let out = Canvas {
+                        doc: tab.id,
+                        layout,
+                        view: &mut tab.view,
+                        snapshot: &mut tab.snapshot_texture,
+                        cache: &mut self.cache,
+                        failed: &self.failed,
+                        links: &tab.links,
+                        page_border: palette.page_border,
+                    }
+                    .show(ui, &mut wants);
+                    self.visible_ready = out.ready;
+                    out.clicked_link
                 }
-                .show(ui, &mut wants),
             }
         })
         .inner;
+        if let Some(target) = clicked_link {
+            self.follow(target);
+        }
 
         self.renderer.set_wanted(wants.into_queue());
         self.cache.trim();

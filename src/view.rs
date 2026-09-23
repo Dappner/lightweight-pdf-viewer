@@ -1,15 +1,16 @@
 //! The scrolling page canvas of the active tab.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use eframe::egui::{
-    Color32, Pos2, Rect, ScrollArea, Stroke, StrokeKind, TextureHandle, Ui, Vec2, pos2, vec2,
+    Color32, CursorIcon, Pos2, Rect, ScrollArea, Sense, Stroke, StrokeKind, TextureHandle, Ui, Vec2,
+    pos2, vec2,
 };
 
 use crate::cache::TextureCache;
 use crate::layout::{DocLayout, MARGIN};
-use crate::renderer::{DocId, Key, SnapshotJob, SnapshotPage, TILE, page_pixels, scale_key};
+use crate::renderer::{DocId, Key, Link, SnapshotJob, SnapshotPage, TILE, Target, page_pixels, scale_key};
 use crate::sidebar;
 use crate::tab::View;
 
@@ -86,6 +87,14 @@ impl View {
         self.pending_offset = Some(vec2(x, (rect.top() - MARGIN).max(0.0)));
     }
 
+    /// Scrolls so `y` (0 = top of the page, 1 = bottom) sits at the top of the viewport.
+    pub fn go_to_point(&mut self, layout: &DocLayout, page: usize, y: Option<f32>) {
+        self.go_to_page(layout, page);
+        if let (Some(y), Some(offset)) = (y, self.pending_offset.as_mut()) {
+            offset.y += MARGIN + y * layout.page_size(page.min(layout.page_count() - 1)).y * self.zoom;
+        }
+    }
+
     /// Describes the current viewport so the worker can render it into a snapshot.
     pub fn snapshot_job(&self, layout: &DocLayout, doc: DocId, pixels_per_point: f32) -> SnapshotJob {
         let s = snapshot_scale(pixels_per_point);
@@ -119,13 +128,20 @@ pub struct Canvas<'a> {
     pub snapshot: &'a mut Option<TextureHandle>,
     pub cache: &'a mut TextureCache,
     pub failed: &'a HashSet<Key>,
+    /// Link annotations of the pages loaded so far.
+    pub links: &'a HashMap<u32, Vec<Link>>,
     pub page_border: Color32,
 }
 
+pub struct CanvasOutput {
+    /// Every visible tile was drawn at full sharpness.
+    pub ready: bool,
+    pub clicked_link: Option<Target>,
+}
+
 impl Canvas<'_> {
-    /// Returns whether every visible tile was drawn at full sharpness.
-    pub fn show(self, ui: &mut Ui, wants: &mut Wants) -> bool {
-        let Canvas { doc, layout, view, snapshot, cache, failed, page_border } = self;
+    pub fn show(self, ui: &mut Ui, wants: &mut Wants) -> CanvasOutput {
+        let Canvas { doc, layout, view, snapshot, cache, failed, links, page_border } = self;
         let ppp = ui.ctx().pixels_per_point();
         let now = ui.input(|i| i.time);
         let area = ui.available_rect_before_wrap();
@@ -176,6 +192,7 @@ impl Canvas<'_> {
             }
 
             let mut all_visible_ready = true;
+            let mut clicked_link = None;
             let pages = layout.pages_in(prefetch.top() - origin.y, prefetch.bottom() - origin.y, view.zoom);
             for page in pages {
                 let size = layout.page_size(page);
@@ -196,6 +213,23 @@ impl Canvas<'_> {
                         }
                     }
                     painter.rect_stroke(rect, 0.0, Stroke::new(1.0, page_border), StrokeKind::Outside);
+                    match links.get(&(page as u32)) {
+                        None => wants.visible.push(Key::Links { doc, page: page as u32 }),
+                        Some(page_links) => {
+                            for (i, link) in page_links.iter().enumerate() {
+                                let area = Rect::from_min_max(
+                                    rect.min + link.rect.min.to_vec2() * rect.size(),
+                                    rect.min + link.rect.max.to_vec2() * rect.size(),
+                                );
+                                let response = ui
+                                    .interact(area, ui.id().with(("link", doc, page, i)), Sense::click())
+                                    .on_hover_cursor(CursorIcon::PointingHand);
+                                if response.clicked() {
+                                    clicked_link = Some(link.target.clone());
+                                }
+                            }
+                        }
+                    }
                     if let Some(prev) = prev_scale {
                         for (key, tile_rect) in tiles(doc, page, size, prev, rect, screen_viewport) {
                             if let Some(id) = cache.peek(&key) {
@@ -223,21 +257,22 @@ impl Canvas<'_> {
             }
 
             view.current_page = layout.page_at(viewport.center().y, view.zoom);
-            all_visible_ready
+            (all_visible_ready, clicked_link)
         });
+        let (all_visible_ready, clicked_link) = output.inner;
 
         let scrolled = output.state.offset != view.offset;
         view.offset = output.state.offset;
         view.viewport = output.inner_rect;
 
-        if output.inner || scrolled || view.zoom != view.render_zoom {
+        if all_visible_ready || scrolled || view.zoom != view.render_zoom {
             *snapshot = None;
         }
-        if output.inner && view.prev_render_zoom.take().is_some() {
+        if all_visible_ready && view.prev_render_zoom.take().is_some() {
             // The new scale fully covers the viewport; drop tiles rendered at other scales.
             cache.retain(|k| !matches!(*k, Key::Tile { doc: d, scale: s, .. } if d == doc && s != scale));
         }
-        output.inner && view.zoom == view.render_zoom
+        CanvasOutput { ready: all_visible_ready && view.zoom == view.render_zoom, clicked_link }
     }
 }
 

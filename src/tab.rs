@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use eframe::egui::{Rect, TextureHandle, Vec2};
 
 use crate::layout::DocLayout;
-use crate::renderer::DocId;
+use crate::renderer::{DocId, Link, OutlineEntry};
 
 pub enum DocState {
     Loading,
@@ -21,6 +22,11 @@ pub struct Tab {
     pub snapshot: Option<Snapshot>,
     /// Decoded snapshot, shown right after switching back until sharp tiles are ready.
     pub snapshot_texture: Option<TextureHandle>,
+    /// Link annotations per page, loaded as pages become visible; cleared in the background.
+    pub links: HashMap<u32, Vec<Link>>,
+    /// Loaded the first time the outline is shown.
+    pub outline: Option<Vec<OutlineEntry>>,
+    pub outline_requested: bool,
 }
 
 pub struct Snapshot {
@@ -60,6 +66,9 @@ impl Tab {
             view: View::default(),
             snapshot: None,
             snapshot_texture: None,
+            links: HashMap::new(),
+            outline: None,
+            outline_requested: false,
         }
     }
 }

@@ -84,6 +84,7 @@ pub fn install(ctx: &egui::Context) {
         ]),
         ("View", vec![
             Item("Toggle Sidebar", Command::ToggleSidebar, "b", cmd),
+            Item("Pages / Outline", Command::ToggleOutline, "b", cmd_option),
             Separator,
             Item("Zoom In", Command::ZoomIn, "=", cmd),
             Item("Zoom Out", Command::ZoomOut, "-", cmd),

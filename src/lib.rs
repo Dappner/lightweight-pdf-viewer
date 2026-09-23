@@ -11,4 +11,5 @@ mod sidebar;
 mod tab;
 mod tab_bar;
 mod theme;
+pub mod titlebar;
 mod view;

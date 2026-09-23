@@ -1,8 +1,9 @@
-//! Background render thread that rasterizes pages with CoreGraphics (Preview's engine).
+//! Background render thread: rasterizes pages with CoreGraphics (Preview's engine) and reads
+//! document structure (outline, links) with PDFKit.
 //!
 //! Every document lives on this one thread. At most one document is kept open at a time:
-//! touching a different document closes the previous one, which frees CoreGraphics'
-//! per-document caches (decoded images, fonts, parsed content streams).
+//! touching a different document closes the previous one, which frees its per-document
+//! caches (decoded images, fonts, parsed content streams).
 //!
 //! The UI replaces the whole render queue every frame with what it currently wants, so
 //! work for pages that scrolled out of view is dropped without explicit cancellation.
@@ -11,12 +12,16 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 
-use eframe::egui::{self, Vec2, vec2};
-use objc2_core_foundation::{CFRetained, CFURL, CGAffineTransform, CGPoint, CGRect, CGSize};
+use eframe::egui::{self, Pos2, Rect, Vec2, pos2, vec2};
+use objc2::AnyThread;
+use objc2::rc::Retained;
+use objc2_core_foundation::{CFRetained, CGAffineTransform, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
     CGBitmapContextCreate, CGColorSpace, CGContext, CGImageAlphaInfo, CGInterpolationQuality,
     CGPDFBox, CGPDFDocument, CGPDFPage, kCGColorSpaceSRGB,
 };
+use objc2_foundation::NSURL;
+use objc2_pdf_kit::{PDFActionGoTo, PDFActionURL, PDFDestination, PDFDocument, PDFOutline};
 
 pub type DocId = u64;
 
@@ -28,20 +33,44 @@ pub enum Key {
     /// `scale` is physical pixels per PDF point, in 1/256 steps (see [`scale_key`]).
     Tile { doc: DocId, page: u32, scale: u32, tx: u32, ty: u32 },
     Thumb { doc: DocId, page: u32, width: u32 },
+    /// The page's link annotations.
+    Links { doc: DocId, page: u32 },
 }
 
 impl Key {
     pub fn doc(&self) -> DocId {
         match *self {
-            Key::Tile { doc, .. } | Key::Thumb { doc, .. } => doc,
+            Key::Tile { doc, .. } | Key::Thumb { doc, .. } | Key::Links { doc, .. } => doc,
         }
     }
 
     fn page(&self) -> u32 {
         match *self {
-            Key::Tile { page, .. } | Key::Thumb { page, .. } => page,
+            Key::Tile { page, .. } | Key::Thumb { page, .. } | Key::Links { page, .. } => page,
         }
     }
+}
+
+/// Where a link or outline entry points.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Target {
+    /// `y` is the vertical position on the page, 0 = top and 1 = bottom, when specified.
+    Page { page: u32, y: Option<f32> },
+    Url(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct Link {
+    /// The clickable area as fractions of the displayed page (top-left origin).
+    pub rect: Rect,
+    pub target: Target,
+}
+
+#[derive(Clone, Debug)]
+pub struct OutlineEntry {
+    pub title: String,
+    pub depth: usize,
+    pub target: Option<Target>,
 }
 
 pub fn scale_key(pixels_per_point: f32) -> u32 {
@@ -79,11 +108,34 @@ pub enum Output {
     Failed(Key),
     /// QOI-compressed RGBA viewport image, kept while the tab is in the background.
     Snapshot { doc: DocId, size: [u32; 2], qoi: Vec<u8> },
+    Links { doc: DocId, page: u32, links: Vec<Link> },
+    Outline { doc: DocId, entries: Vec<OutlineEntry> },
+}
+
+impl Output {
+    /// The queued key this output answers, if any.
+    fn key(&self) -> Option<Key> {
+        match *self {
+            Output::Image { key, .. } | Output::Failed(key) => Some(key),
+            Output::Links { doc, page, .. } => Some(Key::Links { doc, page }),
+            _ => None,
+        }
+    }
 }
 
 enum Control {
     Open(DocId),
     Snapshot(SnapshotJob),
+    Outline(DocId),
+}
+
+impl Control {
+    fn doc(&self) -> DocId {
+        match self {
+            Control::Open(doc) | Control::Outline(doc) => *doc,
+            Control::Snapshot(job) => job.doc,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -135,6 +187,12 @@ impl Renderer {
         self.with_queue(|q| q.control.push_back(Control::Snapshot(job)));
     }
 
+    /// Reads the document outline. Resolving entries to pages parses those pages, so this is
+    /// only requested when the outline is shown.
+    pub fn outline(&self, doc: DocId) {
+        self.with_queue(|q| q.control.push_back(Control::Outline(doc)));
+    }
+
     pub fn take_done(&self) -> Vec<Output> {
         std::mem::take(&mut self.shared.0.lock().unwrap().done)
     }
@@ -144,8 +202,7 @@ impl Renderer {
     pub fn set_wanted(&self, mut wanted: Vec<Key>) {
         self.with_queue(|q| {
             wanted.retain(|k| {
-                !q.busy.contains(k)
-                    && !q.done.iter().any(|o| matches!(o, Output::Image { key, .. } | Output::Failed(key) if key == k))
+                !q.busy.contains(k) && !q.done.iter().any(|o| o.key() == Some(*k))
             });
             q.wanted = wanted;
         });
@@ -158,7 +215,7 @@ enum Work {
 }
 
 fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context) {
-    let mut open: Option<(DocId, CFRetained<CGPDFDocument>)> = None;
+    let mut open: Option<(DocId, Document)> = None;
 
     loop {
         let (lock, cvar) = shared;
@@ -169,11 +226,7 @@ fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context) {
                     open = None;
                 }
                 if let Some(c) = q.control.pop_front() {
-                    let doc = match &c {
-                        Control::Open(doc) => *doc,
-                        Control::Snapshot(job) => job.doc,
-                    };
-                    match q.paths.get(&doc) {
+                    match q.paths.get(&c.doc()) {
                         Some(path) => break (Work::Control(c), path.clone()),
                         None => continue,
                     }
@@ -199,8 +252,7 @@ fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context) {
         };
 
         let doc_id = match &work {
-            Work::Control(Control::Open(doc)) => *doc,
-            Work::Control(Control::Snapshot(job)) => job.doc,
+            Work::Control(c) => c.doc(),
             Work::Render(batch) => batch[0].doc(),
         };
         // CoreGraphics may autorelease internally; drain per job so nothing piles up on
@@ -218,6 +270,7 @@ fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context) {
                     result: Err(format!("Could not open {}", path.display())),
                 }],
                 (None, Work::Control(Control::Snapshot(_))) => vec![],
+                (None, Work::Control(Control::Outline(doc))) => vec![Output::Outline { doc, entries: vec![] }],
                 (None, Work::Render(batch)) => batch.into_iter().map(Output::Failed).collect(),
             }
         });
@@ -230,33 +283,112 @@ fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context) {
     }
 }
 
-fn open_document(path: &std::path::Path) -> Option<CFRetained<CGPDFDocument>> {
-    let url = CFURL::from_file_path(path)?;
-    let doc = CGPDFDocument::with_url(Some(&url))?;
-    (CGPDFDocument::number_of_pages(Some(&doc)) > 0).then_some(doc)
+/// An open document: PDFKit for structure, and the CoreGraphics document it wraps for
+/// rendering.
+struct Document {
+    pdf: Retained<PDFDocument>,
+    cg: Retained<CGPDFDocument>,
 }
 
-fn run(doc: &CGPDFDocument, doc_id: DocId, work: Work) -> Vec<Output> {
+fn open_document(path: &std::path::Path) -> Option<Document> {
+    let url = NSURL::from_file_path(path)?;
+    // SAFETY: `url` is a valid file URL.
+    let pdf = unsafe { PDFDocument::initWithURL(PDFDocument::alloc(), &url) }?;
+    let cg = unsafe { pdf.documentRef() }?;
+    (CGPDFDocument::number_of_pages(Some(&cg)) > 0).then_some(Document { pdf, cg })
+}
+
+fn run(doc: &Document, doc_id: DocId, work: Work) -> Vec<Output> {
     match work {
         Work::Control(Control::Open(_)) => {
-            let count = CGPDFDocument::number_of_pages(Some(doc));
+            let count = CGPDFDocument::number_of_pages(Some(&doc.cg));
             let sizes = (0..count)
-                .map(|i| get_page(doc, i as u32).map_or(vec2(612.0, 792.0), |p| PageGeometry::of(&p).size()))
+                .map(|i| get_page(&doc.cg, i as u32).map_or(vec2(612.0, 792.0), |p| PageGeometry::of(&p).size()))
                 .collect();
             vec![Output::Opened { doc: doc_id, result: Ok(sizes) }]
         }
-        Work::Control(Control::Snapshot(job)) => render_snapshot(doc, &job).into_iter().collect(),
+        Work::Control(Control::Snapshot(job)) => render_snapshot(&doc.cg, &job).into_iter().collect(),
+        Work::Control(Control::Outline(_)) => vec![Output::Outline { doc: doc_id, entries: outline(doc) }],
         Work::Render(batch) => {
-            let Some(page) = get_page(doc, batch[0].page()) else {
+            let Some(page) = get_page(&doc.cg, batch[0].page()) else {
                 return batch.into_iter().map(Output::Failed).collect();
             };
             let geometry = PageGeometry::of(&page);
             batch
                 .into_iter()
-                .map(|key| render_key(&page, &geometry, key).unwrap_or(Output::Failed(key)))
+                .map(|key| match key {
+                    Key::Links { doc: d, page: p } => {
+                        Output::Links { doc: d, page: p, links: page_links(doc, p, &geometry) }
+                    }
+                    _ => render_key(&page, &geometry, key).unwrap_or(Output::Failed(key)),
+                })
                 .collect()
         }
     }
+}
+
+/// Resolves a PDFKit destination to a page and vertical position.
+fn destination_target(doc: &Document, destination: &PDFDestination) -> Option<Target> {
+    // SAFETY: plain PDFKit getters on objects owned by `doc`.
+    let page = unsafe { destination.page() }?;
+    let index = unsafe { doc.pdf.indexForPage(&page) } as u32;
+    let point = unsafe { destination.point() };
+    // PDFKit uses a huge sentinel (kPDFDestinationUnspecifiedValue) for "no position".
+    let y = (point.y.abs() < 1e6)
+        .then(|| get_page(&doc.cg, index).map(|p| PageGeometry::of(&p).to_fraction(point.x.min(1e6), point.y).y))
+        .flatten()
+        .map(|y| y.clamp(0.0, 1.0));
+    Some(Target::Page { page: index, y })
+}
+
+fn page_links(doc: &Document, page: u32, geometry: &PageGeometry) -> Vec<Link> {
+    // SAFETY: plain PDFKit getters on objects owned by `doc`.
+    let Some(pdf_page) = (unsafe { doc.pdf.pageAtIndex(page as usize) }) else { return vec![] };
+    let annotations = unsafe { pdf_page.annotations() };
+    annotations
+        .iter()
+        .filter(|a| unsafe { a.r#type() }.is_some_and(|t| t.to_string() == "Link"))
+        .filter_map(|a| {
+            let action = unsafe { a.action() };
+            let url = unsafe { a.URL() }
+                .or_else(|| action.clone()?.downcast::<PDFActionURL>().ok().and_then(|u| unsafe { u.URL() }));
+            let target = match url.and_then(|u| u.absoluteString()) {
+                Some(url) => Target::Url(url.to_string()),
+                None => {
+                    let destination = unsafe { a.destination() }
+                        .or_else(|| action?.downcast::<PDFActionGoTo>().ok().map(|g| unsafe { g.destination() }))?;
+                    destination_target(doc, &destination)?
+                }
+            };
+            let b = unsafe { a.bounds() };
+            let corners = [
+                geometry.to_fraction(b.origin.x, b.origin.y),
+                geometry.to_fraction(b.origin.x + b.size.width, b.origin.y + b.size.height),
+            ];
+            Some(Link { rect: Rect::from_two_pos(corners[0], corners[1]), target })
+        })
+        .collect()
+}
+
+fn outline(doc: &Document) -> Vec<OutlineEntry> {
+    fn walk(doc: &Document, node: &PDFOutline, depth: usize, out: &mut Vec<OutlineEntry>) {
+        // SAFETY: plain PDFKit getters on objects owned by `doc`.
+        for i in 0..unsafe { node.numberOfChildren() } {
+            let Some(child) = (unsafe { node.childAtIndex(i) }) else { continue };
+            let title = unsafe { child.label() }.map(|l| l.to_string()).unwrap_or_default();
+            let destination = unsafe { child.destination() }.or_else(|| {
+                unsafe { child.action() }?.downcast::<PDFActionGoTo>().ok().map(|g| unsafe { g.destination() })
+            });
+            let target = destination.and_then(|d| destination_target(doc, &d));
+            out.push(OutlineEntry { title: title.trim().to_owned(), depth, target });
+            walk(doc, &child, depth + 1, out);
+        }
+    }
+    let mut entries = Vec::new();
+    if let Some(root) = unsafe { doc.pdf.outlineRoot() } {
+        walk(doc, &root, 0, &mut entries);
+    }
+    entries
 }
 
 /// `page` is zero-based; CoreGraphics numbers pages from 1.
@@ -282,6 +414,15 @@ impl PageGeometry {
     fn size(&self) -> Vec2 {
         let (w, h) = (self.crop.size.width as f32, self.crop.size.height as f32);
         if self.rotation % 180 == 90 { vec2(h, w) } else { vec2(w, h) }
+    }
+
+    /// A point in PDF user space as fractions of the displayed page, top-left origin.
+    fn to_fraction(&self, x: f64, y: f64) -> Pos2 {
+        let t = self.page_to_display();
+        let size = self.size();
+        let u = t.a * x + t.c * y + t.tx;
+        let v = t.b * x + t.d * y + t.ty;
+        pos2(u as f32 / size.x, 1.0 - v as f32 / size.y)
     }
 
     /// Maps PDF user space onto the displayed page, with the origin at its bottom-left.
@@ -360,6 +501,7 @@ fn render_key(page: &CGPDFPage, geometry: &PageGeometry, key: Key) -> Option<Out
             let h = thumb_height(size, width);
             ([width, h], [0, 0], width, h)
         }
+        Key::Links { .. } => return None,
     };
     let mut rgba = vec![0u8; (w * h * 4) as usize];
     let ctx = bitmap_context(&mut rgba, w, h)?;
@@ -411,8 +553,24 @@ mod tests {
         let (Ok(pdf), Ok(out)) = (std::env::var("RENDER_TEST_PDF"), std::env::var("RENDER_TEST_OUT")) else {
             return;
         };
-        let doc = open_document(std::path::Path::new(&pdf)).expect("open");
-        let page = get_page(&doc, 1).expect("page");
+        let document = open_document(std::path::Path::new(&pdf)).expect("open");
+        let entries = outline(&document);
+        println!("outline: {} entries", entries.len());
+        for e in entries.iter().take(4) {
+            println!("  {}{} -> {:?}", "  ".repeat(e.depth), e.title, e.target);
+        }
+        let with_links = (0..CGPDFDocument::number_of_pages(Some(&document.cg)).min(60) as u32).find_map(|p| {
+            let page = get_page(&document.cg, p)?;
+            let g = PageGeometry::of(&page);
+            let links = page_links(&document, p, &g);
+            (!links.is_empty()).then_some((p, links))
+        });
+        if let Some((p, links)) = with_links {
+            println!("page {} has {} links, e.g. {:?}", p + 1, links.len(), links[0]);
+            assert!(links.iter().all(|l| l.rect.min.x >= -0.01 && l.rect.max.y <= 1.01), "link rects should be page fractions");
+        }
+        let doc = &document.cg;
+        let page = get_page(doc, 1).expect("page");
         let geometry = PageGeometry::of(&page);
         let size = geometry.size();
         println!("page size {size:?}, rotation {}", geometry.rotation);
@@ -425,7 +583,7 @@ mod tests {
             let Some(Output::Image { key, size, rgba }) = render_key(&page, &geometry, key) else { panic!("render {key:?}") };
             let name = match key {
                 Key::Tile { scale, tx, ty, .. } => format!("tile_{scale}_{tx}_{ty}"),
-                Key::Thumb { .. } => "thumb".into(),
+                Key::Thumb { .. } | Key::Links { .. } => "thumb".into(),
             };
             write_png(&format!("{out}/{name}.png"), &rgba, size[0] as u32, size[1] as u32);
         }
@@ -438,7 +596,7 @@ mod tests {
                 SnapshotPage { page: 1, x: 20, y: 244, width: 576, height: 432 },
             ],
         };
-        let Some(Output::Snapshot { size, qoi, .. }) = render_snapshot(&doc, &job) else { panic!("snapshot") };
+        let Some(Output::Snapshot { size, qoi, .. }) = render_snapshot(doc, &job) else { panic!("snapshot") };
         let (_, rgba) = qoi::decode_to_vec(&qoi).unwrap();
         println!("snapshot qoi {} KB (raw {} KB)", qoi.len() / 1024, rgba.len() / 1024);
         write_png(&format!("{out}/snapshot.png"), &rgba, size[0], size[1]);
