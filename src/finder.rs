@@ -53,7 +53,7 @@ fn add_open_urls_method() {
         ffi::class_addMethod(
             class as *const AnyClass as *mut AnyClass,
             sel!(application:openURLs:),
-            std::mem::transmute::<_, Imp>(imp),
+            std::mem::transmute::<unsafe extern "C-unwind" fn(&AnyObject, Sel, &AnyObject, &NSArray<NSURL>), Imp>(imp),
             c"v@:@@".as_ptr(),
         );
     }

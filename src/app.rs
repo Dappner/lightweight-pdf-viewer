@@ -2,13 +2,14 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use eframe::egui::{
-    self, Align2, CentralPanel, ColorImage, Context, FontId, Frame, Key as KeyCode,
-    Modifiers, SidePanel, TextureOptions, TopBottomPanel, ViewportCommand, vec2,
+    self, Align2, CentralPanel, ColorImage, Context, FontId, Frame, Key as KeyCode, Modifiers,
+    SidePanel, TextureOptions, TopBottomPanel, ViewportCommand, vec2,
 };
 
 use crate::cache::TextureCache;
 use crate::finder;
 use crate::layout::DocLayout;
+use crate::menu;
 use crate::renderer::{DocId, Key, Output, Renderer};
 use crate::sidebar;
 use crate::tab::{DocState, Snapshot, Tab};
@@ -18,6 +19,8 @@ use crate::view::{Canvas, Wants, fit_width_zoom};
 
 /// GPU budget for rendered tiles and thumbnails, shared by every tab.
 const TEXTURE_BUDGET: usize = 64 * 1024 * 1024;
+/// Seconds a tab you switched away from keeps its tiles, so flipping straight back is sharp.
+const PARK_SECONDS: f64 = 3.0;
 const ZOOM_STEP: f32 = 1.25;
 const LINE_SCROLL: f32 = 48.0;
 
@@ -29,29 +32,66 @@ pub struct App {
     cache: TextureCache,
     failed: HashSet<Key>,
     sidebar: bool,
+    tab_scroll: f32,
+    /// The last tab switched away from, whose tiles are kept until this time.
+    parked: Option<(DocId, f64)>,
+    /// Whether every visible tile of the active tab was drawn sharp last frame.
+    visible_ready: bool,
+}
+
+/// Actions reachable from the menu bar and keyboard shortcuts.
+#[derive(Clone, Copy, Debug)]
+pub enum Command {
+    Open,
+    CloseTab,
+    NextTab,
+    PreviousTab,
+    SelectTab(usize),
+    ToggleSidebar,
+    ZoomIn,
+    ZoomOut,
+    ZoomToFit,
+    Quit,
+}
+
+/// A snapshot of app state for benchmarks.
+pub struct Stats {
+    pub tabs: usize,
+    pub active: usize,
+    /// The active tab has loaded and every visible tile is sharp.
+    pub ready: bool,
+    pub snapshot_shown: bool,
+    pub current_page: usize,
+    pub page_count: usize,
+    pub texture_bytes: usize,
+    /// Compressed snapshots held by background tabs.
+    pub snapshot_bytes: usize,
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext, files: Vec<PathBuf>) -> Self {
+    pub fn new(ctx: &Context, files: Vec<PathBuf>) -> Self {
         // ⌘+/⌘- zoom the document, not the UI.
-        cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
-        finder::set_context(&cc.egui_ctx);
+        ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        finder::set_context(ctx);
         let mut app = Self {
             tabs: Vec::new(),
             active: 0,
             next_id: 0,
-            renderer: Renderer::spawn(cc.egui_ctx.clone()),
+            renderer: Renderer::spawn(ctx.clone()),
             cache: TextureCache::new(TEXTURE_BUDGET),
             failed: HashSet::new(),
             sidebar: true,
+            tab_scroll: 0.0,
+            parked: None,
+            visible_ready: false,
         };
         for file in files {
-            app.open(&cc.egui_ctx, file);
+            app.open(ctx, file);
         }
         app
     }
 
-    fn open(&mut self, ctx: &Context, path: PathBuf) {
+    pub fn open(&mut self, ctx: &Context, path: PathBuf) {
         let path = path.canonicalize().unwrap_or(path);
         if let Some(i) = self.tabs.iter().position(|t| t.path == path) {
             self.activate(ctx, i);
@@ -72,8 +112,11 @@ impl App {
     }
 
     /// Switching tabs is where memory is reclaimed: the outgoing tab keeps only a small
-    /// compressed snapshot, and its textures and open PDF document are released.
+    /// compressed snapshot, and its open PDF document is released. Its textures are kept for
+    /// a few seconds (see [`PARK_SECONDS`]) in case you flip straight back.
     fn activate(&mut self, ctx: &Context, index: usize) {
+        // Returning to the parked tab within the grace period: its tiles are still cached.
+        let returning = self.parked.is_some_and(|(doc, _)| doc == self.tabs[index].id);
         if index != self.active
             && let Some(old) = self.tabs.get_mut(self.active)
         {
@@ -82,12 +125,20 @@ impl App {
             {
                 self.renderer.snapshot(old.view.snapshot_job(layout, old.id, ctx.pixels_per_point()));
             }
-            self.cache.evict_doc(old.id);
             old.snapshot_texture = None;
+            if let Some((parked, _)) = self.parked.take()
+                && !returning
+            {
+                self.cache.evict_doc(parked);
+            }
+            self.parked = Some((old.id, ctx.input(|i| i.time) + PARK_SECONDS));
         }
         self.active = index;
 
         let tab = &mut self.tabs[index];
+        if returning {
+            return;
+        }
         if let Some(snapshot) = tab.snapshot.take()
             && let Ok((_, rgba)) = qoi::decode_to_vec(&snapshot.qoi)
         {
@@ -97,10 +148,24 @@ impl App {
         }
     }
 
+    fn expire_parked(&mut self, ctx: &Context) {
+        let Some((doc, until)) = self.parked else { return };
+        let now = ctx.input(|i| i.time);
+        if now >= until {
+            self.cache.evict_doc(doc);
+            self.parked = None;
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(until - now));
+        }
+    }
+
     fn close(&mut self, ctx: &Context, index: usize) {
         let tab = self.tabs.remove(index);
         self.renderer.forget(tab.id);
         self.cache.evict_doc(tab.id);
+        if self.parked.is_some_and(|(doc, _)| doc == tab.id) {
+            self.parked = None;
+        }
         self.failed.retain(|k| k.doc() != tab.id);
         if self.tabs.is_empty() {
             self.active = 0;
@@ -111,6 +176,13 @@ impl App {
             self.active = usize::MAX;
             self.activate(ctx, index.min(self.tabs.len() - 1));
         }
+    }
+
+    fn move_tab(&mut self, from: usize, to: usize) {
+        let active_id = self.tabs[self.active].id;
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active = self.tabs.iter().position(|t| t.id == active_id).unwrap_or(0);
     }
 
     fn receive(&mut self, ctx: &Context) {
@@ -144,64 +216,82 @@ impl App {
         }
     }
 
+    pub fn run(&mut self, ctx: &Context, command: Command) {
+        let n = self.tabs.len();
+        match command {
+            Command::Open => self.open_dialog(ctx),
+            Command::CloseTab if n == 0 => ctx.send_viewport_cmd(ViewportCommand::Close),
+            Command::CloseTab => self.close(ctx, self.active),
+            Command::NextTab if n > 0 => self.activate(ctx, (self.active + 1) % n),
+            Command::PreviousTab if n > 0 => self.activate(ctx, (self.active + n - 1) % n),
+            // Like browsers, the ninth tab shortcut always selects the last tab.
+            Command::SelectTab(i) if n > 0 => self.activate(ctx, if i == 8 { n - 1 } else { i.min(n - 1) }),
+            Command::NextTab | Command::PreviousTab | Command::SelectTab(_) => {}
+            Command::ToggleSidebar => {
+                self.sidebar = !self.sidebar;
+                if !self.sidebar {
+                    self.cache.retain(|k| !matches!(k, Key::Thumb { .. }));
+                }
+            }
+            Command::ZoomIn | Command::ZoomOut | Command::ZoomToFit => self.zoom(ctx, command),
+            Command::Quit => ctx.send_viewport_cmd(ViewportCommand::Close),
+        }
+    }
+
+    fn zoom(&mut self, ctx: &Context, command: Command) {
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        let DocState::Ready(layout) = &tab.doc else { return };
+        let view = &mut tab.view;
+        if view.zoom == 0.0 {
+            return;
+        }
+        let zoom = match command {
+            Command::ZoomIn => view.zoom * ZOOM_STEP,
+            Command::ZoomOut => view.zoom / ZOOM_STEP,
+            _ => fit_width_zoom(layout, view.viewport.width()),
+        };
+        let center = view.viewport.size() / 2.0;
+        view.zoom_about(layout, zoom, center, ctx.input(|i| i.time));
+    }
+
+    /// Keyboard shortcuts. In the app, the menu bar receives the ⌘ shortcuts before egui
+    /// does; these also cover them when running without a menu (benchmarks).
     fn shortcuts(&mut self, ctx: &Context) {
         let cmd = Modifiers::COMMAND;
-        let (open, close, sidebar, next, prev, number) = ctx.input_mut(|i| {
-            // Check the shifted variant first: consume_key ignores extra Shift.
-            let prev = i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, KeyCode::Tab)
-                || i.consume_key(cmd | Modifiers::SHIFT, KeyCode::OpenBracket)
-                || i.consume_key(cmd | Modifiers::SHIFT, KeyCode::OpenCurlyBracket)
-                || i.consume_key(cmd | Modifiers::ALT, KeyCode::ArrowLeft);
-            let next = i.consume_key(Modifiers::CTRL, KeyCode::Tab)
-                || i.consume_key(cmd | Modifiers::SHIFT, KeyCode::CloseBracket)
-                || i.consume_key(cmd | Modifiers::SHIFT, KeyCode::CloseCurlyBracket)
-                || i.consume_key(cmd | Modifiers::ALT, KeyCode::ArrowRight);
-            let number = [
-                KeyCode::Num1, KeyCode::Num2, KeyCode::Num3, KeyCode::Num4, KeyCode::Num5,
-                KeyCode::Num6, KeyCode::Num7, KeyCode::Num8, KeyCode::Num9,
-            ]
-            .into_iter()
-            .position(|k| i.consume_key(cmd, k));
-            (
-                i.consume_key(cmd, KeyCode::O),
-                i.consume_key(cmd, KeyCode::W),
-                i.consume_key(cmd, KeyCode::B),
-                next,
-                prev,
-                number,
-            )
+        let shift = Modifiers::SHIFT;
+        let numbers = [
+            KeyCode::Num1, KeyCode::Num2, KeyCode::Num3, KeyCode::Num4, KeyCode::Num5,
+            KeyCode::Num6, KeyCode::Num7, KeyCode::Num8, KeyCode::Num9,
+        ];
+        let commands: Vec<Command> = ctx.input_mut(|i| {
+            // Shifted variants first: consume_key ignores extra Shift.
+            let bindings = [
+                (Modifiers::CTRL | shift, KeyCode::Tab, Command::PreviousTab),
+                (Modifiers::CTRL, KeyCode::Tab, Command::NextTab),
+                (cmd | shift, KeyCode::OpenBracket, Command::PreviousTab),
+                (cmd | shift, KeyCode::OpenCurlyBracket, Command::PreviousTab),
+                (cmd | shift, KeyCode::CloseBracket, Command::NextTab),
+                (cmd | shift, KeyCode::CloseCurlyBracket, Command::NextTab),
+                (cmd | Modifiers::ALT, KeyCode::ArrowLeft, Command::PreviousTab),
+                (cmd | Modifiers::ALT, KeyCode::ArrowRight, Command::NextTab),
+                (cmd, KeyCode::O, Command::Open),
+                (cmd, KeyCode::W, Command::CloseTab),
+                (cmd, KeyCode::B, Command::ToggleSidebar),
+                (cmd, KeyCode::Equals, Command::ZoomIn),
+                (cmd, KeyCode::Plus, Command::ZoomIn),
+                (cmd, KeyCode::Minus, Command::ZoomOut),
+                (cmd, KeyCode::Num0, Command::ZoomToFit),
+            ];
+            let mut commands: Vec<Command> =
+                bindings.into_iter().filter(|(m, k, _)| i.consume_key(*m, *k)).map(|(_, _, c)| c).collect();
+            commands.extend(
+                numbers.iter().enumerate().filter(|(_, k)| i.consume_key(cmd, **k)).map(|(n, _)| Command::SelectTab(n)),
+            );
+            commands
         });
-
-        if open {
-            self.open_dialog(ctx);
+        for command in commands {
+            self.run(ctx, command);
         }
-        if close {
-            if self.tabs.is_empty() {
-                ctx.send_viewport_cmd(ViewportCommand::Close);
-            } else {
-                self.close(ctx, self.active);
-            }
-        }
-        if sidebar {
-            self.sidebar = !self.sidebar;
-            if !self.sidebar {
-                self.cache.retain(|k| !matches!(k, Key::Thumb { .. }));
-            }
-        }
-        let n = self.tabs.len();
-        if n > 0 {
-            if next {
-                self.activate(ctx, (self.active + 1) % n);
-            }
-            if prev {
-                self.activate(ctx, (self.active + n - 1) % n);
-            }
-            if let Some(k) = number {
-                // ⌘9 always selects the last tab, like browsers.
-                self.activate(ctx, if k == 8 { n - 1 } else { k.min(n - 1) });
-            }
-        }
-
         self.view_shortcuts(ctx);
     }
 
@@ -215,20 +305,9 @@ impl App {
         let cmd = Modifiers::COMMAND;
         let none = Modifiers::NONE;
         let shift = Modifiers::SHIFT;
-        let now = ctx.input(|i| i.time);
-        let center = view.viewport.size() / 2.0;
         let page_scroll = (view.viewport.height() - LINE_SCROLL).max(LINE_SCROLL);
 
         ctx.input_mut(|i| {
-            if i.consume_key(cmd, KeyCode::Equals) || i.consume_key(cmd, KeyCode::Plus) {
-                view.zoom_about(layout, view.zoom * ZOOM_STEP, center, now);
-            }
-            if i.consume_key(cmd, KeyCode::Minus) {
-                view.zoom_about(layout, view.zoom / ZOOM_STEP, center, now);
-            }
-            if i.consume_key(cmd, KeyCode::Num0) {
-                view.zoom_about(layout, fit_width_zoom(layout, view.viewport.width()), center, now);
-            }
             if i.consume_key(cmd, KeyCode::ArrowUp) || i.consume_key(none, KeyCode::Home) {
                 view.go_to_page(layout, 0);
             }
@@ -256,6 +335,23 @@ impl App {
         });
     }
 
+    pub fn stats(&self) -> Stats {
+        let active = self.tabs.get(self.active);
+        Stats {
+            tabs: self.tabs.len(),
+            active: self.active,
+            ready: self.visible_ready,
+            snapshot_shown: active.is_some_and(|t| t.snapshot_texture.is_some()),
+            current_page: active.map_or(0, |t| t.view.current_page),
+            page_count: active.map_or(0, |t| match &t.doc {
+                DocState::Ready(layout) => layout.page_count(),
+                _ => 0,
+            }),
+            texture_bytes: self.cache.bytes(),
+            snapshot_bytes: self.tabs.iter().filter_map(|t| t.snapshot.as_ref()).map(|s| s.qoi.len()).sum(),
+        }
+    }
+
     fn status(&self) -> Option<String> {
         let tab = self.tabs.get(self.active)?;
         let DocState::Ready(layout) = &tab.doc else { return None };
@@ -270,13 +366,24 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        self.ui(ctx);
+    }
+}
+
+impl App {
+    /// One frame of the app. Separate from `eframe::App::update` so it can run headless.
+    pub fn ui(&mut self, ctx: &Context) {
         self.receive(ctx);
+        self.expire_parked(ctx);
         self.cache.begin_frame();
 
         let mut opened = finder::take();
         opened.extend(ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect::<Vec<_>>()));
         for path in opened {
             self.open(ctx, path);
+        }
+        for command in menu::take() {
+            self.run(ctx, command);
         }
         self.shortcuts(ctx);
 
@@ -287,11 +394,15 @@ impl eframe::App for App {
             .exact_height(tab_bar::HEIGHT)
             .frame(Frame::NONE)
             .show_separator_line(false)
-            .show(ctx, |ui| tab_bar::show(ui, &self.tabs, self.active, self.status(), &palette))
+            .show(ctx, |ui| {
+                let status = self.status();
+                tab_bar::show(ui, &self.tabs, self.active, &mut self.tab_scroll, status, &palette)
+            })
             .inner;
         match bar {
             Some(Action::Select(i)) => self.activate(ctx, i),
             Some(Action::Close(i)) => self.close(ctx, i),
+            Some(Action::Move { from, to }) => self.move_tab(from, to),
             Some(Action::Open) => self.open_dialog(ctx),
             None => {}
         }
@@ -314,14 +425,17 @@ impl eframe::App for App {
             }
         }
 
-        CentralPanel::default().frame(content_frame).show(ctx, |ui| {
+        self.visible_ready = CentralPanel::default().frame(content_frame).show(ctx, |ui| {
             let Some(tab) = self.tabs.get_mut(self.active) else {
                 empty_state(ui, &palette, "Drop a PDF here or press ⌘O");
-                return;
+                return false;
             };
             match &tab.doc {
-                DocState::Loading => {}
-                DocState::Failed(e) => empty_state(ui, &palette, e),
+                DocState::Loading => false,
+                DocState::Failed(e) => {
+                    empty_state(ui, &palette, e);
+                    false
+                }
                 DocState::Ready(layout) => Canvas {
                     doc: tab.id,
                     layout,
@@ -333,7 +447,8 @@ impl eframe::App for App {
                 }
                 .show(ui, &mut wants),
             }
-        });
+        })
+        .inner;
 
         self.renderer.set_wanted(wants.into_queue());
         self.cache.trim();

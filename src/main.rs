@@ -1,17 +1,7 @@
-mod app;
-mod cache;
-mod finder;
-mod layout;
-mod renderer;
-mod sidebar;
-mod tab;
-mod tab_bar;
-mod theme;
-mod view;
-
 use std::path::PathBuf;
 
 use eframe::egui;
+use lightweight_pdf_viewer::{app::App, finder, menu};
 
 fn main() -> eframe::Result {
     let files: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
@@ -31,6 +21,9 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Lightweight PDF",
         options,
-        Box::new(|cc| Ok(Box::new(app::App::new(cc, files)))),
+        Box::new(|cc| {
+            menu::install(&cc.egui_ctx);
+            Ok(Box::new(App::new(&cc.egui_ctx, files)))
+        }),
     )
 }

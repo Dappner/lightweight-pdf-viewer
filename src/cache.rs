@@ -86,4 +86,8 @@ impl TextureCache {
             }
         }
     }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
 }

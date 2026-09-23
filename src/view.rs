@@ -123,7 +123,8 @@ pub struct Canvas<'a> {
 }
 
 impl Canvas<'_> {
-    pub fn show(self, ui: &mut Ui, wants: &mut Wants) {
+    /// Returns whether every visible tile was drawn at full sharpness.
+    pub fn show(self, ui: &mut Ui, wants: &mut Wants) -> bool {
         let Canvas { doc, layout, view, snapshot, cache, failed, page_border } = self;
         let ppp = ui.ctx().pixels_per_point();
         let now = ui.input(|i| i.time);
@@ -236,6 +237,7 @@ impl Canvas<'_> {
             // The new scale fully covers the viewport; drop tiles rendered at other scales.
             cache.retain(|k| !matches!(*k, Key::Tile { doc: d, scale: s, .. } if d == doc && s != scale));
         }
+        output.inner && view.zoom == view.render_zoom
     }
 }
 

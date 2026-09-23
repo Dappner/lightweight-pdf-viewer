@@ -10,6 +10,7 @@ eframe = { version = "0.33.3", default-features = false, features = ["wgpu", "de
 # Only the Metal backend (eframe's defaults would also pull in GL/Vulkan backends).
 egui-wgpu = { version = "0.33.3", default-features = false, features = ["macos-window-resize-jitter-fix"] }
 objc2 = { version = "0.6.4", default-features = false, features = ["std"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSMenu", "NSMenuItem", "NSApplication", "NSResponder", "NSEvent"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFURL", "CFCGTypes"] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGPDFDocument", "CGPDFPage", "CGContext", "CGBitmapContext", "CGColorSpace", "CGImage", "CGAffineTransform"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSNotification", "NSOperation", "NSString", "NSArray", "NSURL", "NSObject"] }
@@ -22,4 +23,9 @@ codegen-units = 1
 strip = true
 
 [dev-dependencies]
+libc = "0.2.189"
 png = "0.18.1"
+
+[[bench]]
+name = "session"
+harness = false
