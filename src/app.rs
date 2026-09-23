@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use eframe::egui::{
     self, Align2, CentralPanel, ColorImage, Context, FontId, Frame, Key as KeyCode, Modifiers,
-    SidePanel, TextureOptions, TopBottomPanel, ViewportCommand, vec2,
+    SidePanel, TextureHandle, TextureOptions, TopBottomPanel, Vec2, ViewportCommand, vec2,
 };
 
 use crate::cache::TextureCache;
@@ -48,6 +48,20 @@ pub struct App {
     parked: Option<(DocId, f64)>,
     /// Whether every visible tile of the active tab was drawn sharp last frame.
     visible_ready: bool,
+    sleep: Sleep,
+    /// See [`crate::memory::Tuning::sleep_after`].
+    sleep_after: Option<f64>,
+    /// When the app was last focused, scrolled or zoomed.
+    last_active: f64,
+}
+
+/// Whether the app has let go of its page tiles while in the background.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Sleep {
+    Awake,
+    /// Waiting for a snapshot of the active tab to show in place of its tiles.
+    Falling,
+    Asleep,
 }
 
 /// Actions reachable from the menu bar and keyboard shortcuts.
@@ -81,6 +95,8 @@ pub struct Stats {
     pub texture_bytes: usize,
     /// Compressed snapshots held by background tabs.
     pub snapshot_bytes: usize,
+    /// Page tiles were dropped while the app was in the background.
+    pub asleep: bool,
 }
 
 impl App {
@@ -106,6 +122,9 @@ impl App {
             tab_scroll: 0.0,
             parked: None,
             visible_ready: false,
+            sleep: Sleep::Awake,
+            sleep_after: tuning.sleep_after,
+            last_active: 0.0,
         };
         if app.config.restore_tabs {
             let saved: Vec<PathBuf> = app.config.tabs.iter().filter(|p| p.exists()).cloned().collect();
@@ -193,13 +212,46 @@ impl App {
         if returning {
             return;
         }
-        if let Some(snapshot) = tab.snapshot.take()
-            && let Ok((_, rgba)) = qoi::decode_to_vec(&snapshot.qoi)
-        {
-            let [w, h] = snapshot.size.map(|v| v as usize);
-            let image = ColorImage::from_rgba_premultiplied([w, h], &rgba);
-            tab.snapshot_texture = Some(ctx.load_texture("snapshot", image, TextureOptions::LINEAR));
+        if let Some(snapshot) = tab.snapshot.take() {
+            tab.snapshot_texture = snapshot_texture(ctx, &snapshot);
         }
+    }
+
+    /// In the background, the page tiles (most of the app's GPU memory) are swapped for a
+    /// snapshot of the viewport once the app has been left alone for a while. Focusing,
+    /// scrolling or zooming wakes it; the snapshot shows until the tiles are redrawn.
+    fn sleep_or_wake(&mut self, ctx: &Context) {
+        let Some(after) = self.sleep_after else { return };
+        let (now, active) = ctx.input(|i| {
+            let focused = i.viewport().focused.unwrap_or(true);
+            (i.time, focused || i.raw_scroll_delta != Vec2::ZERO || i.zoom_delta() != 1.0)
+        });
+        if active {
+            self.last_active = now;
+            self.sleep = Sleep::Awake;
+        } else if self.sleep == Sleep::Awake {
+            let idle = now - self.last_active;
+            if idle < after {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(after - idle));
+            } else if let Some(tab) = self.tabs.get(self.active)
+                && let DocState::Ready(layout) = &tab.doc
+                && tab.view.zoom > 0.0
+            {
+                // The tiles go once the snapshot that replaces them arrives (see `receive`).
+                self.renderer.snapshot(tab.view.snapshot_job(layout, tab.id, ctx.pixels_per_point()));
+                self.sleep = Sleep::Falling;
+            } else {
+                self.release_tiles();
+                self.sleep = Sleep::Asleep;
+            }
+        }
+    }
+
+    /// Drops every page tile (thumbnails are small and stay) and closes the open document.
+    fn release_tiles(&mut self) {
+        self.cache.retain(|k| !matches!(k, Key::Tile { .. }));
+        self.parked = None;
+        self.renderer.release();
     }
 
     fn expire_parked(&mut self, ctx: &Context) {
@@ -251,6 +303,8 @@ impl App {
                         };
                     }
                 }
+                // Tiles that were in flight when the app fell asleep.
+                Output::Image { key: Key::Tile { .. }, .. } if self.sleep != Sleep::Awake => {}
                 Output::Image { key, size, rgba } if Some(key.doc()) == active_id => {
                     let image = ColorImage::from_rgba_premultiplied(size, &rgba);
                     let texture = ctx.load_texture("page", image, TextureOptions::LINEAR);
@@ -259,6 +313,11 @@ impl App {
                 Output::Image { .. } => {}
                 Output::Failed(key) => {
                     self.failed.insert(key);
+                }
+                Output::Snapshot { doc, size, qoi } if Some(doc) == active_id && self.sleep == Sleep::Falling => {
+                    self.tabs[self.active].snapshot_texture = snapshot_texture(ctx, &Snapshot { size, qoi });
+                    self.release_tiles();
+                    self.sleep = Sleep::Asleep;
                 }
                 Output::Snapshot { doc, size, qoi } if Some(doc) != active_id => {
                     if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == doc) {
@@ -483,6 +542,7 @@ impl App {
             }),
             texture_bytes: self.cache.bytes(),
             snapshot_bytes: self.tabs.iter().filter_map(|t| t.snapshot.as_ref()).map(|s| s.qoi.len()).sum(),
+            asleep: self.sleep == Sleep::Asleep,
         }
     }
 
@@ -507,6 +567,8 @@ impl eframe::App for App {
 impl App {
     /// One frame of the app. Separate from `eframe::App::update` so it can run headless.
     pub fn ui(&mut self, ctx: &Context) {
+        // Before `receive`, so a snapshot that arrives as the app wakes is ignored.
+        self.sleep_or_wake(ctx);
         self.receive(ctx);
         self.expire_parked(ctx);
         self.cache.begin_frame();
@@ -631,16 +693,29 @@ impl App {
         }
 
         self.save_tabs();
+        if self.sleep != Sleep::Awake {
+            // The snapshot stands in for the page; only thumbnails are still drawn.
+            wants.visible.clear();
+            wants.prefetch.clear();
+        }
         self.renderer.set_wanted(wants.into_queue());
         // A parked tab that has lost tiles to the budget would come back with holes, so it
         // gives up the rest and shows its snapshot when switched back to instead.
+        let evicted = self.cache.trim();
         if let Some((parked, _)) = self.parked
-            && self.cache.trim().contains(&parked)
+            && evicted.contains(&parked)
         {
             self.cache.evict_doc(parked);
             self.parked = None;
         }
     }
+}
+
+fn snapshot_texture(ctx: &Context, snapshot: &Snapshot) -> Option<TextureHandle> {
+    let (_, rgba) = qoi::decode_to_vec(&snapshot.qoi).ok()?;
+    let [w, h] = snapshot.size.map(|v| v as usize);
+    let image = ColorImage::from_rgba_premultiplied([w, h], &rgba);
+    Some(ctx.load_texture("snapshot", image, TextureOptions::LINEAR))
 }
 
 fn empty_state(ui: &mut egui::Ui, palette: &Palette, text: &str) {

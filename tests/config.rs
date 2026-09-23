@@ -212,3 +212,31 @@ fn memory_preset_is_read_from_the_config_file() {
     assert_eq!(Config::load_from(config).memory, Memory::Low);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn texture_budget_holds_with_a_single_tab() {
+    use lightweight_pdf_viewer::memory::Memory;
+
+    let dir = temp_dir("budget");
+    let pdf = dir.join("long.pdf");
+    write_pdf(&pdf, 150);
+    let mut config = Config::default();
+    config.memory = Memory::Low;
+    // One tab, so nothing is parked: the budget must still be enforced every frame.
+    let mut h = Harness::new(config, vec![pdf]);
+    let mut peak = 0;
+    for _ in 0..150 {
+        let _ = h.frame(vec![key(egui::Key::PageDown, Modifiers::NONE)]);
+        for _ in 0..200 {
+            if h.app.stats().ready {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let _ = h.frame(vec![]);
+        }
+        peak = peak.max(h.app.stats().texture_bytes);
+    }
+    assert!(h.app.stats().current_page > 100, "scrolled through the document");
+    assert!(peak <= 16 << 20, "textures reached {} MB over a 16 MB budget", peak >> 20);
+    let _ = std::fs::remove_dir_all(dir);
+}

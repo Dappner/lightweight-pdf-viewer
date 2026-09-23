@@ -172,6 +172,8 @@ struct Queue {
     busy: Vec<Key>,
     done: Vec<Output>,
     paths: HashMap<DocId, PathBuf>,
+    /// Close the open document, releasing CoreGraphics' caches for it.
+    release: bool,
 }
 
 pub struct Renderer {
@@ -208,6 +210,14 @@ impl Renderer {
         self.with_queue(|q| {
             q.paths.remove(&doc);
             q.wanted.retain(|k| k.doc() != doc);
+        });
+    }
+
+    /// Drops queued work and closes the open document; the next job reopens it.
+    pub fn release(&self) {
+        self.with_queue(|q| {
+            q.wanted.clear();
+            q.release = true;
         });
     }
 
@@ -252,7 +262,7 @@ fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context, pages_per_open:
         let (work, path) = {
             let mut q = lock.lock().unwrap();
             loop {
-                if open.as_ref().is_some_and(|o| !q.paths.contains_key(&o.id)) {
+                if std::mem::take(&mut q.release) || open.as_ref().is_some_and(|o| !q.paths.contains_key(&o.id)) {
                     open = None;
                 }
                 if let Some(c) = q.control.pop_front() {

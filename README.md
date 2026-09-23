@@ -67,7 +67,7 @@ A headless benchmark opens real PDFs through the app and reports speed and memor
 cargo bench --bench session -- a.pdf b.pdf
 ```
 
-Set `BENCH_MEMORY=low|balanced|fast` to pick the memory setting and `BENCH_PPP=2` for Retina.
+Set `BENCH_MEMORY=low|balanced|fast` to pick the memory setting and `BENCH_PPP=2` for Retina. It takes about 30 seconds; `BENCH_FULL=1` runs each scenario more times and scrolls the whole last document (about 2.5 minutes).
 
 ## Requirements
 

@@ -20,6 +20,12 @@ fn main() -> eframe::Result {
             .with_title_shown(false)
             .with_drag_and_drop(true),
         renderer: eframe::Renderer::Wgpu,
+        wgpu_options: egui_wgpu::WgpuConfiguration {
+            // Two drawables instead of three. Each is a full-window buffer (28 MB for a
+            // near-full-screen window on a 14" MacBook Pro), and frames here are cheap to draw.
+            desired_maximum_frame_latency: Some(1),
+            ..Default::default()
+        },
         ..Default::default()
     };
     eframe::run_native(

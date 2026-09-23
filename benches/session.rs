@@ -6,7 +6,7 @@
 //! Environment: BENCH_MEMORY (memory preset: low, balanced or fast; default balanced),
 //! BENCH_PPP (pixels per point, default 1 = non-Retina), BENCH_SIZE (window size in points,
 //! default 1000x1000), BENCH_BREAKDOWN=1 prints `footprint`'s per-category breakdown after
-//! each phase.
+//! each phase, BENCH_FULL=1 runs the long version (see [`Rounds`]).
 //!
 //! Memory is the process footprint without a window: GPU textures are not allocated, so
 //! the "textures" column reports what they would occupy on the GPU. A windowed app adds a
@@ -26,12 +26,37 @@ use lightweight_pdf_viewer::memory::{self, Memory};
 
 const TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How many times each scenario runs. The quick default takes about 30 s per preset and
+/// still catches memory that grows with pages read; the full run (BENCH_FULL=1, ~2.5 min)
+/// gives steadier latency numbers and scrolls the whole last document.
+struct Rounds {
+    cycle: usize,
+    flip: usize,
+    /// Switches after a 4 s pause, once the previous tab's tiles have expired.
+    dwell: usize,
+    /// Switches afterwards, to show the footprint doesn't creep.
+    more: usize,
+    /// Page-down steps; the full run scrolls to the end.
+    scroll: usize,
+}
+
+impl Rounds {
+    fn from_env() -> Self {
+        if std::env::var_os("BENCH_FULL").is_some() {
+            Self { cycle: 40, flip: 40, dwell: 6, more: 100, scroll: usize::MAX }
+        } else {
+            Self { cycle: 20, flip: 10, dwell: 2, more: 40, scroll: 150 }
+        }
+    }
+}
+
 struct Harness {
     ctx: egui::Context,
     app: App,
     start: Instant,
     size: Vec2,
     ppp: f32,
+    focused: bool,
     events: Vec<Event>,
     /// Highest footprint seen since the phase began.
     peak: f64,
@@ -48,7 +73,7 @@ impl Harness {
         };
         raw.viewports.insert(
             ViewportId::ROOT,
-            ViewportInfo { native_pixels_per_point: Some(self.ppp), ..Default::default() },
+            ViewportInfo { native_pixels_per_point: Some(self.ppp), focused: Some(self.focused), ..Default::default() },
         );
         let app = &mut self.app;
         // The output (including texture uploads) is dropped: there is no GPU.
@@ -174,6 +199,7 @@ fn main() {
         eprintln!("usage: cargo bench --bench session -- <pdf> [<pdf> ...]");
         std::process::exit(2);
     }
+    let rounds = Rounds::from_env();
     let ppp = std::env::var("BENCH_PPP").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
     let size = std::env::var("BENCH_SIZE")
         .ok()
@@ -185,7 +211,7 @@ fn main() {
     let mut config = Config::default();
     config.memory = preset;
     let app = App::new(&ctx, config, History::default(), Vec::new());
-    let mut h = Harness { ctx, app, start: Instant::now(), size, ppp, events: Vec::new(), peak: 0.0, phase_cpu: 0.0 };
+    let mut h = Harness { ctx, app, start: Instant::now(), size, ppp, focused: true, events: Vec::new(), peak: 0.0, phase_cpu: 0.0 };
     h.frame();
     let malloc = std::env::var("MallocSpaceEfficient").map_or("default".into(), |v| format!("MallocSpaceEfficient={v}"));
     println!("memory preset {preset:?} ({malloc}), viewport {}x{} pt @ {ppp}x\n", size.x, size.y);
@@ -218,7 +244,7 @@ fn main() {
         h.begin_phase();
         let mut rapid = Vec::new();
         let mut covered = 0;
-        let n = 40;
+        let n = rounds.cycle;
         for _ in 0..n {
             let (c, sharp) = h.switch(Key::Tab, Modifiers::CTRL);
             covered += c as usize;
@@ -228,6 +254,7 @@ fn main() {
 
         let mut toggle = Vec::new();
         let mut covered = 0;
+        let n = rounds.flip;
         for i in 0..n {
             let (key, modifiers) = if i % 2 == 0 { (Key::Tab, Modifiers::CTRL) } else { (Key::Tab, Modifiers::CTRL | Modifiers::SHIFT) };
             h.idle(Duration::from_millis(300));
@@ -239,7 +266,7 @@ fn main() {
 
         let mut dwell = Vec::new();
         let mut covered = 0;
-        let n = 6;
+        let n = rounds.dwell;
         for _ in 0..n {
             h.idle(Duration::from_secs(4));
             let (c, sharp) = h.switch(Key::Tab, Modifiers::CTRL);
@@ -250,11 +277,11 @@ fn main() {
         breakdown("after switching");
 
         let before = footprint_mb();
-        for _ in 0..100 {
+        for _ in 0..rounds.more {
             h.switch(Key::Tab, Modifiers::CTRL);
         }
         h.idle(Duration::from_millis(300));
-        println!("  footprint over 100 more switches: {before:.1} -> {:.1} MB", footprint_mb());
+        println!("  footprint over {} more switches: {before:.1} -> {:.1} MB", rounds.more, footprint_mb());
         h.end_phase();
     }
 
@@ -266,7 +293,7 @@ fn main() {
     let mut peak = 0;
     // Pages taller than the viewport take several steps; stop if the page stops advancing.
     let (mut last, mut stuck) = (usize::MAX, 0);
-    for _ in 0..5000 {
+    for _ in 0..rounds.scroll.min(5000) {
         let s = h.stats();
         stuck = if s.current_page == last { stuck + 1 } else { 0 };
         if s.current_page + 1 >= s.page_count || stuck > 8 {
@@ -306,4 +333,37 @@ fn main() {
         footprint_mb()
     );
     h.end_phase();
+
+    println!("\nbackground (unfocused and left alone; the snapshot texture is not counted)");
+    let Some(after) = preset.tuning().sleep_after else {
+        println!("  never drops tiles with this preset");
+        return;
+    };
+    h.begin_phase();
+    let textures = h.stats().texture_bytes;
+    h.focused = false;
+    let t = Instant::now();
+    // An idle app draws no frames; check a few times a second instead of spinning.
+    while !h.stats().asleep && t.elapsed() < Duration::from_secs_f64(after + 5.0) {
+        h.frame();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    h.idle(Duration::from_millis(500));
+    let s = h.stats();
+    println!(
+        "  asleep {} after {:.1} s   textures {:.1} -> {:.1} MB   footprint {:.1} MB",
+        s.asleep,
+        t.elapsed().as_secs_f64(),
+        mb(textures),
+        mb(s.texture_bytes),
+        footprint_mb()
+    );
+    h.end_phase();
+
+    h.focused = true;
+    let t = Instant::now();
+    h.frame();
+    let covered = h.stats().snapshot_shown || h.stats().ready;
+    let sharp = h.wait(|s| s.ready).map(|_| t.elapsed());
+    println!("  refocus: covered {covered}, to sharp {} ms", ms(sharp));
 }

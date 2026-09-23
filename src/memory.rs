@@ -29,6 +29,9 @@ pub struct Tuning {
     pub prefetch: f32,
     /// Makes the allocator hand freed memory back to macOS promptly (see [`relaunch`]).
     pub space_efficient_malloc: bool,
+    /// Seconds in the background (unfocused, not scrolled) after which the page tiles are
+    /// dropped and a snapshot is shown instead; `None` keeps them.
+    pub sleep_after: Option<f64>,
 }
 
 const MB: usize = 1024 * 1024;
@@ -41,18 +44,21 @@ impl Memory {
                 pages_per_open: 16,
                 prefetch: 0.25,
                 space_efficient_malloc: true,
+                sleep_after: Some(2.0),
             },
             Memory::Balanced => Tuning {
                 texture_budget: 48 * MB,
                 pages_per_open: 32,
                 prefetch: 0.5,
                 space_efficient_malloc: true,
+                sleep_after: Some(10.0),
             },
             Memory::Fast => Tuning {
                 texture_budget: 128 * MB,
                 pages_per_open: 256,
                 prefetch: 1.0,
                 space_efficient_malloc: false,
+                sleep_after: None,
             },
         }
     }
