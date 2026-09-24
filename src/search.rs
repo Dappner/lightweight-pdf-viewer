@@ -45,7 +45,7 @@ use objc2::rc::{Retained, autoreleasepool};
 use objc2_foundation::{NSRange, NSURL};
 use objc2_pdf_kit::{PDFDocument, PDFPage};
 
-use crate::renderer::PageGeometry;
+use crate::engine::PageGeometry;
 use crate::search_index::{self, Index, Store};
 use crate::text::{PageText, Query};
 

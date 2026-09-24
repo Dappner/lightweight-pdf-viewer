@@ -237,6 +237,7 @@ impl Harness {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn footprint_mb() -> f64 {
     let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
     let ok = unsafe {
@@ -248,6 +249,15 @@ fn footprint_mb() -> f64 {
     };
     assert_eq!(ok, 0, "proc_pid_rusage failed");
     info.ri_phys_footprint as f64 / 1_048_576.0
+}
+
+/// Resident memory (the closest Linux has to macOS's footprint); with the synthetic engine
+/// this measures the app's own memory, without CoreGraphics' caches.
+#[cfg(not(target_os = "macos"))]
+fn footprint_mb() -> f64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let kb = status.lines().find_map(|l| l.strip_prefix("VmRSS:")).and_then(|v| v.trim().trim_end_matches(" kB").parse::<f64>().ok());
+    kb.unwrap_or(0.0) / 1024.0
 }
 
 /// User plus system CPU time of the whole process, in seconds.

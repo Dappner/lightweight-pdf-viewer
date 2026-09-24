@@ -326,8 +326,11 @@ impl State {
     }
 
     fn open_dialog(&mut self, ctx: &Context, w: usize) {
-        let files = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).pick_files();
-        for file in files.unwrap_or_default() {
+        #[cfg(target_os = "macos")]
+        let files = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).pick_files().unwrap_or_default();
+        #[cfg(not(target_os = "macos"))]
+        let files = crate::unsupported::pick_pdfs();
+        for file in files {
             self.open_in(ctx, w, file);
         }
     }

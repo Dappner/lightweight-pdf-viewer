@@ -54,7 +54,7 @@ impl PageLayout {
         match self {
             PageLayout::Single => false,
             PageLayout::TwoPages => page % 2 == 1,
-            PageLayout::Book => page % 2 == 0,
+            PageLayout::Book => page.is_multiple_of(2),
         }
     }
 }
