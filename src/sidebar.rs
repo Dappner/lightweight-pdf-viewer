@@ -9,6 +9,7 @@ use eframe::egui::{
 };
 
 use crate::cache::TextureCache;
+use crate::grey;
 use crate::layout::DocLayout;
 use crate::renderer::{DocId, Key, OutlineEntry, Target};
 use crate::tab::View;
@@ -205,10 +206,7 @@ fn thumbnails(
             painter.rect_filled(thumb, 0.0, Color32::WHITE);
             let key = Key::Thumb { doc, page: page as u32, width: thumb_px };
             match cache.get(&key) {
-                Some(id) => {
-                    let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-                    painter.image(id, thumb, uv, Color32::WHITE);
-                }
+                Some(image) => grey::paint(painter, image, thumb),
                 None if !failed.contains(&key) => wants.thumbs.push(key),
                 None => {}
             }

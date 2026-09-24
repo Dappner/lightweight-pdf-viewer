@@ -9,6 +9,7 @@ use eframe::egui::{
 
 use crate::cache::TextureCache;
 use crate::find_bar;
+use crate::grey;
 use crate::history::Place;
 use crate::layout::{DocLayout, MARGIN, PageLayout};
 use crate::renderer::{DocId, Key, Link, SnapshotJob, SnapshotPage, TILE, Target, page_pixels, scale_key};
@@ -282,8 +283,8 @@ impl Canvas<'_> {
                     if snapshot.is_none() {
                         painter.rect_filled(rect, 0.0, Color32::WHITE);
                         let thumb = Key::Thumb { doc, page: page as u32, width: thumb_px };
-                        if let Some(id) = cache.peek(&thumb) {
-                            painter.image(id, rect, UV, Color32::WHITE);
+                        if let Some(image) = cache.peek(&thumb) {
+                            grey::paint(painter, image, rect);
                         }
                     }
                     painter.rect_stroke(rect, 0.0, Stroke::new(1.0, page_border), StrokeKind::Outside);
@@ -306,8 +307,8 @@ impl Canvas<'_> {
                     }
                     if let Some(prev) = prev_scale {
                         for (key, tile_rect) in tiles(doc, page, size, prev, rect, screen_viewport) {
-                            if let Some(id) = cache.peek(&key) {
-                                painter.image(id, tile_rect, UV, Color32::WHITE);
+                            if let Some(image) = cache.peek(&key) {
+                                grey::paint(painter, image, tile_rect);
                             }
                         }
                     }
@@ -316,9 +317,7 @@ impl Canvas<'_> {
                 for (key, tile_rect) in tiles(doc, page, size, scale, rect, prefetch) {
                     let tile_visible = tile_rect.intersects(screen_viewport);
                     match cache.get(&key) {
-                        Some(id) if tile_visible => {
-                            painter.image(id, tile_rect, UV, Color32::WHITE);
-                        }
+                        Some(image) if tile_visible => grey::paint(painter, image, tile_rect),
                         Some(_) => {}
                         None if failed.contains(&key) => {}
                         None if tile_visible => {

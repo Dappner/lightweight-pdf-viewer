@@ -20,6 +20,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use eframe::egui::{self, Color32, Rect, Vec2, vec2};
 
 use crate::engine::{self, Bitmap, Document, Page};
+use crate::grey;
 
 pub type DocId = u64;
 
@@ -126,12 +127,10 @@ pub enum Output {
         doc: DocId,
         result: Result<Vec<Vec2>, String>,
     },
-    /// Premultiplied pixels, in the layout egui uploads, so taking one in on the UI thread
-    /// doesn't copy it.
     Image {
         key: Key,
         size: [usize; 2],
-        pixels: Vec<Color32>,
+        pixels: Pixels,
     },
     Failed(Key),
     /// `None` if the viewport could not be drawn.
@@ -148,6 +147,20 @@ pub enum Output {
         doc: DocId,
         entries: Vec<OutlineEntry>,
     },
+}
+
+pub enum Pixels {
+    /// Premultiplied, in the layout egui uploads, so taking them in on the UI thread doesn't
+    /// copy them.
+    Rgba(Vec<Color32>),
+    /// A tile without colour, one byte a pixel (see [`crate::grey`]).
+    Grey(Vec<u8>),
+}
+
+impl Pixels {
+    fn tile(rgba: Vec<Color32>) -> Self {
+        grey::to_grey(&rgba).map_or(Pixels::Rgba(rgba), Pixels::Grey)
+    }
 }
 
 impl Output {
@@ -481,14 +494,14 @@ fn render_tiles(page: &Page, run: &[Key]) -> Option<Vec<Output>> {
     );
     let [w, h] = [w as usize, h as usize];
     if let [key] = *run {
-        return Some(vec![Output::Image { key, size: [w, h], pixels: strip }]);
+        return Some(vec![Output::Image { key, size: [w, h], pixels: Pixels::tile(strip) }]);
     }
     let tile = TILE as usize;
     let tiles = run.iter().enumerate().map(|(i, &key)| {
         let x = i * tile;
         let tw = tile.min(w - x);
         let pixels = strip.chunks_exact(w).flat_map(|row| &row[x..x + tw]).copied().collect();
-        Output::Image { key, size: [tw, h], pixels }
+        Output::Image { key, size: [tw, h], pixels: Pixels::tile(pixels) }
     });
     Some(tiles.collect())
 }
@@ -497,7 +510,7 @@ fn render_thumb(page: &Page, key: Key, width: u32) -> Option<Output> {
     let h = thumb_height(page.size(), width);
     let mut pixels: Vec<Color32> = bytemuck::allocation::zeroed_vec((width * h) as usize);
     Bitmap::new(bytemuck::cast_slice_mut(&mut pixels), width, h)?.draw(page, [width as f64, h as f64], [0.0, 0.0]);
-    Some(Output::Image { key, size: [width as usize, h as usize], pixels })
+    Some(Output::Image { key, size: [width as usize, h as usize], pixels: Pixels::Rgba(pixels) })
 }
 
 // TODO(perf): the QOI encode runs on the render thread, delaying tiles for the tab just
@@ -524,6 +537,13 @@ fn render_snapshot(doc: &Document, job: &SnapshotJob) -> Option<Snapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rgba(pixels: Pixels) -> Vec<Color32> {
+        match pixels {
+            Pixels::Rgba(p) => p,
+            Pixels::Grey(p) => p.into_iter().map(Color32::from_gray).collect(),
+        }
+    }
 
     fn write_png(path: &str, rgba: &[u8], w: u32, h: u32) {
         let mut enc = png::Encoder::new(std::fs::File::create(path).unwrap(), w, h);
@@ -564,13 +584,15 @@ mod tests {
         images.push(render_thumb(&page, Key::Thumb { doc: 0, page: 1, width: 108 }, 108).expect("render thumb"));
         for image in images {
             let Output::Image { key, size, pixels } = image else { panic!("not an image") };
-            if let [single] = &render_tiles(&page, &[key]).unwrap_or_default()[..]
-                && row.contains(&key)
+            let pixels = rgba(pixels);
+            if row.contains(&key)
+                && let Some(Output::Image { pixels: alone, .. }) =
+                    render_tiles(&page, &[key]).and_then(|t| t.into_iter().next())
             {
-                let Output::Image { pixels: alone, .. } = single else { panic!("not an image") };
+                let alone = rgba(alone);
                 // Image resampling rounds differently by a level, and a lone tile's clip can
                 // shade a few edge pixels, so allow that much.
-                let off = pixels.iter().zip(alone).filter(|(a, b)| (0..4).any(|i| a[i].abs_diff(b[i]) > 1)).count();
+                let off = pixels.iter().zip(&alone).filter(|(a, b)| (0..4).any(|i| a[i].abs_diff(b[i]) > 1)).count();
                 assert!(
                     off * 10_000 <= pixels.len(),
                     "{key:?}: {off} pixels differ between its row and it drawn alone"

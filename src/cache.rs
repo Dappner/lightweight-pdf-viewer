@@ -7,12 +7,12 @@
 //! the budget is exceeded.
 
 use eframe::egui::ahash::{HashMap, HashSet};
-use eframe::egui::{TextureHandle, TextureId};
 
+use crate::grey::{Image, Texture};
 use crate::renderer::{DocId, Key};
 
 struct Entry {
-    texture: TextureHandle,
+    texture: Texture,
     bytes: usize,
     last_used: u64,
     /// The latest frame of each window that used this entry, as (window, frame).
@@ -56,7 +56,7 @@ impl TextureCache {
     }
 
     /// Returns the texture and marks it as shown by the window drawing now.
-    pub fn get(&mut self, key: &Key) -> Option<TextureId> {
+    pub fn get(&mut self, key: &Key) -> Option<Image> {
         let entry = self.entries.get_mut(key)?;
         entry.last_used = self.frame;
         // One hash lookup per tile per frame: what a window shows is recorded on the entry
@@ -65,7 +65,7 @@ impl TextureCache {
             Some(used) => used.1 = self.frame,
             None => entry.used_by.push((self.window, self.frame)),
         }
-        Some(entry.texture.id())
+        Some(entry.texture.image())
     }
 
     pub fn contains(&self, key: &Key) -> bool {
@@ -73,11 +73,11 @@ impl TextureCache {
     }
 
     /// Returns the texture without protecting it from eviction.
-    pub fn peek(&self, key: &Key) -> Option<TextureId> {
-        self.entries.get(key).map(|e| e.texture.id())
+    pub fn peek(&self, key: &Key) -> Option<Image> {
+        self.entries.get(key).map(|e| e.texture.image())
     }
 
-    pub fn insert(&mut self, key: Key, texture: TextureHandle, bytes: usize) {
+    pub fn insert(&mut self, key: Key, texture: Texture, bytes: usize) {
         let entry = Entry { texture, bytes, last_used: self.frame, used_by: Vec::new() };
         self.bytes += bytes;
         if let Some(old) = self.entries.insert(key, entry) {
@@ -143,7 +143,7 @@ mod tests {
 
     fn insert(cache: &mut TextureCache, ctx: &Context, key: Key) {
         let texture = ctx.load_texture("t", ColorImage::filled([1, 1], Default::default()), TextureOptions::LINEAR);
-        cache.insert(key, texture, 1);
+        cache.insert(key, Texture::Egui(texture), 1);
     }
 
     /// A window that stops drawing keeps what it shows, but no longer stops other windows'

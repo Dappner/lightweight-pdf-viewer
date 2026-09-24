@@ -17,10 +17,11 @@ use eframe::egui::{
 use crate::cache::TextureCache;
 use crate::config::{Config, SavedWindow};
 use crate::finder;
+use crate::grey::{GreyTexture, Texture};
 use crate::history::{self, History};
 use crate::layout::{DocLayout, PageLayout};
 use crate::menu;
-use crate::renderer::{DocId, Key, Output, Renderer};
+use crate::renderer::{DocId, Key, Output, Pixels, Renderer};
 use crate::sidebar::{self, Mode as SidebarMode};
 use crate::tab::DocState;
 use crate::tab_bar;
@@ -498,13 +499,16 @@ impl State {
             // Tiles that were in flight when the app fell asleep.
             Output::Image { key: Key::Tile { .. }, .. } if self.sleep != Sleep::Awake => self.discarded += 1,
             Output::Image { key, size, pixels } if self.is_active(key.doc()) => {
-                // TODO(perf, memory): most pages are text: grayscale tiles could be single-channel
-                // (R8) textures, a quarter of the memory, and on M-series GPU memory is system
-                // memory. egui 0.33 only uploads RGBA, so this needs its own wgpu texture and a
-                // paint callback that samples .rrr; measure texture MB in the session benchmark.
-                let image = ColorImage::new(size, pixels);
-                let texture = ctx.load_texture("page", image, TextureOptions::LINEAR);
-                self.shared.cache.insert(key, texture, size[0] * size[1] * 4);
+                let (texture, bytes) = match pixels {
+                    Pixels::Rgba(pixels) => {
+                        let texture = ctx.load_texture("page", ColorImage::new(size, pixels), TextureOptions::LINEAR);
+                        (Texture::Egui(texture), size[0] * size[1] * 4)
+                    }
+                    Pixels::Grey(pixels) => {
+                        (Texture::Grey(Arc::new(GreyTexture::new(size, pixels))), size[0] * size[1])
+                    }
+                };
+                self.shared.cache.insert(key, texture, bytes);
             }
             Output::Image { .. } => self.discarded += 1,
             Output::Failed(key) => {
@@ -838,7 +842,7 @@ mod tests {
         state.open(&ctx, "/nonexistent/a.pdf".into());
         let doc = state.windows[0].tabs[0].id;
         let texture = ctx.load_texture("t", ColorImage::filled([1, 1], Default::default()), TextureOptions::LINEAR);
-        state.shared.cache.insert(tile(doc), texture, 4);
+        state.shared.cache.insert(tile(doc), Texture::Egui(texture), 4);
         (ctx, state, doc)
     }
 

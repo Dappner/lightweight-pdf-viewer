@@ -9,6 +9,7 @@ mod engine;
 mod find_bar;
 #[cfg(target_os = "macos")]
 pub mod finder;
+pub mod grey;
 pub mod history;
 mod layout;
 pub mod memory;

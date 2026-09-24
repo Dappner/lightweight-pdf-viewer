@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use eframe::egui;
 use lightweight_pdf_viewer::app::{self, App};
-use lightweight_pdf_viewer::{config::Config, finder, history::History, memory, menu, titlebar};
+use lightweight_pdf_viewer::{config::Config, finder, grey, history::History, memory, menu, titlebar};
 
 fn main() -> eframe::Result {
     let config = Config::load();
@@ -25,10 +25,12 @@ fn main() -> eframe::Result {
         },
         ..Default::default()
     };
+    let dithering = options.dithering;
     eframe::run_native(
         "Lightweight PDF",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
+            grey::install(cc.wgpu_render_state.as_ref().expect("wgpu renderer"), dithering);
             menu::install(&cc.egui_ctx);
             titlebar::install();
             Ok(Box::new(App::new(&cc.egui_ctx, config, History::load(), files)))

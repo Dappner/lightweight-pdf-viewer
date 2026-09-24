@@ -6,7 +6,7 @@ license = "MIT"
 
 [dependencies]
 # Zero-copy pixel buffers: tiles are drawn straight into the `Color32`s egui uploads.
-bytemuck = { version = "1.25.2", features = ["extern_crate_alloc"] }
+bytemuck = { version = "1.25.2", features = ["derive", "extern_crate_alloc"] }
 eframe = { version = "0.33.3", default-features = false, features = ["wgpu", "default_fonts"] }
 # Only the Metal backend (eframe's defaults would also pull in GL/Vulkan backends).
 egui-wgpu = { version = "0.33.3", default-features = false, features = ["macos-window-resize-jitter-fix"] }
@@ -38,6 +38,7 @@ strip = true
 [dev-dependencies]
 libc = "0.2.189"
 png = "0.18.1"
+pollster = "0.4.0"
 
 [[bench]]
 name = "session"
