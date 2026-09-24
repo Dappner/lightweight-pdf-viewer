@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::memory::Memory;
+use crate::search_index::{self, Limits, Store};
 use crate::sidebar;
 
 #[derive(Serialize, Deserialize)]
@@ -17,6 +18,11 @@ pub struct Config {
     pub windows: Vec<SavedWindow>,
     /// How much to keep in memory to make scrolling and going back fast.
     pub memory: Memory,
+    /// How much searched text to keep on disk, so searching a document again is fast.
+    pub search_cache: Limits,
+    /// Where searched text is saved; `None` doesn't save it (tests, benchmarks).
+    #[serde(skip)]
+    pub search_cache_dir: Option<PathBuf>,
     /// Where the settings are saved; `None` keeps them in memory only (tests, benchmarks).
     #[serde(skip)]
     path: Option<PathBuf>,
@@ -29,6 +35,8 @@ impl Default for Config {
             restore_tabs: true,
             windows: Vec::new(),
             memory: Memory::default(),
+            search_cache: Limits::default(),
+            search_cache_dir: None,
             path: None,
         }
     }
@@ -47,7 +55,15 @@ pub struct SavedWindow {
 impl Config {
     /// Loads the user's settings.
     pub fn load() -> Self {
-        support_file("config.json").map_or_else(Self::default, Self::load_from)
+        let mut config = support_file("config.json").map_or_else(Self::default, Self::load_from);
+        config.search_cache_dir = search_index::user_dir();
+        config
+    }
+
+    /// Where searches save page text, unless that's turned off.
+    pub fn search_store(&self) -> Option<Store> {
+        let dir = self.search_cache_dir.clone()?;
+        (self.search_cache.max_mb > 0).then_some(Store { dir, limits: self.search_cache })
     }
 
     /// Loads settings saved at `path`, falling back to defaults if the file is missing or invalid.

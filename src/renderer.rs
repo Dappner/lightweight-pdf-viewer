@@ -463,14 +463,14 @@ fn get_page(doc: &CGPDFDocument, page: u32) -> Option<CFRetained<CGPDFPage>> {
 }
 
 /// Crop box and rotation of a page, which together define what is displayed.
-struct PageGeometry {
+pub(crate) struct PageGeometry {
     crop: CGRect,
     /// Clockwise rotation in degrees: 0, 90, 180 or 270.
     rotation: i32,
 }
 
 impl PageGeometry {
-    fn of(page: &CGPDFPage) -> Self {
+    pub(crate) fn of(page: &CGPDFPage) -> Self {
         let crop = CGPDFPage::box_rect(Some(page), CGPDFBox::CropBox);
         let rotation = CGPDFPage::rotation_angle(Some(page)).rem_euclid(360) / 90 * 90;
         Self { crop, rotation }
@@ -483,7 +483,7 @@ impl PageGeometry {
     }
 
     /// A point in PDF user space as fractions of the displayed page, top-left origin.
-    fn to_fraction(&self, x: f64, y: f64) -> Pos2 {
+    pub(crate) fn to_fraction(&self, x: f64, y: f64) -> Pos2 {
         let t = self.page_to_display();
         let size = self.size();
         let u = t.a * x + t.c * y + t.tx;

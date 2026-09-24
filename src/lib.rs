@@ -3,16 +3,21 @@
 
 pub mod app;
 mod cache;
+mod case_folding;
 pub mod config;
 pub mod finder;
+mod find_bar;
 pub mod history;
 mod layout;
 pub mod memory;
 pub mod menu;
 mod quick_open;
 mod renderer;
+pub mod search;
+pub mod search_index;
 mod sidebar;
 mod tab;
+mod text;
 mod tab_bar;
 mod theme;
 pub mod titlebar;

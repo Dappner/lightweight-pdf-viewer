@@ -12,10 +12,12 @@ use eframe::egui::{
 use crate::app::Command;
 use crate::cache::TextureCache;
 use crate::config::Config;
+use crate::find_bar;
 use crate::history::{self, History};
 use crate::layout::PageLayout;
 use crate::quick_open::{Outcome, QuickOpen};
 use crate::renderer::{DocId, Key, Renderer, Snapshot, Target};
+use crate::search::{Anchor, Search};
 use crate::sidebar::{self, Mode as SidebarMode};
 use crate::tab::{DocState, Tab};
 use crate::tab_bar::{self, Action};
@@ -134,11 +136,13 @@ impl Window {
     }
 
     /// Switching tabs is where memory is reclaimed: the outgoing tab keeps only a small
-    /// compressed snapshot, and its open PDF document is released. Its textures are kept for
-    /// a few seconds (see [`PARK_SECONDS`]) in case you flip straight back.
+    /// compressed snapshot, and its open PDF document is released. Its textures, and its
+    /// search's text, are kept for a few seconds (see [`PARK_SECONDS`]) in case you flip
+    /// straight back; its search is paused meanwhile.
     pub fn activate(&mut self, ctx: &Context, shared: &mut Shared, index: usize) {
         // Returning to the parked tab within the grace period: its tiles are still cached.
         let returning = self.parked.is_some_and(|(doc, _)| doc == self.tabs[index].id);
+        let mut expired = None;
         if index != self.active
             && let Some(old) = self.tabs.get_mut(self.active)
         {
@@ -150,16 +154,26 @@ impl Window {
             }
             old.snapshot_texture = None;
             old.links.clear();
+            if let Some(search) = &mut old.search {
+                search.pause(true);
+            }
             if let Some((parked, _)) = self.parked.take()
                 && !returning
             {
                 shared.cache.evict_doc(parked);
+                expired = Some(parked);
             }
             self.parked = Some((old.id, ctx.input(|i| i.time) + PARK_SECONDS));
+        }
+        if let Some(doc) = expired {
+            self.suspend_search(doc);
         }
         self.active = index;
 
         let tab = &mut self.tabs[index];
+        if let Some(search) = &mut tab.search {
+            search.pause(false);
+        }
         if returning {
             return;
         }
@@ -174,8 +188,16 @@ impl Window {
         if now >= until {
             shared.cache.evict_doc(doc);
             self.parked = None;
+            self.suspend_search(doc);
         } else {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(until - now));
+        }
+    }
+
+    /// Stops the search worker of tab `doc`, which is in the background; its results stay.
+    fn suspend_search(&mut self, doc: DocId) {
+        if let Some(search) = self.tabs.iter_mut().find(|t| t.id == doc).and_then(|t| t.search.as_mut()) {
+            search.suspend();
         }
     }
 
@@ -260,7 +282,54 @@ impl Window {
             Command::ShowSidebar(mode) => self.set_sidebar_mode(shared, mode),
             Command::SetLayout(mode) => self.set_layout(ctx, mode),
             Command::ZoomIn | Command::ZoomOut | Command::ZoomToFit => self.zoom(ctx, command),
+            Command::Find => self.open_find(ctx, shared),
+            Command::FindNext => self.find_step(true),
+            Command::FindPrevious => self.find_step(false),
             _ => {}
+        }
+    }
+
+    /// Opens the active tab's find bar, or focuses it and selects its text.
+    fn open_find(&mut self, ctx: &Context, shared: &Shared) {
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        let DocState::Ready(layout) = &tab.doc else { return };
+        let start = tab.view.current_page;
+        let search = tab
+            .search
+            .get_or_insert_with(|| Search::new(ctx, tab.path.clone(), layout.page_count(), start, shared.config.search_store()));
+        search.focus = true;
+        search.wake();
+    }
+
+    /// The top of the active tab's viewport, where a search without a current match starts
+    /// from.
+    fn find_anchor(&self) -> Option<Anchor> {
+        let tab = self.active_tab()?;
+        let DocState::Ready(layout) = &tab.doc else { return None };
+        (tab.view.zoom > 0.0).then(|| {
+            let place = tab.view.place(layout);
+            (place.page, place.y)
+        })
+    }
+
+    fn find_step(&mut self, forward: bool) {
+        let Some(anchor) = self.find_anchor() else { return };
+        if let Some(search) = self.tabs.get_mut(self.active).and_then(|t| t.search.as_mut()) {
+            search.step(forward, anchor);
+        }
+    }
+
+    /// Runs the active tab's search for this frame: takes up edits and pending steps, and
+    /// scrolls to a newly selected match.
+    fn update_find(&mut self, ctx: &Context) {
+        let anchor = self.find_anchor();
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        let (Some(search), DocState::Ready(layout), Some(anchor)) = (tab.search.as_mut(), &tab.doc, anchor) else {
+            return;
+        };
+        search.update(ctx, anchor, tab.view.current_page);
+        if let Some((page, area)) = search.take_reveal() {
+            tab.view.reveal(layout, page, area);
         }
     }
 
@@ -396,6 +465,9 @@ impl Window {
                 (cmd | alt, KeyCode::Num1, Command::SetLayout(PageLayout::Single)),
                 (cmd | alt, KeyCode::Num2, Command::SetLayout(PageLayout::TwoPages)),
                 (cmd | alt, KeyCode::Num3, Command::SetLayout(PageLayout::Book)),
+                (cmd | shift, KeyCode::G, Command::FindPrevious),
+                (cmd, KeyCode::G, Command::FindNext),
+                (cmd, KeyCode::F, Command::Find),
             ];
             let mut commands: Vec<Command> =
                 bindings.into_iter().filter(|(m, k, _)| i.consume_key(*m, *k)).map(|(_, _, c)| c).collect();
@@ -407,8 +479,8 @@ impl Window {
             }
             commands
         });
-        // The palette's list and text field take the arrow and editing keys.
-        if self.quick_open.is_none() {
+        // The palette's list and the text fields take the arrow and editing keys.
+        if self.quick_open.is_none() && !find_bar::focused(ctx, self.serial) {
             self.view_shortcuts(ctx);
         }
         commands
@@ -500,6 +572,12 @@ impl Window {
             shared.renderer.outline(tab.id);
         }
 
+        let find_open = self.active_tab().is_some_and(|t| t.search.is_some());
+        if find_open && self.quick_open.is_none() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, KeyCode::Escape)) {
+            self.tabs[self.active].search = None;
+        }
+        self.update_find(ctx);
+
         let palette = palette(ctx.style().visuals.dark_mode);
         let bar = TopBottomPanel::top(Id::new(("tabs", self.serial)))
             .exact_height(tab_bar::HEIGHT)
@@ -578,12 +656,16 @@ impl Window {
                         cache: &mut shared.cache,
                         failed: &shared.failed,
                         links: &tab.links,
+                        search: tab.search.as_ref(),
                         thumb_px: shared.thumb_px,
                         prefetch: shared.prefetch,
                         page_border: palette.page_border,
                     }
                     .show(ui, wants);
                     self.visible_ready = out.ready;
+                    if let Some(search) = &mut tab.search {
+                        search.want_geometry(&out.visible_pages);
+                    }
                     out.clicked_link
                 }
             }
@@ -591,6 +673,20 @@ impl Window {
         .inner;
         if let Some(target) = clicked_link {
             self.follow(target);
+        }
+
+        if self.quick_open.is_none()
+            && let Some(tab) = self.tabs.get_mut(self.active)
+            && let Some(search) = &mut tab.search
+        {
+            let now = ctx.input(|i| i.time);
+            match find_bar::show(ctx, self.serial, tab_bar::HEIGHT, search, &palette) {
+                Some(find_bar::Action::Edited) => search.edited(now),
+                Some(find_bar::Action::Next) => self.find_step(true),
+                Some(find_bar::Action::Previous) => self.find_step(false),
+                Some(find_bar::Action::Close) => self.tabs[self.active].search = None,
+                None => {}
+            }
         }
 
         if let Some(quick_open) = &mut self.quick_open

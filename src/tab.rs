@@ -6,6 +6,7 @@ use eframe::egui::{Rect, TextureHandle, Vec2};
 use crate::history::Place;
 use crate::layout::DocLayout;
 use crate::renderer::{DocId, Link, OutlineEntry, Snapshot};
+use crate::search::Search;
 
 pub enum DocState {
     Loading,
@@ -30,6 +31,8 @@ pub struct Tab {
     pub outline_requested: bool,
     /// Where the file was left last time, applied once it loads.
     pub restore: Option<Place>,
+    /// The find bar's search, while it is open.
+    pub search: Option<Search>,
 }
 
 /// Scroll and zoom state of a tab. Survives while the tab is in the background.
@@ -73,6 +76,7 @@ impl Tab {
             outline: None,
             outline_requested: false,
             restore,
+            search: None,
         }
     }
 }

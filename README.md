@@ -46,6 +46,8 @@ The app reopens the tabs you had open last time. Settings live in `~/Library/App
 | `"balanced"` (default) | A few screens of pages, and the last tab for a few seconds after you leave it. | Most people |
 | `"fast"` | More rendered pages, and more of each document parsed. Uses several times the memory. | Plenty of free memory |
 
+Searching a document saves its text in `~/Library/Caches/Lightweight PDF/Search/`, so the next search of it, even after a relaunch, skips reading the PDF's text again. A textbook takes 2–5 MB. `"search_cache": { "max_mb": 256, "max_days": 30 }` sets how much is kept: documents not searched for `max_days` are deleted, and the least recently searched go first once the folder is over `max_mb`. `"max_mb": 0` turns it off. Edit → Clear Search Cache deletes it all.
+
 | Shortcut | Action |
 | --- | --- |
 | ⌘O | Open |
@@ -56,6 +58,7 @@ The app reopens the tabs you had open last time. Settings live in `~/Library/App
 | ⌘B | Show or hide page thumbnails |
 | ⌘= / ⌘- | Zoom in / out |
 | ⌘0 | Fit page width |
+| ⌘F | Find text (Enter / ⇧Enter or ⌘G / ⌘⇧G for next / previous match, Esc to close) |
 | Space / ⇧Space | Page down / up |
 | ⌘↑ / ⌘↓ | First / last page |
 
@@ -68,6 +71,14 @@ cargo bench --bench session -- a.pdf b.pdf
 ```
 
 Set `BENCH_MEMORY=low|balanced|fast` to pick the memory setting and `BENCH_PPP=2` for Retina. It takes about 30 seconds; `BENCH_FULL=1` runs each scenario more times and scrolls the whole last document (about 2.5 minutes).
+
+Text search has its own, which searches each PDF end to end and fails if memory goes over budget or isn't given back when the search closes (a few seconds to half a minute per file):
+
+```sh
+cargo bench --bench search -- a.pdf b.pdf
+```
+
+`cargo bench --bench search_spike` measures PDFKit itself (text extraction, highlight geometry, contention with rendering), which the search design is based on.
 
 ## Requirements
 

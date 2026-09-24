@@ -110,6 +110,13 @@ pub fn install(ctx: &egui::Context) {
             Separator,
             Item("Close Tab", Command::CloseTab, "w", cmd),
         ]),
+        ("Edit", vec![
+            Item("Find…", Command::Find, "f", cmd),
+            Item("Find Next", Command::FindNext, "g", cmd),
+            Item("Find Previous", Command::FindPrevious, "g", cmd_shift),
+            Separator,
+            Item("Clear Search Cache", Command::ClearSearchCache, "", none),
+        ]),
         ("View", vec![
             Item("Toggle Sidebar", Command::ToggleSidebar, "b", cmd),
             Item("Pages / Outline", Command::ToggleOutline, "b", cmd_option),

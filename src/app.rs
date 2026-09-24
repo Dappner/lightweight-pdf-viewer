@@ -90,6 +90,12 @@ pub enum Command {
     ZoomIn,
     ZoomOut,
     ZoomToFit,
+    /// Opens the find bar, or focuses it.
+    Find,
+    FindNext,
+    FindPrevious,
+    /// Deletes the page text searches saved to disk.
+    ClearSearchCache,
     Quit,
 }
 
@@ -112,6 +118,12 @@ pub struct Stats {
     pub snapshot_capacity: usize,
     /// Page tiles were dropped while the app was in the background.
     pub asleep: bool,
+    /// The active tab's find bar status, while the bar is open ("" before a query).
+    pub find: Option<String>,
+    /// The active tab's search: its reads of page text from the disk index, and with PDFKit.
+    pub find_reads: (u64, u64),
+    /// Searches with a worker attached, in every window and tab.
+    pub search_workers: usize,
 }
 
 /// How every window is set up: a tab strip in place of the title bar.
@@ -419,6 +431,15 @@ impl State {
         for output in self.shared.renderer.take_done() {
             self.handle(ctx, output);
         }
+        for window in &mut self.windows {
+            let mut changed = false;
+            for search in window.tabs.iter_mut().filter_map(|t| t.search.as_mut()) {
+                changed |= search.receive();
+            }
+            if changed {
+                ctx.request_repaint_of(window.viewport);
+            }
+        }
         self.finish_falling_asleep();
     }
 
@@ -543,11 +564,15 @@ impl State {
         }
     }
 
-    /// Drops every page tile (thumbnails are small and stay) and closes the open documents.
+    /// Drops every page tile (thumbnails are small and stay), closes the open documents and
+    /// stops the search workers (searches keep their results).
     fn release_tiles(&mut self) {
         self.shared.cache.retain(|k| !matches!(k, Key::Tile { .. }));
         for window in &mut self.windows {
             window.parked = None;
+            for search in window.tabs.iter_mut().filter_map(|t| t.search.as_mut()) {
+                search.sleep();
+            }
         }
         self.shared.renderer.release();
     }
@@ -565,6 +590,11 @@ impl State {
             }
             Command::MergeAllWindows => self.merge_into(ctx, w),
             Command::CloseTab if self.windows[w].tabs.is_empty() => self.close_window(ctx, w),
+            Command::ClearSearchCache => {
+                if let Some(store) = self.shared.config.search_store() {
+                    store.clear();
+                }
+            }
             Command::Quit => {
                 self.quitting = true;
                 ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::Close);
@@ -637,6 +667,15 @@ impl State {
                 .map(|s| s.qoi.capacity())
                 .sum(),
             asleep: self.sleep == Sleep::Asleep,
+            find: active.and_then(|t| t.search.as_ref()).map(|s| s.status().unwrap_or_default()),
+            find_reads: active.and_then(|t| t.search.as_ref()).map_or((0, 0), |s| (s.stats().loaded, s.stats().extracted)),
+            search_workers: self
+                .windows
+                .iter()
+                .flat_map(|w| &w.tabs)
+                .filter_map(|t| t.search.as_ref())
+                .filter(|s| s.stats().worker)
+                .count(),
         }
     }
 }

@@ -14,7 +14,7 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std"
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFURL", "CFCGTypes"] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGPDFDocument", "CGPDFPage", "CGContext", "CGBitmapContext", "CGColorSpace", "CGImage", "CGAffineTransform"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSNotification", "NSOperation", "NSString", "NSArray", "NSURL", "NSObject"] }
-objc2-pdf-kit = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-graphics", "PDFDocument", "PDFPage", "PDFOutline", "PDFDestination", "PDFAnnotation", "PDFAnnotationUtilities", "PDFAction", "PDFActionURL", "PDFActionGoTo"] }
+objc2-pdf-kit = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-graphics", "PDFDocument", "PDFPage", "PDFOutline", "PDFDestination", "PDFAnnotation", "PDFAnnotationUtilities", "PDFAction", "PDFActionURL", "PDFActionGoTo", "PDFSelection"] }
 qoi = "0.4.1"
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -31,4 +31,12 @@ png = "0.18.1"
 
 [[bench]]
 name = "session"
+harness = false
+
+[[bench]]
+name = "search_spike"
+harness = false
+
+[[bench]]
+name = "search"
 harness = false

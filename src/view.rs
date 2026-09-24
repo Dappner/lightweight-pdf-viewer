@@ -9,9 +9,11 @@ use eframe::egui::{
 };
 
 use crate::cache::TextureCache;
+use crate::find_bar;
 use crate::history::Place;
 use crate::layout::{DocLayout, MARGIN, PageLayout};
 use crate::renderer::{DocId, Key, Link, SnapshotJob, SnapshotPage, TILE, Target, page_pixels, scale_key};
+use crate::search::Search;
 use crate::tab::View;
 
 pub const MIN_ZOOM: f32 = 0.1;
@@ -116,6 +118,30 @@ impl View {
         }
     }
 
+    /// Scrolls `area` of `page` (fractions of the page) into view if it isn't already,
+    /// placing it a third of the way down the viewport.
+    pub fn reveal(&mut self, layout: &DocLayout, page: usize, area: Rect) {
+        if page >= layout.page_count() {
+            return;
+        }
+        let page_rect = layout.page_rect(page, self.zoom, self.content_width(layout, self.zoom));
+        let target = find_bar::on_page(page_rect, area);
+        let offset = self.pending_offset.unwrap_or(self.offset);
+        let visible = Rect::from_min_size(offset.to_pos2(), self.viewport.size());
+        if visible.contains_rect(target) {
+            return;
+        }
+        let mut offset = offset;
+        if target.top() < visible.top() || target.bottom() > visible.bottom() {
+            offset.y = target.center().y - visible.height() / 3.0;
+        }
+        if target.left() < visible.left() || target.right() > visible.right() {
+            offset.x = target.center().x - visible.width() / 2.0;
+        }
+        self.pending_offset = Some(offset.max(Vec2::ZERO));
+        self.landed_page = None;
+    }
+
     /// Rearranges the pages, fitting the new rows to the window and keeping the page at the
     /// top of the viewport in place.
     pub fn set_layout(&mut self, layout: &mut DocLayout, mode: PageLayout, now: f64) {
@@ -164,6 +190,8 @@ pub struct Canvas<'a> {
     pub failed: &'a HashSet<Key>,
     /// Link annotations of the pages loaded so far.
     pub links: &'a HashMap<u32, Vec<Link>>,
+    /// The find bar's search, whose matches are highlighted.
+    pub search: Option<&'a Search>,
     /// Width of the sidebar's thumbnails, drawn as placeholders until tiles arrive.
     pub thumb_px: u32,
     /// Screen heights rendered ahead, above and below the visible area.
@@ -175,11 +203,13 @@ pub struct CanvasOutput {
     /// Every visible tile was drawn at full sharpness.
     pub ready: bool,
     pub clicked_link: Option<Target>,
+    /// Pages at least partly on screen.
+    pub visible_pages: Vec<u32>,
 }
 
 impl Canvas<'_> {
     pub fn show(self, ui: &mut Ui, wants: &mut Wants) -> CanvasOutput {
-        let Canvas { doc, layout, view, snapshot, cache, failed, links, thumb_px, prefetch, page_border } = self;
+        let Canvas { doc, layout, view, snapshot, cache, failed, links, search, thumb_px, prefetch, page_border } = self;
         let ppp = ui.ctx().pixels_per_point();
         let now = ui.input(|i| i.time);
         let area = ui.available_rect_before_wrap();
@@ -231,6 +261,7 @@ impl Canvas<'_> {
 
             let mut all_visible_ready = true;
             let mut clicked_link = None;
+            let mut visible_pages: Vec<(u32, Rect)> = Vec::new();
             // The page taking up the most of the viewport; the first one on a tie.
             let mut most_visible = (0.0, layout.page_at(viewport.top(), view.zoom));
             let pages = layout.pages_in(prefetch.top() - origin.y, prefetch.bottom() - origin.y, view.zoom);
@@ -245,6 +276,7 @@ impl Canvas<'_> {
                 let visible = rect.intersects(screen_viewport);
 
                 if visible {
+                    visible_pages.push((page as u32, rect));
                     let shown = rect.intersect(screen_viewport).area();
                     if shown > most_visible.0 + 0.5 {
                         most_visible = (shown, page);
@@ -300,9 +332,20 @@ impl Canvas<'_> {
                 }
             }
 
-            (all_visible_ready, clicked_link, most_visible.1)
+            // Over the tiles: every match on screen, the current one stronger.
+            if let Some(search) = search {
+                let (all, current) = highlight_colors();
+                for &(page, rect) in &visible_pages {
+                    for (area, is_current) in search.highlights(page) {
+                        let area = find_bar::on_page(rect, area).expand(1.0);
+                        painter.rect_filled(area, 2.0, if is_current { current } else { all });
+                    }
+                }
+            }
+
+            (all_visible_ready, clicked_link, most_visible.1, visible_pages.into_iter().map(|(p, _)| p).collect())
         });
-        let (all_visible_ready, clicked_link, most_visible) = output.inner;
+        let (all_visible_ready, clicked_link, most_visible, visible_pages) = output.inner;
 
         let scrolled = output.state.offset != view.offset;
         if scrolled && !jumped {
@@ -319,8 +362,13 @@ impl Canvas<'_> {
             // The new scale fully covers the viewport; drop tiles rendered at other scales.
             cache.retain(|k| !matches!(*k, Key::Tile { doc: d, scale: s, .. } if d == doc && s != scale));
         }
-        CanvasOutput { ready: all_visible_ready && view.zoom == view.render_zoom, clicked_link }
+        CanvasOutput { ready: all_visible_ready && view.zoom == view.render_zoom, clicked_link, visible_pages }
     }
+}
+
+/// Fill colors of search matches: all of them, and the current one.
+fn highlight_colors() -> (Color32, Color32) {
+    (Color32::from_rgba_unmultiplied(255, 204, 0, 90), Color32::from_rgba_unmultiplied(255, 140, 0, 150))
 }
 
 /// Aligns a position to the physical pixel grid.
