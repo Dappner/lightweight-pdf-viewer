@@ -26,7 +26,8 @@ pub struct Tuning {
     /// is closed; reopening takes a millisecond or two.
     pub pages_per_open: usize,
     /// Render threads, each drawing a different page at once. Each keeps its own copy of the
-    /// documents it draws, and so of CoreGraphics' caches for them.
+    /// documents it draws, and so of CoreGraphics' caches for them: a second thread made
+    /// scrolling sharp ~40% sooner for up to ~13 MB more peak footprint (`benches/session.rs`).
     pub render_threads: usize,
     /// Screen heights rendered ahead, above and below the visible area.
     pub prefetch: f32,
@@ -53,7 +54,7 @@ impl Memory {
             Memory::Balanced => Tuning {
                 texture_budget: 48 * MB,
                 pages_per_open: 32,
-                render_threads: 2,
+                render_threads: 1,
                 prefetch: 0.5,
                 space_efficient_malloc: true,
                 sleep_after: Some(10.0),

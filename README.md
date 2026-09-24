@@ -44,7 +44,7 @@ The app reopens the tabs you had open last time. Settings live in `~/Library/App
 | --- | --- | --- |
 | `"low"` | Only what's on screen. Flipping back to a tab shows its snapshot for a moment while it redraws. | Macs short on memory |
 | `"balanced"` (default) | A few screens of pages, and the last tab for a few seconds after you leave it. | Most people |
-| `"fast"` | More rendered pages, and more of each document parsed. Uses several times the memory. | Plenty of free memory |
+| `"fast"` | More rendered pages, more of each document parsed, and pages drawn three at a time. Uses several times the memory. | Plenty of free memory |
 
 Searching a document saves its text in `~/Library/Caches/Lightweight PDF/Search/`, so the next search of it, even after a relaunch, skips reading the PDF's text again. A textbook takes 2–5 MB. `"search_cache": { "max_mb": 256, "max_days": 30 }` sets how much is kept: documents not searched for `max_days` are deleted, and the least recently searched go first once the folder is over `max_mb`. `"max_mb": 0` turns it off. Edit → Clear Search Cache deletes it all.
 
