@@ -70,8 +70,10 @@ pub fn paint(painter: &Painter, image: Image, rect: Rect) {
 /// The pixels as one byte each, if they are all opaque grey. Only exact grey: anything else
 /// would draw differently.
 pub fn to_grey(pixels: &[Color32]) -> Option<Vec<u8>> {
-    let grey = pixels.iter().all(|p| p.r() == p.g() && p.g() == p.b() && p.a() == 255);
-    grey.then(|| pixels.iter().map(|p| p.r()).collect())
+    // Whole pixels as u32s, which vectorizes: opaque grey is 0xFF_vv_vv_vv.
+    let words: &[u32] = bytemuck::cast_slice(pixels);
+    let grey = words.iter().fold(true, |grey, &w| grey & (w == ((w & 0xFF) * 0x01_01_01) | 0xFF_00_00_00));
+    grey.then(|| words.iter().map(|&w| w as u8).collect())
 }
 
 /// Sets up drawing grey tiles in the app's renderer. eframe's defaults are assumed for what
@@ -438,6 +440,21 @@ mod tests {
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         let data = readback.slice(..).get_mapped_range();
         data.chunks(row as usize).flat_map(|r| &r[..(size[0] * 4) as usize]).copied().collect()
+    }
+
+    #[test]
+    fn only_opaque_grey_is_grey() {
+        let grey: Vec<Color32> = (0..=255).map(Color32::from_gray).collect();
+        assert_eq!(to_grey(&grey), Some((0..=255).collect()));
+        for odd in [
+            Color32::from_rgb(10, 10, 11),
+            Color32::from_rgb(10, 11, 10),
+            Color32::from_rgba_premultiplied(10, 10, 10, 254),
+        ] {
+            let mut pixels = grey.clone();
+            pixels[100] = odd;
+            assert_eq!(to_grey(&pixels), None, "{odd:?}");
+        }
     }
 
     /// A grey tile drawn as R8 through the callback puts the same pixels on screen as egui
