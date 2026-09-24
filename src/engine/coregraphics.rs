@@ -196,6 +196,11 @@ impl<'a> Bitmap<'a> {
                 CGImageAlphaInfo::PremultipliedLast.0,
             )
         }?;
+        // TODO(perf): compare Default with High on image-heavy PDFs (scans): High resamples
+        // embedded images more expensively, and at 2x the difference may not be visible.
+        // Also try kCGImageAlphaNoneSkipLast: pages are opaque, and an opaque context can
+        // skip blending, but only if CoreGraphics then writes 255 to the alpha byte egui
+        // reads; check before adopting.
         CGContext::set_interpolation_quality(Some(&ctx), CGInterpolationQuality::High);
         CGContext::set_allows_font_smoothing(Some(&ctx), true);
         CGContext::set_should_smooth_fonts(Some(&ctx), true);

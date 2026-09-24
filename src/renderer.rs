@@ -22,6 +22,9 @@ use crate::engine::{self, Bitmap, Document, Page};
 pub type DocId = u64;
 
 /// Tile edge length in physical pixels.
+// TODO(perf): try 256 and 1024. Smaller tiles land sooner and waste less off-screen area;
+// larger ones mean fewer CoreGraphics draws and textures. Compare "to sharp" and cpu in
+// `cargo bench --bench session` on an M-series Mac.
 pub const TILE: u32 = 512;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -191,6 +194,12 @@ impl Renderer {
         let worker_shared = shared.clone();
         std::thread::Builder::new()
             .name("pdf-render".into())
+            // TODO(perf): give this thread QOS_CLASS_USER_INITIATED
+            // (pthread_set_qos_class_self_np) so macOS keeps it on performance cores; it
+            // renders what is on screen. Measure "to sharp" while scrolling on battery.
+            // TODO(perf): a second worker with its own Document (prefetch and thumbnails
+            // while the first draws visible tiles) would use a second M-series core, at the
+            // cost of a second copy of CoreGraphics' per-document caches.
             .spawn(move || worker(&worker_shared, &ctx, pages_per_open))
             .expect("spawn render thread");
         Self { shared }
@@ -368,6 +377,11 @@ fn run(doc: &Document, doc_id: DocId, work: Work) -> Vec<Output> {
     }
 }
 
+// TODO(perf): each tile draws the whole page clipped to the tile, so a page of N tiles has
+// its content stream walked N times. Drawing a row of the batch's tiles into one bitmap
+// and slicing it (a few MB transient) may be cheaper; how much depends on how well
+// CoreGraphics culls by clip, so measure on macOS before adopting (the synthetic engine's
+// cost is per pixel and cannot show it).
 fn render_key(page: &Page, key: Key) -> Option<Output> {
     let size = page.size();
     let (page_px, origin, w, h) = match key {
@@ -393,6 +407,10 @@ fn render_key(page: &Page, key: Key) -> Option<Output> {
     Some(Output::Image { key, size: [w as usize, h as usize], pixels })
 }
 
+// TODO(perf): the QOI encode runs on the render thread, delaying tiles for the tab just
+// switched to by its duration: ~1.9 ms for a 1512x945 snapshot (measured on x86 Linux;
+// likely less on M-series). Low priority; if it shows in the "cycle all tabs" numbers,
+// encode on a short-lived thread instead.
 fn render_snapshot(doc: &Document, job: &SnapshotJob) -> Option<Snapshot> {
     let [w, h] = job.size;
     let mut rgba = vec![0u8; (w * h * 4) as usize];

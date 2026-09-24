@@ -19,6 +19,8 @@ use crate::tab::View;
 pub const MIN_ZOOM: f32 = 0.1;
 pub const MAX_ZOOM: f32 = 8.0;
 /// Seconds the zoom must stay unchanged before tiles are re-rendered at the new scale.
+// TODO(perf): 0.15 s is most of the ~175 ms "zoom to sharp" in the benchmark. Try
+// 0.08-0.1 s: sharper sooner, but more discarded renders during a slow pinch.
 const ZOOM_SETTLE: f64 = 0.15;
 
 const UV: Rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
