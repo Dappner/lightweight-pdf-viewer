@@ -80,6 +80,8 @@ cargo bench --bench search -- a.pdf b.pdf
 
 `cargo bench --bench search_spike` measures PDFKit itself (text extraction, highlight geometry, contention with rendering), which the search design is based on.
 
+`cargo bench --bench render_spike` measures CoreGraphics' rendering options the same way. [docs/performance.md](docs/performance.md) records what has been tried to make rendering faster and lighter, and what it measured.
+
 ## Requirements
 
 macOS 11 or later. It uses macOS's own PDF engine, so it runs on macOS only.
