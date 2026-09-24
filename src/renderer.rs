@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 
-use eframe::egui::{self, Pos2, Rect, Vec2, pos2, vec2};
+use eframe::egui::{self, Color32, Pos2, Rect, Vec2, pos2, vec2};
 use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2_core_foundation::{CFRetained, CGAffineTransform, CGPoint, CGRect, CGSize};
@@ -113,7 +113,9 @@ pub struct Snapshot {
 
 pub enum Output {
     Opened { doc: DocId, result: Result<Vec<Vec2>, String> },
-    Image { key: Key, size: [usize; 2], rgba: Vec<u8> },
+    /// Premultiplied pixels, in the layout egui uploads, so taking one in on the UI thread
+    /// doesn't copy it.
+    Image { key: Key, size: [usize; 2], pixels: Vec<Color32> },
     Failed(Key),
     /// `None` if the viewport could not be drawn.
     Snapshot { doc: DocId, snapshot: Option<Snapshot> },
@@ -569,8 +571,8 @@ fn render_key(page: &CGPDFPage, geometry: &PageGeometry, key: Key) -> Option<Out
         }
         Key::Links { .. } => return None,
     };
-    let mut rgba = vec![0u8; (w * h * 4) as usize];
-    let ctx = bitmap_context(&mut rgba, w, h)?;
+    let mut pixels: Vec<Color32> = bytemuck::allocation::zeroed_vec((w * h) as usize);
+    let ctx = bitmap_context(bytemuck::cast_slice_mut(&mut pixels), w, h)?;
     draw_page(
         &ctx,
         page,
@@ -580,7 +582,7 @@ fn render_key(page: &CGPDFPage, geometry: &PageGeometry, key: Key) -> Option<Out
         h as f64,
     );
     drop(ctx);
-    Some(Output::Image { key, size: [w as usize, h as usize], rgba })
+    Some(Output::Image { key, size: [w as usize, h as usize], pixels })
 }
 
 fn render_snapshot(doc: &CGPDFDocument, job: &SnapshotJob) -> Option<Snapshot> {
@@ -649,12 +651,13 @@ mod tests {
             Key::Tile { doc: 0, page: 1, scale: scale_key(2.0), tx: 1, ty: 1 },
             Key::Thumb { doc: 0, page: 1, width: 108 },
         ] {
-            let Some(Output::Image { key, size, rgba }) = render_key(&page, &geometry, key) else { panic!("render {key:?}") };
+            let Some(Output::Image { key, size, pixels }) = render_key(&page, &geometry, key) else { panic!("render {key:?}") };
+            let rgba: &[u8] = bytemuck::cast_slice(&pixels);
             let name = match key {
                 Key::Tile { scale, tx, ty, .. } => format!("tile_{scale}_{tx}_{ty}"),
                 Key::Thumb { .. } | Key::Links { .. } => "thumb".into(),
             };
-            write_png(&format!("{out}/{name}.png"), &rgba, size[0] as u32, size[1] as u32);
+            write_png(&format!("{out}/{name}.png"), rgba, size[0] as u32, size[1] as u32);
         }
 
         let job = SnapshotJob {

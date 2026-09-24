@@ -5,6 +5,8 @@ edition = "2024"
 license = "MIT"
 
 [dependencies]
+# Zero-copy pixel buffers: tiles are drawn straight into the `Color32`s egui uploads.
+bytemuck = { version = "1.25.2", features = ["extern_crate_alloc"] }
 block2 = { version = "0.6.2", default-features = false, features = ["std"] }
 eframe = { version = "0.33.3", default-features = false, features = ["wgpu", "default_fonts"] }
 # Only the Metal backend (eframe's defaults would also pull in GL/Vulkan backends).

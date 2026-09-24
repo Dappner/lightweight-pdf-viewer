@@ -702,9 +702,11 @@ impl Window {
 }
 
 pub fn snapshot_texture(ctx: &Context, snapshot: &Snapshot) -> Option<TextureHandle> {
-    let (_, rgba) = qoi::decode_to_vec(&snapshot.qoi).ok()?;
     let [w, h] = snapshot.size.map(|v| v as usize);
-    let image = ColorImage::from_rgba_premultiplied([w, h], &rgba);
+    // Decoded straight into the pixels egui uploads, rather than into bytes and then copied.
+    let mut pixels: Vec<egui::Color32> = bytemuck::allocation::zeroed_vec(w * h);
+    qoi::decode_to_buf(bytemuck::cast_slice_mut(&mut pixels), &snapshot.qoi).ok()?;
+    let image = ColorImage::new([w, h], pixels);
     Some(ctx.load_texture("snapshot", image, TextureOptions::LINEAR))
 }
 

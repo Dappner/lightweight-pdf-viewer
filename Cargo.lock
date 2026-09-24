@@ -1001,6 +1001,7 @@ name = "lightweight-pdf-viewer"
 version = "0.1.0"
 dependencies = [
  "block2 0.6.2",
+ "bytemuck",
  "eframe",
  "egui-wgpu",
  "libc",

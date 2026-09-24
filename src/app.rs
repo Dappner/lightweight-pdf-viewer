@@ -479,8 +479,8 @@ impl State {
             }
             // Tiles that were in flight when the app fell asleep.
             Output::Image { key: Key::Tile { .. }, .. } if self.sleep != Sleep::Awake => {}
-            Output::Image { key, size, rgba } if self.is_active(key.doc()) => {
-                let image = ColorImage::from_rgba_premultiplied(size, &rgba);
+            Output::Image { key, size, pixels } if self.is_active(key.doc()) => {
+                let image = ColorImage::new(size, pixels);
                 let texture = ctx.load_texture("page", image, TextureOptions::LINEAR);
                 self.shared.cache.insert(key, texture, size[0] * size[1] * 4);
             }
