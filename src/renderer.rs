@@ -21,10 +21,8 @@ use crate::engine::{self, Bitmap, Document, Page};
 
 pub type DocId = u64;
 
-/// Tile edge length in physical pixels.
-// TODO(perf): try 256 and 1024. Smaller tiles land sooner and waste less off-screen area;
-// larger ones mean fewer CoreGraphics draws and textures. Compare "to sharp" and cpu in
-// `cargo bench --bench session` on an M-series Mac.
+/// Tile edge length in physical pixels. A row of adjacent tiles is drawn at once (see
+/// [`render_tiles`]), so smaller tiles would not add draws, only textures to upload and track.
 pub const TILE: u32 = 512;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -228,12 +226,11 @@ impl Renderer {
         let worker_shared = shared.clone();
         std::thread::Builder::new()
             .name("pdf-render".into())
-            // TODO(perf): give this thread QOS_CLASS_USER_INITIATED
-            // (pthread_set_qos_class_self_np) so macOS keeps it on performance cores; it
-            // renders what is on screen. Measure "to sharp" while scrolling on battery.
-            // TODO(perf): a second worker with its own Document (prefetch and thumbnails
-            // while the first draws visible tiles) would use a second M-series core, at the
-            // cost of a second copy of CoreGraphics' per-document caches.
+            // TODO(perf): on AC power (M1 Pro) QoS makes no difference, even background
+            // (`render_spike`); QOS_CLASS_USER_INITIATED may still matter on battery.
+            // TODO(perf): a second worker with its own Document draws 1.5-1.75x as many pages
+            // a second (`render_spike`), at the cost of a second copy of CoreGraphics'
+            // per-document caches.
             .spawn(move || worker(&worker_shared, &ctx, pages_per_open))
             .expect("spawn render thread");
         Self { shared }
@@ -423,44 +420,75 @@ fn run(doc: &Document, doc_id: DocId, work: Work, out: &Delivery) {
             let Some(page) = doc.page(batch[0].page()) else {
                 return batch.into_iter().for_each(|key| out.send(Output::Failed(key)));
             };
-            for key in batch.into_iter().filter(|key| out.wanted(key)) {
-                out.send(match key {
-                    Key::Links { doc: d, page: p } => Output::Links { doc: d, page: p, links: page.links() },
-                    _ => render_key(&page, key).unwrap_or(Output::Failed(key)),
-                });
+            let mut keys = batch.into_iter().filter(|key| out.wanted(key)).peekable();
+            while let Some(key) = keys.next() {
+                match key {
+                    Key::Links { doc: d, page: p } => out.send(Output::Links { doc: d, page: p, links: page.links() }),
+                    Key::Thumb { width, .. } => {
+                        out.send(render_thumb(&page, key, width).unwrap_or(Output::Failed(key)))
+                    }
+                    Key::Tile { .. } => {
+                        // The view lists tiles row by row, left to right.
+                        let mut run = vec![key];
+                        while let Some(next) = keys.next_if(|k| next_in_row(run[run.len() - 1], *k)) {
+                            run.push(next);
+                        }
+                        match render_tiles(&page, &run) {
+                            Some(tiles) => tiles.into_iter().for_each(|t| out.send(t)),
+                            None => run.into_iter().for_each(|key| out.send(Output::Failed(key))),
+                        }
+                    }
+                }
             }
         }
     }
 }
 
-// TODO(perf): each tile draws the whole page clipped to the tile, so a page of N tiles has
-// its content stream walked N times. Drawing a row of the batch's tiles into one bitmap
-// and slicing it (a few MB transient) may be cheaper; how much depends on how well
-// CoreGraphics culls by clip, so measure on macOS before adopting (the synthetic engine's
-// cost is per pixel and cannot show it).
-fn render_key(page: &Page, key: Key) -> Option<Output> {
-    let size = page.size();
-    let (page_px, origin, w, h) = match key {
-        Key::Tile { scale, tx, ty, .. } => {
-            let page_px = page_pixels(size, scale);
-            let origin = [tx * TILE, ty * TILE];
-            let w = TILE.min(page_px[0].checked_sub(origin[0])?);
-            let h = TILE.min(page_px[1].checked_sub(origin[1])?);
-            (page_px, origin, w, h)
-        }
-        Key::Thumb { width, .. } => {
-            let h = thumb_height(size, width);
-            ([width, h], [0, 0], width, h)
-        }
-        Key::Links { .. } => return None,
+/// Whether `next` is the tile right of `prev`, at the same scale.
+fn next_in_row(prev: Key, next: Key) -> bool {
+    matches!(
+        (prev, next),
+        (Key::Tile { scale: s0, tx: x0, ty: y0, .. }, Key::Tile { scale: s1, tx: x1, ty: y1, .. })
+            if s0 == s1 && y0 == y1 && x1 == x0 + 1
+    )
+}
+
+/// Renders a run of adjacent tiles in a row (see [`next_in_row`]) with one draw, sliced into
+/// tiles. CoreGraphics walks the whole page's content however small the clip, so a draw per
+/// tile cost 1.6-2.8x as much per page (`cargo bench --bench render_spike`).
+fn render_tiles(page: &Page, run: &[Key]) -> Option<Vec<Output>> {
+    let (Key::Tile { scale, tx, ty, .. }, Some(&Key::Tile { tx: last, .. })) = (run[0], run.last()) else {
+        return None;
     };
-    let mut pixels: Vec<Color32> = bytemuck::allocation::zeroed_vec((w * h) as usize);
-    Bitmap::new(bytemuck::cast_slice_mut(&mut pixels), w, h)?.draw(
+    let page_px = page_pixels(page.size(), scale);
+    let origin = [tx * TILE, ty * TILE];
+    let w = ((last + 1) * TILE).min(page_px[0]).checked_sub(origin[0])?;
+    let h = TILE.min(page_px[1].checked_sub(origin[1])?);
+    let mut strip: Vec<Color32> = bytemuck::allocation::zeroed_vec((w * h) as usize);
+    Bitmap::new(bytemuck::cast_slice_mut(&mut strip), w, h)?.draw(
         page,
         [page_px[0] as f64, page_px[1] as f64],
         [-(origin[0] as f64), -(origin[1] as f64)],
     );
-    Some(Output::Image { key, size: [w as usize, h as usize], pixels })
+    let [w, h] = [w as usize, h as usize];
+    if let [key] = *run {
+        return Some(vec![Output::Image { key, size: [w, h], pixels: strip }]);
+    }
+    let tile = TILE as usize;
+    let tiles = run.iter().enumerate().map(|(i, &key)| {
+        let x = i * tile;
+        let tw = tile.min(w - x);
+        let pixels = strip.chunks_exact(w).flat_map(|row| &row[x..x + tw]).copied().collect();
+        Output::Image { key, size: [tw, h], pixels }
+    });
+    Some(tiles.collect())
+}
+
+fn render_thumb(page: &Page, key: Key, width: u32) -> Option<Output> {
+    let h = thumb_height(page.size(), width);
+    let mut pixels: Vec<Color32> = bytemuck::allocation::zeroed_vec((width * h) as usize);
+    Bitmap::new(bytemuck::cast_slice_mut(&mut pixels), width, h)?.draw(page, [width as f64, h as f64], [0.0, 0.0]);
+    Some(Output::Image { key, size: [width as usize, h as usize], pixels })
 }
 
 // TODO(perf): the QOI encode runs on the render thread, delaying tiles for the tab just
@@ -520,12 +548,25 @@ mod tests {
         let page = document.page(1).expect("page");
         println!("page size {:?}", page.size());
 
-        for key in [
-            Key::Tile { doc: 0, page: 1, scale: scale_key(0.8), tx: 0, ty: 0 },
-            Key::Tile { doc: 0, page: 1, scale: scale_key(2.0), tx: 1, ty: 1 },
-            Key::Thumb { doc: 0, page: 1, width: 108 },
-        ] {
-            let Some(Output::Image { key, size, pixels }) = render_key(&page, key) else { panic!("render {key:?}") };
+        let tile = |scale, tx, ty| Key::Tile { doc: 0, page: 1, scale: scale_key(scale), tx, ty };
+        let row = [tile(2.0, 0, 1), tile(2.0, 1, 1), tile(2.0, 2, 1)];
+        let mut images = render_tiles(&page, &[tile(0.8, 0, 0)]).expect("render tile");
+        images.extend(render_tiles(&page, &row).expect("render row"));
+        images.push(render_thumb(&page, Key::Thumb { doc: 0, page: 1, width: 108 }, 108).expect("render thumb"));
+        for image in images {
+            let Output::Image { key, size, pixels } = image else { panic!("not an image") };
+            if let [single] = &render_tiles(&page, &[key]).unwrap_or_default()[..]
+                && row.contains(&key)
+            {
+                let Output::Image { pixels: alone, .. } = single else { panic!("not an image") };
+                // Image resampling rounds differently by a level, and a lone tile's clip can
+                // shade a few edge pixels, so allow that much.
+                let off = pixels.iter().zip(alone).filter(|(a, b)| (0..4).any(|i| a[i].abs_diff(b[i]) > 1)).count();
+                assert!(
+                    off * 10_000 <= pixels.len(),
+                    "{key:?}: {off} pixels differ between its row and it drawn alone"
+                );
+            }
             let rgba: &[u8] = bytemuck::cast_slice(&pixels);
             let name = match key {
                 Key::Tile { scale, tx, ty, .. } => format!("tile_{scale}_{tx}_{ty}"),

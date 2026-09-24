@@ -50,3 +50,7 @@ harness = false
 [[bench]]
 name = "search"
 harness = false
+
+[[bench]]
+name = "render_spike"
+harness = false
