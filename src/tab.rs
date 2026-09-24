@@ -60,10 +60,8 @@ pub struct View {
 
 impl Tab {
     pub fn new(id: DocId, path: PathBuf, restore: Option<Place>) -> Self {
-        let title = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
+        let title =
+            path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
         Self {
             id,
             path,

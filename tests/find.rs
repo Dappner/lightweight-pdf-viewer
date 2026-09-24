@@ -26,7 +26,8 @@ fn placed_text_pdf(name: &str, page_lines: &[Vec<(&str, i32)>]) -> PathBuf {
         "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
     ];
     for (i, lines) in page_lines.iter().enumerate() {
-        let content: String = lines.iter().map(|(line, y)| format!("BT /F1 18 Tf 72 {y} Td ({line}) Tj ET\n")).collect();
+        let content: String =
+            lines.iter().map(|(line, y)| format!("BT /F1 18 Tf 72 {y} Td ({line}) Tj ET\n")).collect();
         objects.push(format!(
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents {} 0 R >>",
             5 + i * 2
@@ -105,8 +106,14 @@ impl Harness {
 }
 
 const LINES: [&str; 8] = [
-    "Chapter one", "filler text", "the needle is here", "more filler", "and more",
-    "still nothing", "a second NEEDLE", "the end",
+    "Chapter one",
+    "filler text",
+    "the needle is here",
+    "more filler",
+    "and more",
+    "still nothing",
+    "a second NEEDLE",
+    "the end",
 ];
 
 /// Opens a PDF of [`LINES`] and searches it for "needle", landing on the first match.
@@ -200,8 +207,14 @@ fn first_match_is_below_the_top_of_the_viewport() {
 #[test]
 fn finds_steps_through_and_closes() {
     let lines = [
-        "Chapter one", "filler text", "the needle is here", "more filler", "and more",
-        "still nothing", "a second NEEDLE", "the end",
+        "Chapter one",
+        "filler text",
+        "the needle is here",
+        "more filler",
+        "and more",
+        "still nothing",
+        "a second NEEDLE",
+        "the end",
     ];
     let path = text_pdf("find", &lines);
     let mut h = Harness::new();

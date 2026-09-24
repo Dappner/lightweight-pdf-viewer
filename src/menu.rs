@@ -94,51 +94,66 @@ pub fn install(ctx: &egui::Context) {
     let none = NSEventModifierFlags::empty();
     use Entry::*;
     let menus = [
-        ("Lightweight PDF", vec![
-            System("About Lightweight PDF", sel!(orderFrontStandardAboutPanel:), "", none),
-            Separator,
-            System("Hide Lightweight PDF", sel!(hide:), "h", cmd),
-            System("Hide Others", sel!(hideOtherApplications:), "h", cmd_option),
-            System("Show All", sel!(unhideAllApplications:), "", none),
-            Separator,
-            Item("Quit Lightweight PDF", Command::Quit, "q", cmd),
-        ]),
-        ("File", vec![
-            Item("New Window", Command::NewWindow, "n", cmd),
-            Item("Open…", Command::Open, "o", cmd),
-            Item("Open Recent…", Command::QuickOpen, "k", cmd),
-            Separator,
-            Item("Close Tab", Command::CloseTab, "w", cmd),
-        ]),
-        ("Edit", vec![
-            Item("Find…", Command::Find, "f", cmd),
-            Item("Find Next", Command::FindNext, "g", cmd),
-            Item("Find Previous", Command::FindPrevious, "g", cmd_shift),
-            Separator,
-            Item("Clear Search Cache", Command::ClearSearchCache, "", none),
-        ]),
-        ("View", vec![
-            Item("Toggle Sidebar", Command::ToggleSidebar, "b", cmd),
-            Item("Pages / Outline", Command::ToggleOutline, "b", cmd_option),
-            Separator,
-            Item("Single Page", Command::SetLayout(PageLayout::Single), "1", cmd_option),
-            Item("Two Pages", Command::SetLayout(PageLayout::TwoPages), "2", cmd_option),
-            Item("Book", Command::SetLayout(PageLayout::Book), "3", cmd_option),
-            Separator,
-            Item("Zoom In", Command::ZoomIn, "=", cmd),
-            Item("Zoom Out", Command::ZoomOut, "-", cmd),
-            Item("Fit Width", Command::ZoomToFit, "0", cmd),
-        ]),
-        ("Window", vec![
-            System("Minimize", sel!(performMiniaturize:), "m", cmd),
-            System("Zoom", sel!(performZoom:), "", none),
-            Separator,
-            Item("Show Previous Tab", Command::PreviousTab, "[", cmd_shift),
-            Item("Show Next Tab", Command::NextTab, "]", cmd_shift),
-            Separator,
-            Item("Move Tab to New Window", Command::MoveTabToNewWindow, "", none),
-            Item("Merge All Windows", Command::MergeAllWindows, "", none),
-        ]),
+        (
+            "Lightweight PDF",
+            vec![
+                System("About Lightweight PDF", sel!(orderFrontStandardAboutPanel:), "", none),
+                Separator,
+                System("Hide Lightweight PDF", sel!(hide:), "h", cmd),
+                System("Hide Others", sel!(hideOtherApplications:), "h", cmd_option),
+                System("Show All", sel!(unhideAllApplications:), "", none),
+                Separator,
+                Item("Quit Lightweight PDF", Command::Quit, "q", cmd),
+            ],
+        ),
+        (
+            "File",
+            vec![
+                Item("New Window", Command::NewWindow, "n", cmd),
+                Item("Open…", Command::Open, "o", cmd),
+                Item("Open Recent…", Command::QuickOpen, "k", cmd),
+                Separator,
+                Item("Close Tab", Command::CloseTab, "w", cmd),
+            ],
+        ),
+        (
+            "Edit",
+            vec![
+                Item("Find…", Command::Find, "f", cmd),
+                Item("Find Next", Command::FindNext, "g", cmd),
+                Item("Find Previous", Command::FindPrevious, "g", cmd_shift),
+                Separator,
+                Item("Clear Search Cache", Command::ClearSearchCache, "", none),
+            ],
+        ),
+        (
+            "View",
+            vec![
+                Item("Toggle Sidebar", Command::ToggleSidebar, "b", cmd),
+                Item("Pages / Outline", Command::ToggleOutline, "b", cmd_option),
+                Separator,
+                Item("Single Page", Command::SetLayout(PageLayout::Single), "1", cmd_option),
+                Item("Two Pages", Command::SetLayout(PageLayout::TwoPages), "2", cmd_option),
+                Item("Book", Command::SetLayout(PageLayout::Book), "3", cmd_option),
+                Separator,
+                Item("Zoom In", Command::ZoomIn, "=", cmd),
+                Item("Zoom Out", Command::ZoomOut, "-", cmd),
+                Item("Fit Width", Command::ZoomToFit, "0", cmd),
+            ],
+        ),
+        (
+            "Window",
+            vec![
+                System("Minimize", sel!(performMiniaturize:), "m", cmd),
+                System("Zoom", sel!(performZoom:), "", none),
+                Separator,
+                Item("Show Previous Tab", Command::PreviousTab, "[", cmd_shift),
+                Item("Show Next Tab", Command::NextTab, "]", cmd_shift),
+                Separator,
+                Item("Move Tab to New Window", Command::MoveTabToNewWindow, "", none),
+                Item("Merge All Windows", Command::MergeAllWindows, "", none),
+            ],
+        ),
     ];
 
     let target = MenuTarget::new(mtm);

@@ -11,8 +11,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use eframe::egui::{
-    ColorImage, Context, IconData, Pos2, TextureOptions, Vec2, ViewportBuilder, ViewportCommand, ViewportId,
-    vec2,
+    ColorImage, Context, IconData, Pos2, TextureOptions, Vec2, ViewportBuilder, ViewportCommand, ViewportId, vec2,
 };
 
 use crate::cache::TextureCache;
@@ -238,9 +237,10 @@ impl State {
             for (i, saved) in app.shared.config.windows.clone().into_iter().enumerate() {
                 let w = match i {
                     0 => 0,
-                    _ => app.add_window(ctx, saved.frame.map_or_else(window_builder, |[x, y, w, h]| {
-                        window_at(Pos2::new(x, y), vec2(w, h))
-                    })),
+                    _ => app.add_window(
+                        ctx,
+                        saved.frame.map_or_else(window_builder, |[x, y, w, h]| window_at(Pos2::new(x, y), vec2(w, h))),
+                    ),
                 };
                 let active = saved.tabs.get(saved.active).cloned();
                 for file in saved.tabs.into_iter().filter(|p| p.exists()) {
@@ -285,16 +285,18 @@ impl State {
 
     /// The window and tab showing `path`.
     fn find_path(&self, path: &std::path::Path) -> Option<(usize, usize)> {
-        self.windows.iter().enumerate().find_map(|(w, window)| {
-            window.tabs.iter().position(|t| t.path == path).map(|i| (w, i))
-        })
+        self.windows
+            .iter()
+            .enumerate()
+            .find_map(|(w, window)| window.tabs.iter().position(|t| t.path == path).map(|i| (w, i)))
     }
 
     /// The window and tab showing document `doc`.
     fn find_doc(&self, doc: DocId) -> Option<(usize, usize)> {
-        self.windows.iter().enumerate().find_map(|(w, window)| {
-            window.tabs.iter().position(|t| t.id == doc).map(|i| (w, i))
-        })
+        self.windows
+            .iter()
+            .enumerate()
+            .find_map(|(w, window)| window.tabs.iter().position(|t| t.id == doc).map(|i| (w, i)))
     }
 
     fn is_active(&self, doc: DocId) -> bool {
@@ -673,7 +675,9 @@ impl State {
                 .sum(),
             asleep: self.sleep == Sleep::Asleep,
             find: active.and_then(|t| t.search.as_ref()).map(|s| s.status().unwrap_or_default()),
-            find_reads: active.and_then(|t| t.search.as_ref()).map_or((0, 0), |s| (s.stats().loaded, s.stats().extracted)),
+            find_reads: active
+                .and_then(|t| t.search.as_ref())
+                .map_or((0, 0), |s| (s.stats().loaded, s.stats().extracted)),
             find_done: active.and_then(|t| t.search.as_ref()).is_some_and(|s| s.done()),
             search_workers: self
                 .windows

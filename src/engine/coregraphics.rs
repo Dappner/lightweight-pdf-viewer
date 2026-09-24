@@ -9,8 +9,8 @@ use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2_core_foundation::{CFRetained, CGAffineTransform, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
-    CGBitmapContextCreate, CGColorSpace, CGContext, CGImageAlphaInfo, CGInterpolationQuality,
-    CGPDFBox, CGPDFDocument, CGPDFPage, kCGColorSpaceSRGB,
+    CGBitmapContextCreate, CGColorSpace, CGContext, CGImageAlphaInfo, CGInterpolationQuality, CGPDFBox, CGPDFDocument,
+    CGPDFPage, kCGColorSpaceSRGB,
 };
 use objc2_foundation::NSURL;
 use objc2_pdf_kit::{PDFActionGoTo, PDFActionURL, PDFDestination, PDFDocument, PDFOutline};

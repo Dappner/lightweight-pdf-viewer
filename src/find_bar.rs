@@ -2,8 +2,8 @@
 //! count, previous and next buttons, and a close button.
 
 use eframe::egui::{
-    Align2, Context, CornerRadius, FontId, Frame, Id, Key, Label, Margin, Modifiers, Order, Rect, RichText,
-    Sense, Stroke, TextEdit, Ui, pos2, text::CCursor, text::CCursorRange, vec2,
+    Align2, Context, CornerRadius, FontId, Frame, Id, Key, Label, Margin, Modifiers, Order, Rect, RichText, Sense,
+    Stroke, TextEdit, Ui, pos2, text::CCursor, text::CCursorRange, vec2,
 };
 
 use crate::search::Search;

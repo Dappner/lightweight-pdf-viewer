@@ -30,10 +30,23 @@ pub const TILE: u32 = 512;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Key {
     /// `scale` is physical pixels per PDF point, in 1/256 steps (see [`scale_key`]).
-    Tile { doc: DocId, page: u32, scale: u32, tx: u32, ty: u32 },
-    Thumb { doc: DocId, page: u32, width: u32 },
+    Tile {
+        doc: DocId,
+        page: u32,
+        scale: u32,
+        tx: u32,
+        ty: u32,
+    },
+    Thumb {
+        doc: DocId,
+        page: u32,
+        width: u32,
+    },
     /// The page's link annotations.
-    Links { doc: DocId, page: u32 },
+    Links {
+        doc: DocId,
+        page: u32,
+    },
 }
 
 impl Key {
@@ -109,15 +122,32 @@ pub struct Snapshot {
 }
 
 pub enum Output {
-    Opened { doc: DocId, result: Result<Vec<Vec2>, String> },
+    Opened {
+        doc: DocId,
+        result: Result<Vec<Vec2>, String>,
+    },
     /// Premultiplied pixels, in the layout egui uploads, so taking one in on the UI thread
     /// doesn't copy it.
-    Image { key: Key, size: [usize; 2], pixels: Vec<Color32> },
+    Image {
+        key: Key,
+        size: [usize; 2],
+        pixels: Vec<Color32>,
+    },
     Failed(Key),
     /// `None` if the viewport could not be drawn.
-    Snapshot { doc: DocId, snapshot: Option<Snapshot> },
-    Links { doc: DocId, page: u32, links: Vec<Link> },
-    Outline { doc: DocId, entries: Vec<OutlineEntry> },
+    Snapshot {
+        doc: DocId,
+        snapshot: Option<Snapshot>,
+    },
+    Links {
+        doc: DocId,
+        page: u32,
+        links: Vec<Link>,
+    },
+    Outline {
+        doc: DocId,
+        entries: Vec<OutlineEntry>,
+    },
 }
 
 impl Output {
@@ -257,9 +287,7 @@ impl Renderer {
     /// are skipped so nothing is rendered twice.
     pub fn set_wanted(&self, mut wanted: Vec<Key>) {
         self.with_queue(|q| {
-            wanted.retain(|k| {
-                !q.busy.contains(k) && !q.done.iter().any(|o| o.key() == Some(*k))
-            });
+            wanted.retain(|k| !q.busy.contains(k) && !q.done.iter().any(|o| o.key() == Some(*k)));
             q.wanted = wanted;
         });
     }
@@ -327,11 +355,12 @@ fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context, pages_per_open:
             };
             let outputs = match (&current, work) {
                 (Some(o), work) => run(&o.doc, doc_id, work),
-                (None, Work::Control(Control::Open(doc))) => vec![Output::Opened {
-                    doc,
-                    result: Err(format!("Could not open {}", path.display())),
-                }],
-                (None, Work::Control(Control::Snapshot(job))) => vec![Output::Snapshot { doc: job.doc, snapshot: None }],
+                (None, Work::Control(Control::Open(doc))) => {
+                    vec![Output::Opened { doc, result: Err(format!("Could not open {}", path.display())) }]
+                }
+                (None, Work::Control(Control::Snapshot(job))) => {
+                    vec![Output::Snapshot { doc: job.doc, snapshot: None }]
+                }
                 (None, Work::Control(Control::Outline(doc))) => vec![Output::Outline { doc, entries: vec![] }],
                 (None, Work::Render(batch)) => batch.into_iter().map(Output::Failed).collect(),
             };
@@ -456,7 +485,10 @@ mod tests {
         });
         if let Some((p, links)) = with_links {
             println!("page {} has {} links, e.g. {:?}", p + 1, links.len(), links[0]);
-            assert!(links.iter().all(|l| l.rect.min.x >= -0.01 && l.rect.max.y <= 1.01), "link rects should be page fractions");
+            assert!(
+                links.iter().all(|l| l.rect.min.x >= -0.01 && l.rect.max.y <= 1.01),
+                "link rects should be page fractions"
+            );
         }
         let page = document.page(1).expect("page");
         println!("page size {:?}", page.size());

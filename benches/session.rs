@@ -118,11 +118,7 @@ impl Harness {
         let t = Instant::now();
         let output = self.ctx.run(raw, |ctx| app.ui(ctx));
         self.frame_times.push(t.elapsed());
-        self.windows = output
-            .viewport_output
-            .into_iter()
-            .filter_map(|(id, v)| Some((id, v.viewport_ui_cb?)))
-            .collect();
+        self.windows = output.viewport_output.into_iter().filter_map(|(id, v)| Some((id, v.viewport_ui_cb?))).collect();
         self.peak = self.peak.max(footprint_mb());
     }
 
@@ -174,7 +170,13 @@ impl Harness {
 
     /// Presses a key in the other windows.
     fn press_other(&mut self, key: Key) {
-        self.other_events.push(Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE });
+        self.other_events.push(Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        });
     }
 
     /// Runs frames until `done` holds; returns the elapsed time, or `None` (counted in
@@ -211,7 +213,8 @@ impl Harness {
     /// Opens (or focuses) the find bar of the focused window's active tab and searches it for
     /// `query`, in the main window or, with `other`, the others.
     fn find(&mut self, query: &str, other: bool) {
-        let cmd_f = Event::Key { key: Key::F, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::COMMAND };
+        let cmd_f =
+            Event::Key { key: Key::F, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::COMMAND };
         let text = Event::Text(query.into());
         if other {
             self.other_events.push(cmd_f);
@@ -253,11 +256,7 @@ impl Harness {
 fn footprint_mb() -> f64 {
     let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
     let ok = unsafe {
-        libc::proc_pid_rusage(
-            libc::getpid(),
-            libc::RUSAGE_INFO_V2,
-            &mut info as *mut _ as *mut libc::rusage_info_t,
-        )
+        libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V2, &mut info as *mut _ as *mut libc::rusage_info_t)
     };
     assert_eq!(ok, 0, "proc_pid_rusage failed");
     info.ri_phys_footprint as f64 / 1_048_576.0
@@ -268,7 +267,10 @@ fn footprint_mb() -> f64 {
 #[cfg(not(target_os = "macos"))]
 fn footprint_mb() -> f64 {
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-    let kb = status.lines().find_map(|l| l.strip_prefix("VmRSS:")).and_then(|v| v.trim().trim_end_matches(" kB").parse::<f64>().ok());
+    let kb = status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmRSS:"))
+        .and_then(|v| v.trim().trim_end_matches(" kB").parse::<f64>().ok());
     kb.unwrap_or(0.0) / 1024.0
 }
 
@@ -317,8 +319,7 @@ fn main() {
         .unwrap_or_default();
     // Like the app, so the allocator behaves as it would there.
     memory::relaunch(preset);
-    let files: Vec<PathBuf> =
-        std::env::args().skip(1).filter(|a| !a.starts_with("--")).map(PathBuf::from).collect();
+    let files: Vec<PathBuf> = std::env::args().skip(1).filter(|a| !a.starts_with("--")).map(PathBuf::from).collect();
     if files.is_empty() {
         eprintln!("usage: cargo bench --bench session -- <pdf> [<pdf> ...]");
         std::process::exit(2);
@@ -341,7 +342,17 @@ fn main() {
     let _ = std::fs::remove_dir_all(&search_cache);
     config.search_cache_dir = Some(search_cache.clone());
     let app = App::new(&ctx, config, History::default(), Vec::new());
-    let mut h = Harness { ctx, app, start: Instant::now(), size, ppp, focused: true, events: Vec::new(), frame_times: Vec::new(), peak: 0.0, phase_cpu: 0.0,
+    let mut h = Harness {
+        ctx,
+        app,
+        start: Instant::now(),
+        size,
+        ppp,
+        focused: true,
+        events: Vec::new(),
+        frame_times: Vec::new(),
+        peak: 0.0,
+        phase_cpu: 0.0,
         windows: HashMap::new(),
         draw_others: false,
         others_focused: false,
@@ -350,11 +361,15 @@ fn main() {
         failures: Vec::new(),
     };
     h.frame();
-    let malloc = std::env::var("MallocSpaceEfficient").map_or("default".into(), |v| format!("MallocSpaceEfficient={v}"));
+    let malloc =
+        std::env::var("MallocSpaceEfficient").map_or("default".into(), |v| format!("MallocSpaceEfficient={v}"));
     println!("memory preset {preset:?} ({malloc}), viewport {}x{} pt @ {ppp}x\n", size.x, size.y);
     println!("startup footprint: {:.1} MB (no window)\n", footprint_mb());
 
-    println!("{:<34} {:>6} {:>14} {:>10} {:>10} {:>11}", "open", "pages", "to sharp ms", "footprint", "textures", "snapshots");
+    println!(
+        "{:<34} {:>6} {:>14} {:>10} {:>10} {:>11}",
+        "open", "pages", "to sharp ms", "footprint", "textures", "snapshots"
+    );
     println!("{:>101}", "(allocated)");
     h.begin_phase();
     for (i, file) in files.iter().enumerate() {
@@ -395,7 +410,8 @@ fn main() {
         let mut covered = 0;
         let n = rounds.flip;
         for i in 0..n {
-            let (key, modifiers) = if i % 2 == 0 { (Key::Tab, Modifiers::CTRL) } else { (Key::Tab, Modifiers::CTRL | Modifiers::SHIFT) };
+            let (key, modifiers) =
+                if i % 2 == 0 { (Key::Tab, Modifiers::CTRL) } else { (Key::Tab, Modifiers::CTRL | Modifiers::SHIFT) };
             h.idle(Duration::from_millis(300));
             let (c, sharp) = h.switch(key, modifiers);
             covered += c as usize;
@@ -544,7 +560,10 @@ fn search(h: &mut Harness, files: &[PathBuf]) {
         );
     }
     let workers = h.stats().search_workers;
-    println!("  right after the last: {workers} workers (the active tab and the one just left)   footprint {:.1} MB", footprint_mb());
+    println!(
+        "  right after the last: {workers} workers (the active tab and the one just left)   footprint {:.1} MB",
+        footprint_mb()
+    );
     h.check(workers <= 2, || format!("{workers} search workers right after searching, at most 2 expected"));
 
     h.idle(GRACE);
@@ -555,7 +574,9 @@ fn search(h: &mut Harness, files: &[PathBuf]) {
         "  after the grace period: {workers} worker   footprint {before:.1} -> {settled:.1} MB (+{:.1}, allowed +{allowed:.0})",
         settled - before
     );
-    h.check(workers == 1, || format!("{workers} search workers after the grace period, only the active tab's expected"));
+    h.check(workers == 1, || {
+        format!("{workers} search workers after the grace period, only the active tab's expected")
+    });
     h.check(settled - before <= allowed, || format!("footprint +{:.1} MB after searching every tab", settled - before));
 
     // ⌘F focuses the bar, Esc closes it.
@@ -613,7 +634,11 @@ fn search(h: &mut Harness, files: &[PathBuf]) {
         closed.push(footprint_mb());
     }
     let rounds: Vec<String> = closed.iter().map(|f| format!("{f:.1}")).collect();
-    println!("  {} more rounds of searching every tab and closing: footprint {} MB", queries.len(), rounds.join(" -> "));
+    println!(
+        "  {} more rounds of searching every tab and closing: footprint {} MB",
+        queries.len(),
+        rounds.join(" -> ")
+    );
     let climb = closed[closed.len() - 1] - closed[1];
     h.check(climb <= SEARCH_SLACK_MB / 2.0, || format!("footprint climbed {climb:.1} MB over the later search rounds"));
     breakdown("after the search rounds");
@@ -705,7 +730,9 @@ fn two_windows(h: &mut Harness, rounds: &Rounds, preset: Memory) {
         settled - before
     );
     h.check(workers == 2, || format!("{workers} search workers with two windows, one each expected"));
-    h.check(settled - before <= allowed, || format!("footprint +{:.1} MB after searching in two windows", settled - before));
+    h.check(settled - before <= allowed, || {
+        format!("footprint +{:.1} MB after searching in two windows", settled - before)
+    });
     h.end_phase();
 }
 

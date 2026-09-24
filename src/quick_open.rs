@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use eframe::egui::{
-    Align2, Color32, Context, CornerRadius, FontId, Frame, Galley, Id, Key, Margin, Modal, Modifiers, RichText,
-    Sense, Stroke, TextEdit, Ui, pos2, text::LayoutJob, vec2,
+    Align2, Color32, Context, CornerRadius, FontId, Frame, Galley, Id, Key, Margin, Modal, Modifiers, RichText, Sense,
+    Stroke, TextEdit, Ui, pos2, text::LayoutJob, vec2,
 };
 
 use crate::theme::Palette;
@@ -119,7 +119,8 @@ impl QuickOpen {
                 painter.rect_filled(rect, CornerRadius::same(6), palette.accent.gamma_multiply(0.22));
             }
             let text_width = rect.width() - 20.0 - HINT_WIDTH;
-            let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+            let name =
+                path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
             let folder = path.parent().map(|p| self.tidy(p)).unwrap_or_default();
             let left = rect.left() + 10.0;
             painter.galley(pos2(left, rect.top() + 4.0), line(ui, name, 13.5, palette.text, text_width), palette.text);
@@ -211,10 +212,7 @@ mod tests {
     #[test]
     fn better_matches_come_first() {
         let files = ["/papers/xattention.pdf", "/attention/notes.pdf", "/Attention Is All.pdf", "/a_t_t_n.pdf"];
-        assert_eq!(
-            find(&files, "atten"),
-            ["/Attention Is All.pdf", "/papers/xattention.pdf", "/attention/notes.pdf"]
-        );
+        assert_eq!(find(&files, "atten"), ["/Attention Is All.pdf", "/papers/xattention.pdf", "/attention/notes.pdf"]);
         assert_eq!(find(&files, "attn"), ["/papers/xattention.pdf", "/Attention Is All.pdf", "/a_t_t_n.pdf"]);
     }
 

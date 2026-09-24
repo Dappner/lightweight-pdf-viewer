@@ -7,8 +7,8 @@
 //! Left of the tabs, a Preview-style button opens a menu of sidebar and page layout options.
 
 use eframe::egui::{
-    Align2, Button, CornerRadius, CursorIcon, FontId, LayerId, Order, Painter, Popup, Pos2, Rect,
-    Response, Sense, Stroke, Ui, Vec2, ViewportCommand, pos2, text::LayoutJob, vec2,
+    Align2, Button, CornerRadius, CursorIcon, FontId, LayerId, Order, Painter, Popup, Pos2, Rect, Response, Sense,
+    Stroke, Ui, Vec2, ViewportCommand, pos2, text::LayoutJob, vec2,
 };
 
 use crate::app::Command;
@@ -40,9 +40,15 @@ pub const NEW_WINDOW_GRAB: Vec2 = vec2(LEADING + VIEW_BUTTON + 40.0, TRAFFIC_LIG
 pub enum Action {
     Select(usize),
     Close(usize),
-    Move { from: usize, to: usize },
+    Move {
+        from: usize,
+        to: usize,
+    },
     /// A tab was dragged out and dropped at `pointer` (window coordinates).
-    Detach { index: usize, pointer: Pos2 },
+    Detach {
+        index: usize,
+        pointer: Pos2,
+    },
     Open,
     Run(Command),
 }
@@ -102,7 +108,10 @@ pub fn show(
     let scroll = *scroll;
 
     let slot = |i: usize| {
-        Rect::from_min_size(pos2(area.left() - scroll + i as f32 * tab_width, area.top()), vec2(tab_width, area.height()))
+        Rect::from_min_size(
+            pos2(area.left() - scroll + i as f32 * tab_width, area.top()),
+            vec2(tab_width, area.height()),
+        )
     };
 
     // Register all interactions before painting; close buttons last so they win hit-tests.
@@ -114,7 +123,9 @@ pub fn show(
     let closes: Vec<Response> = tabs
         .iter()
         .enumerate()
-        .map(|(i, tab)| ui.interact(close_rect(slot(i)).intersect(area), ui.id().with(("close", tab.id)), Sense::click()))
+        .map(|(i, tab)| {
+            ui.interact(close_rect(slot(i)).intersect(area), ui.id().with(("close", tab.id)), Sense::click())
+        })
         .collect();
 
     let grab_key = ui.id().with("grab");
@@ -161,7 +172,8 @@ pub fn show(
         }
     }
 
-    let button = Rect::from_center_size(pos2(bar.left() + LEADING + VIEW_BUTTON / 2.0 - 4.0, area.center().y), vec2(36.0, 24.0));
+    let button =
+        Rect::from_center_size(pos2(bar.left() + LEADING + VIEW_BUTTON / 2.0 - 4.0, area.center().y), vec2(36.0, 24.0));
     if let Some(command) = view_button(ui, button, &view_menu, palette) {
         action = Some(Action::Run(command));
     }
@@ -192,7 +204,8 @@ pub fn show(
 
     let plus_center = pos2((area.left() - scroll + total).min(area.right()) + PLUS_WIDTH / 2.0, area.center().y);
     let plus = Rect::from_center_size(plus_center, vec2(24.0, 24.0));
-    let plus_response = ui.interact(plus, ui.id().with("open"), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
+    let plus_response =
+        ui.interact(plus, ui.id().with("open"), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
     let painter = ui.painter();
     if plus_response.hovered() {
         painter.rect_filled(plus, CornerRadius::same(6), palette.hover);
@@ -245,7 +258,13 @@ fn paint_detached(ui: &Ui, tab: &Tab, pointer: Pos2, tab_width: f32, palette: &P
     let painter = ui.ctx().layer_painter(LayerId::new(Order::Tooltip, ui.id().with("detached")));
     let rect = Rect::from_min_size(pointer - vec2(24.0, 12.0), vec2(tab_width.min(MAX_TAB), 26.0));
     painter.rect_filled(rect.translate(vec2(0.0, 2.0)), CornerRadius::same(7), palette.separator);
-    painter.rect(rect, CornerRadius::same(7), palette.content, Stroke::new(1.0, palette.separator), eframe::egui::StrokeKind::Inside);
+    painter.rect(
+        rect,
+        CornerRadius::same(7),
+        palette.content,
+        Stroke::new(1.0, palette.separator),
+        eframe::egui::StrokeKind::Inside,
+    );
 
     let badge = pos2(rect.left() + 13.0, rect.center().y);
     painter.circle_filled(badge, 7.0, palette.accent);
@@ -264,7 +283,8 @@ fn paint_detached(ui: &Ui, tab: &Tab, pointer: Pos2, tab_width: f32, palette: &P
 
 /// A sidebar icon with a chevron, like Preview's, that opens the view options.
 fn view_button(ui: &mut Ui, rect: Rect, menu: &ViewMenu, palette: &Palette) -> Option<Command> {
-    let response = ui.interact(rect, ui.id().with("view_menu"), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
+    let response =
+        ui.interact(rect, ui.id().with("view_menu"), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
     let open = Popup::is_id_open(ui.ctx(), Popup::default_response_id(&response));
     let painter = ui.painter();
     if response.hovered() || open {

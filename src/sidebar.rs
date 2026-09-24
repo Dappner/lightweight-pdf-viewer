@@ -4,8 +4,8 @@
 use std::collections::HashSet;
 
 use eframe::egui::{
-    Align2, Color32, CornerRadius, CursorIcon, FontId, Rect, ScrollArea, Sense, Stroke,
-    StrokeKind, Ui, pos2, text::LayoutJob, vec2,
+    Align2, Color32, CornerRadius, CursorIcon, FontId, Rect, ScrollArea, Sense, Stroke, StrokeKind, Ui, pos2,
+    text::LayoutJob, vec2,
 };
 
 use crate::cache::TextureCache;
@@ -192,7 +192,10 @@ fn thumbnails(
             }
             let th = thumb_height(tw, layout.page_size(page));
             let thumb = Rect::from_min_size(pos2(center_x - tw / 2.0, origin.y + top), vec2(tw, th));
-            let item = Rect::from_min_max(pos2(ui.max_rect().left(), thumb.top()), pos2(ui.max_rect().right(), thumb.bottom() + LABEL_HEIGHT));
+            let item = Rect::from_min_max(
+                pos2(ui.max_rect().left(), thumb.top()),
+                pos2(ui.max_rect().right(), thumb.bottom() + LABEL_HEIGHT),
+            );
             let selected = layout.spread(view.current_page).contains(&page);
             let painter = ui.painter();
 

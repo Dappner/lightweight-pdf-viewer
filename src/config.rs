@@ -68,10 +68,8 @@ impl Config {
 
     /// Loads settings saved at `path`, falling back to defaults if the file is missing or invalid.
     pub fn load_from(path: PathBuf) -> Self {
-        let mut config: Self = std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
+        let mut config: Self =
+            std::fs::read(&path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
         config.sidebar_width = sidebar::clamp_width(config.sidebar_width);
         config.path = Some(path);
         config

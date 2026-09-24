@@ -67,7 +67,13 @@ impl Harness {
     }
 
     fn press(&mut self, key: Key) {
-        self.frame(vec![Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }]);
+        self.frame(vec![Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }]);
         // The scroll lands on the next frame.
         self.frame(vec![]);
     }

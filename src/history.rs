@@ -57,7 +57,8 @@ impl History {
 
     /// Loads history saved at `path`, starting empty if the file is missing or invalid.
     pub fn load_from(path: PathBuf) -> Self {
-        let entries = std::fs::read(&path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
+        let entries =
+            std::fs::read(&path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
         Self { entries, path: Some(path) }
     }
 

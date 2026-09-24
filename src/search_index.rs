@@ -89,10 +89,20 @@ impl Store {
         let id = Identity::of(pdf, pages)?;
         create_private_dir(&self.dir)?;
         let path = self.dir.join(format!("{:016x}.{EXTENSION}", id.key()));
-        let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(&path).ok()?;
+        let file =
+            OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(&path).ok()?;
         // Opening counts as use, for expiry and for which documents go first.
         let _ = file.set_modified(SystemTime::now());
-        let mut index = Index { file, path, id, pdf: pdf.to_owned(), pages: vec![None; pages], end: 0, writer: false, max_bytes: self.max_bytes() };
+        let mut index = Index {
+            file,
+            path,
+            id,
+            pdf: pdf.to_owned(),
+            pages: vec![None; pages],
+            end: 0,
+            writer: false,
+            max_bytes: self.max_bytes(),
+        };
         index.try_write();
         if !index.writer {
             index.scan();
@@ -462,7 +472,12 @@ mod tests {
         let file = |name: &str, kb: usize, days_ago: u64| {
             let path = store.dir.join(format!("{name}.{EXTENSION}"));
             std::fs::write(&path, vec![0; kb * 1024]).unwrap();
-            File::options().write(true).open(&path).unwrap().set_modified(now - Duration::from_secs(days_ago * DAY)).unwrap();
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(now - Duration::from_secs(days_ago * DAY))
+                .unwrap();
             path
         };
         let expired = file("expired", 10, 31);

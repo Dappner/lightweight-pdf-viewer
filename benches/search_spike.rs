@@ -226,10 +226,8 @@ fn analyze(texts: &[Option<PageText>], order: &[usize]) {
     let utf16: usize = pages.iter().map(|p| p.utf16_len * 2).sum();
 
     let t = Instant::now();
-    let normalized: Vec<Normalized> = texts
-        .iter()
-        .map(|p| p.as_ref().map_or_else(|| (String::new(), vec![], 0), |p| normalize(&p.text)))
-        .collect();
+    let normalized: Vec<Normalized> =
+        texts.iter().map(|p| p.as_ref().map_or_else(|| (String::new(), vec![], 0), |p| normalize(&p.text))).collect();
     let normalize_time = t.elapsed();
     let norm_bytes: usize = normalized.iter().map(|n| n.0.len()).sum();
     let run_bytes: usize = normalized.iter().map(|n| n.1.len() * 8).sum();
@@ -248,10 +246,8 @@ fn analyze(texts: &[Option<PageText>], order: &[usize]) {
     // Words present on exactly 1 page and on ~20 pages, for rare and medium queries.
     let mut pages_with: HashMap<&str, (usize, usize)> = HashMap::new();
     for (i, (text, _, _)) in normalized.iter().enumerate() {
-        let mut seen: Vec<&str> = text
-            .split(|c: char| !c.is_alphabetic())
-            .filter(|w| w.len() >= 7 && w.is_ascii())
-            .collect();
+        let mut seen: Vec<&str> =
+            text.split(|c: char| !c.is_alphabetic()).filter(|w| w.len() >= 7 && w.is_ascii()).collect();
         seen.sort_unstable();
         seen.dedup();
         for w in seen {
@@ -277,7 +273,11 @@ fn analyze(texts: &[Option<PageText>], order: &[usize]) {
             pages_hit += (n > 0) as usize;
         }
         let scan = t.elapsed();
-        let first = order.iter().find(|&&i| normalized[i].0.contains(q.as_str())).and_then(|&i| texts[i].as_ref()).map(|p| p.at);
+        let first = order
+            .iter()
+            .find(|&&i| normalized[i].0.contains(q.as_str()))
+            .and_then(|&i| texts[i].as_ref())
+            .map(|p| p.at);
         println!(
             "    query {q:>14}: {matches:>7} matches on {pages_hit:>4} pages, ranges {:.2} MB at 12 B each, \
              scan {:.2} ms, first match after {}",
@@ -303,9 +303,15 @@ fn analyze(texts: &[Option<PageText>], order: &[usize]) {
 
 /// UTF-16 ranges of "the" (ASCII case-insensitive) in `text`.
 fn ranges_of_the(text: &str) -> Vec<NSRange> {
-    let units: Vec<u16> = text.encode_utf16().map(|u| if u < 128 { (u as u8).to_ascii_lowercase() as u16 } else { u }).collect();
+    let units: Vec<u16> =
+        text.encode_utf16().map(|u| if u < 128 { (u as u8).to_ascii_lowercase() as u16 } else { u }).collect();
     let needle: Vec<u16> = "the".encode_utf16().collect();
-    units.windows(needle.len()).enumerate().filter(|(_, w)| *w == needle).map(|(i, _)| NSRange::new(i, needle.len())).collect()
+    units
+        .windows(needle.len())
+        .enumerate()
+        .filter(|(_, w)| *w == needle)
+        .map(|(i, _)| NSRange::new(i, needle.len()))
+        .collect()
 }
 
 fn geometry_mode(path: &str) {
@@ -373,7 +379,9 @@ fn geometry_mode(path: &str) {
             slot.3 += rects;
         });
     }
-    for (name, (first, all, matches, rects)) in ["never touched", "already rendered", "text already read"].iter().zip(results) {
+    for (name, (first, all, matches, rects)) in
+        ["never touched", "already rendered", "text already read"].iter().zip(results)
+    {
         println!(
             "  geometry {name:>17}: first rect {} | all matches on page {} ({:.0} matches, {:.0} rects per page avg)",
             summary(first),
@@ -395,7 +403,15 @@ fn render_tile(cg: &CGPDFDocument, index: usize, width_px: f64, tx: u32, ty: u32
     let mut rgba = vec![0u8; 512 * 512 * 4];
     let srgb = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB })).unwrap();
     let ctx = unsafe {
-        CGBitmapContextCreate(rgba.as_mut_ptr().cast(), 512, 512, 8, 2048, Some(&srgb), CGImageAlphaInfo::PremultipliedLast.0)
+        CGBitmapContextCreate(
+            rgba.as_mut_ptr().cast(),
+            512,
+            512,
+            8,
+            2048,
+            Some(&srgb),
+            CGImageAlphaInfo::PremultipliedLast.0,
+        )
     }
     .unwrap();
     let c = Some(&*ctx);

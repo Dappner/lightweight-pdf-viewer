@@ -170,7 +170,11 @@ struct Seek {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Pending {
     /// From a point on a page (`y`, 0 = top, 1 = bottom), before its matches are placed.
-    Start { page: u32, y: f32, forward: bool },
+    Start {
+        page: u32,
+        y: f32,
+        forward: bool,
+    },
     Seek(Seek),
 }
 
@@ -654,9 +658,7 @@ impl Search {
             self.start_worker();
         }
         self.with_inbox(|inbox| {
-            wants.retain(|w| {
-                inbox.busy != Some(*w) && !inbox.highlights.iter().any(|h| h.want == *w)
-            });
+            wants.retain(|w| inbox.busy != Some(*w) && !inbox.highlights.iter().any(|h| h.want == *w));
             inbox.geometry = wants;
         });
     }
@@ -665,7 +667,11 @@ impl Search {
     /// match.
     pub fn highlights(&self, page: u32) -> impl Iterator<Item = (Rect, bool)> + '_ {
         let current = self.current.filter(|c| c.page == page).map(|c| c.index);
-        let on_page = self.highlights.get(&page).into_iter().flat_map(move |h| h.rects.iter().map(move |(i, r)| (*r, Some(*i) == current)));
+        let on_page = self
+            .highlights
+            .get(&page)
+            .into_iter()
+            .flat_map(move |h| h.rects.iter().map(move |(i, r)| (*r, Some(*i) == current)));
         let beyond = self.current_rects.iter().filter(move |(h, _)| h.page == page && !self.has_page_rects(*h));
         on_page.chain(beyond.flat_map(|(_, rects)| rects.iter().map(|r| (*r, true))))
     }
@@ -685,7 +691,8 @@ impl Search {
         } else {
             self.current_rects.as_ref().filter(|(h, _)| *h == hit)?.1.clone()
         };
-        let area = rects.into_iter().reduce(|a, b| a.union(b)).unwrap_or(Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 0.05)));
+        let area =
+            rects.into_iter().reduce(|a, b| a.union(b)).unwrap_or(Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 0.05)));
         self.reveal = false;
         Some((hit.page as usize, area))
     }
@@ -1100,7 +1107,8 @@ impl Worker {
         let geometry = PageGeometry::of(&cg);
         let mut rects = Vec::new();
         for (i, (start, len)) in ranges.into_iter().enumerate() {
-            let Some(selection) = (unsafe { page.selectionForRange(NSRange::new(start as usize, len as usize)) }) else {
+            let Some(selection) = (unsafe { page.selectionForRange(NSRange::new(start as usize, len as usize)) })
+            else {
                 continue;
             };
             let lines = unsafe { selection.selectionsByLine() };

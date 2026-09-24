@@ -6,9 +6,9 @@ mod cache;
 mod case_folding;
 pub mod config;
 mod engine;
+mod find_bar;
 #[cfg(target_os = "macos")]
 pub mod finder;
-mod find_bar;
 pub mod history;
 mod layout;
 pub mod memory;
@@ -20,8 +20,8 @@ pub mod search;
 pub mod search_index;
 mod sidebar;
 mod tab;
-mod text;
 mod tab_bar;
+mod text;
 mod theme;
 #[cfg(target_os = "macos")]
 pub mod titlebar;

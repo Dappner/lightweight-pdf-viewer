@@ -42,7 +42,8 @@ impl Harness {
             events,
             ..Default::default()
         };
-        raw.viewports.insert(ViewportId::ROOT, ViewportInfo { native_pixels_per_point: Some(1.0), ..Default::default() });
+        raw.viewports
+            .insert(ViewportId::ROOT, ViewportInfo { native_pixels_per_point: Some(1.0), ..Default::default() });
         let app = &mut self.app;
         self.ctx.run(raw, |ctx| app.ui(ctx)).platform_output.cursor_icon
     }

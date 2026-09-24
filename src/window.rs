@@ -5,8 +5,8 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use eframe::egui::{
-    self, Align2, CentralPanel, ColorImage, Context, FontId, Frame, Id, Key as KeyCode, Modifiers, Pos2,
-    Rect, SidePanel, TextureHandle, TextureOptions, TopBottomPanel, ViewportBuilder, ViewportId, vec2,
+    self, Align2, CentralPanel, ColorImage, Context, FontId, Frame, Id, Key as KeyCode, Modifiers, Pos2, Rect,
+    SidePanel, TextureHandle, TextureOptions, TopBottomPanel, ViewportBuilder, ViewportId, vec2,
 };
 
 use crate::app::Command;
@@ -71,7 +71,10 @@ pub enum Request {
     Open(Vec<PathBuf>),
     OpenDialog,
     /// Tab `index` was dragged out and dropped at `pointer`, in screen coordinates.
-    Detach { index: usize, pointer: Pos2 },
+    Detach {
+        index: usize,
+        pointer: Pos2,
+    },
 }
 
 pub struct Window {
@@ -275,10 +278,13 @@ impl Window {
                     self.drop_thumbnails(shared);
                 }
             }
-            Command::ToggleOutline => self.set_sidebar_mode(shared, match self.sidebar_mode {
-                SidebarMode::Pages => SidebarMode::Outline,
-                SidebarMode::Outline => SidebarMode::Pages,
-            }),
+            Command::ToggleOutline => self.set_sidebar_mode(
+                shared,
+                match self.sidebar_mode {
+                    SidebarMode::Pages => SidebarMode::Outline,
+                    SidebarMode::Outline => SidebarMode::Pages,
+                },
+            ),
             Command::ShowSidebar(mode) => self.set_sidebar_mode(shared, mode),
             Command::SetLayout(mode) => self.set_layout(ctx, mode),
             Command::ZoomIn | Command::ZoomOut | Command::ZoomToFit => self.zoom(ctx, command),
@@ -294,9 +300,9 @@ impl Window {
         let Some(tab) = self.tabs.get_mut(self.active) else { return };
         let DocState::Ready(layout) = &tab.doc else { return };
         let start = tab.view.current_page;
-        let search = tab
-            .search
-            .get_or_insert_with(|| Search::new(ctx, tab.path.clone(), layout.page_count(), start, shared.config.search_store()));
+        let search = tab.search.get_or_insert_with(|| {
+            Search::new(ctx, tab.path.clone(), layout.page_count(), start, shared.config.search_store())
+        });
         search.focus = true;
         search.wake();
     }
@@ -437,8 +443,15 @@ impl Window {
         let shift = Modifiers::SHIFT;
         let alt = Modifiers::ALT;
         let numbers = [
-            KeyCode::Num1, KeyCode::Num2, KeyCode::Num3, KeyCode::Num4, KeyCode::Num5,
-            KeyCode::Num6, KeyCode::Num7, KeyCode::Num8, KeyCode::Num9,
+            KeyCode::Num1,
+            KeyCode::Num2,
+            KeyCode::Num3,
+            KeyCode::Num4,
+            KeyCode::Num5,
+            KeyCode::Num6,
+            KeyCode::Num7,
+            KeyCode::Num8,
+            KeyCode::Num9,
         ];
         let palette_open = self.quick_open.is_some();
         let commands = ctx.input_mut(|i| {
@@ -474,7 +487,11 @@ impl Window {
             // While the palette is open, ⌘1–9 pick its results instead of tabs.
             if !palette_open {
                 commands.extend(
-                    numbers.iter().enumerate().filter(|(_, k)| i.consume_key(cmd, **k)).map(|(n, _)| Command::SelectTab(n)),
+                    numbers
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, k)| i.consume_key(cmd, **k))
+                        .map(|(n, _)| Command::SelectTab(n)),
                 );
             }
             commands
@@ -573,7 +590,8 @@ impl Window {
         }
 
         let find_open = self.active_tab().is_some_and(|t| t.search.is_some());
-        if find_open && self.quick_open.is_none() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, KeyCode::Escape)) {
+        if find_open && self.quick_open.is_none() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, KeyCode::Escape))
+        {
             self.tabs[self.active].search = None;
         }
         self.update_find(ctx);
@@ -585,7 +603,8 @@ impl Window {
             .show_separator_line(false)
             .show(ctx, |ui| {
                 let status = self.status();
-                let view_menu = tab_bar::ViewMenu { sidebar: self.sidebar.then_some(self.sidebar_mode), layout: self.layout() };
+                let view_menu =
+                    tab_bar::ViewMenu { sidebar: self.sidebar.then_some(self.sidebar_mode), layout: self.layout() };
                 tab_bar::show(ui, &self.tabs, self.active, &mut self.tab_scroll, status, view_menu, &palette)
             })
             .inner;
@@ -635,42 +654,44 @@ impl Window {
             }
         }
 
-        let clicked_link = CentralPanel::default().frame(content_frame).show(ctx, |ui| {
-            self.visible_ready = false;
-            let Some(tab) = self.tabs.get_mut(self.active) else {
-                empty_state(ui, &palette, "Drop a PDF here or press ⌘O");
-                return None;
-            };
-            match &tab.doc {
-                DocState::Loading => None,
-                DocState::Failed(e) => {
-                    empty_state(ui, &palette, e);
-                    None
-                }
-                DocState::Ready(layout) => {
-                    let out = Canvas {
-                        doc: tab.id,
-                        layout,
-                        view: &mut tab.view,
-                        snapshot: &mut tab.snapshot_texture,
-                        cache: &mut shared.cache,
-                        failed: &shared.failed,
-                        links: &tab.links,
-                        search: tab.search.as_ref(),
-                        thumb_px: shared.thumb_px,
-                        prefetch: shared.prefetch,
-                        page_border: palette.page_border,
+        let clicked_link = CentralPanel::default()
+            .frame(content_frame)
+            .show(ctx, |ui| {
+                self.visible_ready = false;
+                let Some(tab) = self.tabs.get_mut(self.active) else {
+                    empty_state(ui, &palette, "Drop a PDF here or press ⌘O");
+                    return None;
+                };
+                match &tab.doc {
+                    DocState::Loading => None,
+                    DocState::Failed(e) => {
+                        empty_state(ui, &palette, e);
+                        None
                     }
-                    .show(ui, wants);
-                    self.visible_ready = out.ready;
-                    if let Some(search) = &mut tab.search {
-                        search.want_geometry(&out.visible_pages);
+                    DocState::Ready(layout) => {
+                        let out = Canvas {
+                            doc: tab.id,
+                            layout,
+                            view: &mut tab.view,
+                            snapshot: &mut tab.snapshot_texture,
+                            cache: &mut shared.cache,
+                            failed: &shared.failed,
+                            links: &tab.links,
+                            search: tab.search.as_ref(),
+                            thumb_px: shared.thumb_px,
+                            prefetch: shared.prefetch,
+                            page_border: palette.page_border,
+                        }
+                        .show(ui, wants);
+                        self.visible_ready = out.ready;
+                        if let Some(search) = &mut tab.search {
+                            search.want_geometry(&out.visible_pages);
+                        }
+                        out.clicked_link
                     }
-                    out.clicked_link
                 }
-            }
-        })
-        .inner;
+            })
+            .inner;
         if let Some(target) = clicked_link {
             self.follow(target);
         }

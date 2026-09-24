@@ -4,8 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use eframe::egui::{
-    Color32, CursorIcon, Pos2, Rect, ScrollArea, Sense, Stroke, StrokeKind, TextureHandle, Ui, Vec2,
-    pos2, vec2,
+    Color32, CursorIcon, Pos2, Rect, ScrollArea, Sense, Stroke, StrokeKind, TextureHandle, Ui, Vec2, pos2, vec2,
 };
 
 use crate::cache::TextureCache;
@@ -175,11 +174,7 @@ impl View {
                 }
             })
             .collect();
-        SnapshotJob {
-            doc,
-            size: [(size.x * s).round().max(1.0) as u32, (size.y * s).round().max(1.0) as u32],
-            pages,
-        }
+        SnapshotJob { doc, size: [(size.x * s).round().max(1.0) as u32, (size.y * s).round().max(1.0) as u32], pages }
     }
 }
 
@@ -211,7 +206,8 @@ pub struct CanvasOutput {
 
 impl Canvas<'_> {
     pub fn show(self, ui: &mut Ui, wants: &mut Wants) -> CanvasOutput {
-        let Canvas { doc, layout, view, snapshot, cache, failed, links, search, thumb_px, prefetch, page_border } = self;
+        let Canvas { doc, layout, view, snapshot, cache, failed, links, search, thumb_px, prefetch, page_border } =
+            self;
         let ppp = ui.ctx().pixels_per_point();
         let now = ui.input(|i| i.time);
         let area = ui.available_rect_before_wrap();

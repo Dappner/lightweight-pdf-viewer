@@ -1,8 +1,7 @@
 //! Headless checks of tab strip mouse handling (no window; egui only).
 
 use eframe::egui::{
-    self, Event, Modifiers, PointerButton, Pos2, RawInput, Rect, ViewportCommand, ViewportId, ViewportInfo, pos2,
-    vec2,
+    self, Event, Modifiers, PointerButton, Pos2, RawInput, Rect, ViewportCommand, ViewportId, ViewportInfo, pos2, vec2,
 };
 use lightweight_pdf_viewer::app::{App, Command};
 use lightweight_pdf_viewer::{config::Config, history::History};
@@ -40,7 +39,8 @@ impl Harness {
             events,
             ..Default::default()
         };
-        raw.viewports.insert(ViewportId::ROOT, ViewportInfo { native_pixels_per_point: Some(1.0), ..Default::default() });
+        raw.viewports
+            .insert(ViewportId::ROOT, ViewportInfo { native_pixels_per_point: Some(1.0), ..Default::default() });
         let app = &mut self.app;
         let out = self.ctx.run(raw, |ctx| app.ui(ctx));
         out.viewport_output.get(&ViewportId::ROOT).map(|v| v.commands.clone()).unwrap_or_default()
