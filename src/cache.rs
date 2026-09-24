@@ -6,8 +6,7 @@
 //! only draws on its next frame. Everything else is evicted least-recently-used first once
 //! the budget is exceeded.
 
-use std::collections::{HashMap, HashSet};
-
+use eframe::egui::ahash::{HashMap, HashSet};
 use eframe::egui::{TextureHandle, TextureId};
 
 use crate::renderer::{DocId, Key};
@@ -16,6 +15,8 @@ struct Entry {
     texture: TextureHandle,
     bytes: usize,
     last_used: u64,
+    /// The latest frame of each window that used this entry, as (window, frame).
+    used_by: Vec<(u64, u64)>,
 }
 
 pub struct TextureCache {
@@ -25,25 +26,29 @@ pub struct TextureCache {
     frame: u64,
     /// The window drawing now, by serial.
     window: u64,
-    /// What each window used in its latest frame, by serial.
-    shown: HashMap<u64, HashSet<Key>>,
+    /// The latest frame of each open window, as (window serial, frame). An entry that window
+    /// used in that frame is what it shows. A handful of windows at most, so a list.
+    latest: Vec<(u64, u64)>,
 }
 
 impl TextureCache {
     pub fn new(budget: usize) -> Self {
-        Self { entries: HashMap::new(), bytes: 0, budget, frame: 0, window: 0, shown: HashMap::new() }
+        Self { entries: HashMap::default(), bytes: 0, budget, frame: 0, window: 0, latest: Vec::new() }
     }
 
     /// Starts a frame of the window with this serial, replacing what it last showed.
     pub fn begin_frame(&mut self, window: u64) {
         self.frame += 1;
         self.window = window;
-        self.shown.entry(window).or_default().clear();
+        match self.latest.iter_mut().find(|(w, _)| *w == window) {
+            Some(latest) => latest.1 = self.frame,
+            None => self.latest.push((window, self.frame)),
+        }
     }
 
     /// Stops protecting what a closed window showed.
     pub fn forget_window(&mut self, window: u64) {
-        self.shown.remove(&window);
+        self.latest.retain(|(w, _)| *w != window);
     }
 
     pub fn set_budget(&mut self, budget: usize) {
@@ -54,7 +59,12 @@ impl TextureCache {
     pub fn get(&mut self, key: &Key) -> Option<TextureId> {
         let entry = self.entries.get_mut(key)?;
         entry.last_used = self.frame;
-        self.shown.entry(self.window).or_default().insert(*key);
+        // One hash lookup per tile per frame: what a window shows is recorded on the entry
+        // rather than in a set per window.
+        match entry.used_by.iter_mut().find(|(w, _)| *w == self.window) {
+            Some(used) => used.1 = self.frame,
+            None => entry.used_by.push((self.window, self.frame)),
+        }
         Some(entry.texture.id())
     }
 
@@ -68,7 +78,7 @@ impl TextureCache {
     }
 
     pub fn insert(&mut self, key: Key, texture: TextureHandle, bytes: usize) {
-        let entry = Entry { texture, bytes, last_used: self.frame };
+        let entry = Entry { texture, bytes, last_used: self.frame, used_by: Vec::new() };
         self.bytes += bytes;
         if let Some(old) = self.entries.insert(key, entry) {
             self.bytes -= old.bytes;
@@ -100,7 +110,7 @@ impl TextureCache {
         let mut candidates: Vec<(u64, Key)> = self
             .entries
             .iter()
-            .filter(|(k, _)| !awaited.contains(*k) && !self.shown.values().any(|shown| shown.contains(*k)))
+            .filter(|(k, e)| !awaited.contains(*k) && !e.used_by.iter().any(|used| self.latest.contains(used)))
             .map(|(k, e)| (e.last_used, *k))
             .collect();
         candidates.sort_unstable_by_key(|(used, _)| *used);
@@ -151,7 +161,7 @@ mod tests {
             cache.begin_frame(2);
             insert(&mut cache, &ctx, tile(2, page));
             cache.get(&tile(2, page));
-            cache.trim(&HashSet::new());
+            cache.trim(&HashSet::default());
             assert!(cache.bytes() <= 3, "{} bytes over a budget of 3 at page {page}", cache.bytes());
         }
         assert!(cache.contains(&tile(1, 0)), "idle window's tile was evicted");
@@ -159,7 +169,7 @@ mod tests {
 
         cache.forget_window(1);
         cache.set_budget(1);
-        cache.trim(&HashSet::new());
+        cache.trim(&HashSet::default());
         assert!(!cache.contains(&tile(1, 0)), "closed window's tile is still protected");
         assert!(cache.contains(&tile(2, 9)));
     }
@@ -174,7 +184,7 @@ mod tests {
         cache.begin_frame(2);
         insert(&mut cache, &ctx, tile(2, 0));
         cache.get(&tile(2, 0));
-        let awaited = HashSet::from([tile(2, 1)]);
+        let awaited = HashSet::from_iter([tile(2, 1)]);
         cache.begin_frame(1);
         insert(&mut cache, &ctx, tile(1, 0));
         cache.get(&tile(1, 0));
@@ -187,7 +197,7 @@ mod tests {
         // Window 2 draws it; its request is no longer outstanding.
         cache.begin_frame(2);
         cache.get(&tile(2, 1));
-        cache.trim(&HashSet::new());
+        cache.trim(&HashSet::default());
         assert!(cache.contains(&tile(2, 1)));
         assert!(!cache.contains(&tile(2, 0)), "tile window 2 no longer shows was kept");
     }

@@ -1,6 +1,6 @@
 //! The scrolling page canvas of the active tab.
 
-use std::collections::{HashMap, HashSet};
+use eframe::egui::ahash::{HashMap, HashSet};
 use std::time::Duration;
 
 use eframe::egui::{

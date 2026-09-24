@@ -6,7 +6,7 @@
 //! quit, so when other windows are open it takes over one of them instead: it moves to where
 //! that window was and shows its tabs.
 
-use std::collections::{HashMap, HashSet};
+use eframe::egui::ahash::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -215,7 +215,7 @@ impl State {
                 renderer: Renderer::spawn(ctx.clone(), tuning.pages_per_open),
                 cache: TextureCache::new(tuning.texture_budget),
                 prefetch: tuning.prefetch,
-                failed: HashSet::new(),
+                failed: HashSet::default(),
                 thumb_px: sidebar::thumb_width_px(config.sidebar_width, ctx.pixels_per_point()),
                 config,
                 history,
@@ -229,7 +229,7 @@ impl State {
             sleep_after: tuning.sleep_after,
             last_active: 0.0,
             texture_budget: tuning.texture_budget,
-            wants: HashMap::new(),
+            wants: HashMap::default(),
         };
         if app.shared.config.restore_tabs {
             // Reopening a session isn't a choice to open these files, so it doesn't count
@@ -555,7 +555,7 @@ impl State {
                 return;
             }
             // The tiles go once the snapshots that replace them arrive (see `receive`).
-            let mut pending = HashSet::new();
+            let mut pending = HashSet::default();
             for window in &self.windows {
                 if let Some(tab) = window.active_tab()
                     && let DocState::Ready(layout) = &tab.doc
@@ -830,7 +830,7 @@ mod tests {
     #[test]
     fn failed_snapshot_still_completes_sleep() {
         let (ctx, mut state, doc) = app();
-        state.sleep = Sleep::Falling(HashSet::from([doc]));
+        state.sleep = Sleep::Falling(HashSet::from_iter([doc]));
         state.handle(&ctx, Output::Snapshot { doc, snapshot: None });
         state.finish_falling_asleep();
         assert_eq!(state.sleep, Sleep::Asleep);
@@ -841,7 +841,7 @@ mod tests {
     #[test]
     fn snapshot_completes_sleep() {
         let (ctx, mut state, doc) = app();
-        state.sleep = Sleep::Falling(HashSet::from([doc]));
+        state.sleep = Sleep::Falling(HashSet::from_iter([doc]));
         let qoi = qoi::encode_to_vec([255u8; 4], 1, 1).unwrap();
         state.handle(&ctx, Output::Snapshot { doc, snapshot: Some(Snapshot { size: [1, 1], qoi }) });
         state.finish_falling_asleep();
@@ -855,9 +855,9 @@ mod tests {
         let (ctx, mut state, doc) = app();
         state.open(&ctx, "/nonexistent/b.pdf".into());
         let other = state.windows[0].tabs[1].id;
-        state.sleep = Sleep::Falling(HashSet::from([other]));
+        state.sleep = Sleep::Falling(HashSet::from_iter([other]));
         state.finish_falling_asleep();
-        assert_eq!(state.sleep, Sleep::Falling(HashSet::from([other])), "fell asleep too early");
+        assert_eq!(state.sleep, Sleep::Falling(HashSet::from_iter([other])), "fell asleep too early");
         state.windows[0].close(&ctx, &mut state.shared, 1);
         state.finish_falling_asleep();
         assert_eq!(state.sleep, Sleep::Asleep);
@@ -871,7 +871,7 @@ mod tests {
         let thumb = Key::Thumb { doc, page: 0, width: 100 };
         state.wants.insert(serial, Wants { thumbs: vec![thumb], ..Default::default() });
         assert_eq!(state.render_queue(), vec![thumb]);
-        state.sleep = Sleep::Falling(HashSet::from([doc]));
+        state.sleep = Sleep::Falling(HashSet::from_iter([doc]));
         assert!(state.render_queue().is_empty(), "rendering while falling asleep");
         state.sleep = Sleep::Asleep;
         assert!(state.render_queue().is_empty(), "rendering while asleep");

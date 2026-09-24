@@ -1,7 +1,7 @@
 //! Sidebar (toggled with ⌘B): page thumbnails or the document outline, picked from the view
 //! menu in the tab bar.
 
-use std::collections::HashSet;
+use eframe::egui::ahash::HashSet;
 
 use eframe::egui::{
     Align2, Color32, CornerRadius, CursorIcon, FontId, Rect, ScrollArea, Sense, Stroke, StrokeKind, Ui, pos2,

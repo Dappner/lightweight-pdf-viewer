@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use eframe::egui::ahash::HashMap;
 use std::path::PathBuf;
 
 use eframe::egui::{Rect, TextureHandle, Vec2};
@@ -70,7 +70,7 @@ impl Tab {
             view: View::default(),
             snapshot: None,
             snapshot_texture: None,
-            links: HashMap::new(),
+            links: HashMap::default(),
             outline: None,
             outline_requested: false,
             restore,

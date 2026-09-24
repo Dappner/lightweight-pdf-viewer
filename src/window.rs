@@ -1,7 +1,7 @@
 //! One window: its tabs, sidebar, tab strip and page canvas. The render thread, texture
 //! cache and saved state are shared by all windows (see [`Shared`]).
 
-use std::collections::HashSet;
+use eframe::egui::ahash::HashSet;
 use std::path::PathBuf;
 
 use eframe::egui::{
