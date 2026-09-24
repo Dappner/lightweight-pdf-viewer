@@ -88,6 +88,8 @@ struct Harness {
     /// Highest footprint seen since the phase began.
     peak: f64,
     phase_cpu: f64,
+    /// Rendered and discarded images when the phase began (see [`Stats::rendered`]).
+    phase_renders: (u64, u64),
     /// The other windows' frame callbacks, which run only when [`Self::window_frame`] asks,
     /// as a native window only draws when something changes.
     windows: HashMap<ViewportId, Arc<DeferredViewportUiCallback>>,
@@ -148,15 +150,20 @@ impl Harness {
         self.frame_times.clear();
         self.peak = footprint_mb();
         self.phase_cpu = cpu_seconds();
+        let s = self.stats();
+        self.phase_renders = (s.rendered, s.discarded);
     }
 
     fn end_phase(&self) {
+        let s = self.stats();
         println!(
-            "  cpu {:.2} s   peak footprint {:.1} MB   UI frame {} ms over {} frames",
+            "  cpu {:.2} s   peak footprint {:.1} MB   UI frame {} ms over {} frames   rendered {} ({} wasted)",
             cpu_seconds() - self.phase_cpu,
             self.peak,
             summary(self.frame_times.clone()),
-            self.frame_times.len()
+            self.frame_times.len(),
+            s.rendered - self.phase_renders.0,
+            s.discarded - self.phase_renders.1,
         );
     }
 
@@ -353,6 +360,7 @@ fn main() {
         frame_times: Vec::new(),
         peak: 0.0,
         phase_cpu: 0.0,
+        phase_renders: (0, 0),
         windows: HashMap::new(),
         draw_others: false,
         others_focused: false,

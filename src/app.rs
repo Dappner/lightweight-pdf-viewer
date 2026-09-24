@@ -54,6 +54,10 @@ pub struct State {
     texture_budget: usize,
     /// What each window wanted rendered in its latest frame, by serial.
     wants: HashMap<u64, Wants>,
+    /// Tiles and thumbnails received from the render thread, and how many of them were
+    /// thrown away on arrival (their tab had gone to the background, or the app to sleep).
+    rendered: u64,
+    discarded: u64,
 }
 
 /// Whether the app has let go of its page tiles while in the background.
@@ -125,6 +129,10 @@ pub struct Stats {
     pub find_done: bool,
     /// Searches with a worker attached, in every window and tab.
     pub search_workers: usize,
+    /// Tiles and thumbnails rendered so far: each costs the render thread a page draw.
+    pub rendered: u64,
+    /// Of those, the ones thrown away on arrival: wasted draws.
+    pub discarded: u64,
 }
 
 /// How every window is set up: a tab strip in place of the title bar.
@@ -230,6 +238,8 @@ impl State {
             last_active: 0.0,
             texture_budget: tuning.texture_budget,
             wants: HashMap::default(),
+            rendered: 0,
+            discarded: 0,
         };
         if app.shared.config.restore_tabs {
             // Reopening a session isn't a choice to open these files, so it doesn't count
@@ -462,6 +472,9 @@ impl State {
         if let Some((w, _)) = self.find_doc(doc) {
             ctx.request_repaint_of(self.windows[w].viewport);
         }
+        if matches!(output, Output::Image { .. }) {
+            self.rendered += 1;
+        }
         match output {
             Output::Opened { doc, result } => {
                 let Some((w, i)) = self.find_doc(doc) else { return };
@@ -483,13 +496,13 @@ impl State {
                 };
             }
             // Tiles that were in flight when the app fell asleep.
-            Output::Image { key: Key::Tile { .. }, .. } if self.sleep != Sleep::Awake => {}
+            Output::Image { key: Key::Tile { .. }, .. } if self.sleep != Sleep::Awake => self.discarded += 1,
             Output::Image { key, size, pixels } if self.is_active(key.doc()) => {
                 let image = ColorImage::new(size, pixels);
                 let texture = ctx.load_texture("page", image, TextureOptions::LINEAR);
                 self.shared.cache.insert(key, texture, size[0] * size[1] * 4);
             }
-            Output::Image { .. } => {}
+            Output::Image { .. } => self.discarded += 1,
             Output::Failed(key) => {
                 self.shared.failed.insert(key);
             }
@@ -686,6 +699,8 @@ impl State {
                 .filter_map(|t| t.search.as_ref())
                 .filter(|s| s.stats().worker)
                 .count(),
+            rendered: self.rendered,
+            discarded: self.discarded,
         }
     }
 }

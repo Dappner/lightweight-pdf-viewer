@@ -203,7 +203,11 @@ impl Work {
 #[derive(Default)]
 struct Queue {
     control: VecDeque<Control>,
+    /// What to render next: what the UI wants, less what is in flight or done.
     wanted: Vec<Key>,
+    /// Everything the UI wanted in its latest frame, in flight or not. A batch skips keys
+    /// that have left it, such as tiles of a tab switched away from mid-page.
+    current: HashSet<Key>,
     busy: Vec<Key>,
     done: Vec<Output>,
     paths: HashMap<DocId, PathBuf>,
@@ -253,6 +257,7 @@ impl Renderer {
         self.with_queue(|q| {
             q.paths.remove(&doc);
             q.wanted.retain(|k| k.doc() != doc);
+            q.current.retain(|k| k.doc() != doc);
         });
     }
 
@@ -265,6 +270,7 @@ impl Renderer {
     pub fn release(&self) {
         self.with_queue(|q| {
             q.wanted.clear();
+            q.current.clear();
             q.release = true;
         });
     }
@@ -287,6 +293,8 @@ impl Renderer {
     /// are skipped so nothing is rendered twice.
     pub fn set_wanted(&self, mut wanted: Vec<Key>) {
         self.with_queue(|q| {
+            q.current.clear();
+            q.current.extend(wanted.iter().copied());
             wanted.retain(|k| !q.busy.contains(k) && !q.done.iter().any(|o| o.key() == Some(*k)));
             q.wanted = wanted;
         });
@@ -339,11 +347,12 @@ fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context, pages_per_open:
             }
         };
 
+        let out = Delivery { shared, ctx };
         let doc_id = work.doc();
         let pages = work.pages();
         // CoreGraphics may autorelease internally; drain per job so nothing piles up on
         // this long-lived thread.
-        let outputs = engine::autoreleasepool(|| {
+        engine::autoreleasepool(|| {
             let current = match open.iter().position(|o| o.id == doc_id) {
                 Some(i) => Some(open.remove(i)),
                 None => {
@@ -353,55 +362,73 @@ fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context, pages_per_open:
                     Document::open(&path).map(|doc| OpenDoc { id: doc_id, doc, pages: HashSet::new() })
                 }
             };
-            let outputs = match (&current, work) {
-                (Some(o), work) => run(&o.doc, doc_id, work),
+            match (&current, work) {
+                (Some(o), work) => run(&o.doc, doc_id, work, &out),
                 (None, Work::Control(Control::Open(doc))) => {
-                    vec![Output::Opened { doc, result: Err(format!("Could not open {}", path.display())) }]
+                    out.send(Output::Opened { doc, result: Err(format!("Could not open {}", path.display())) })
                 }
                 (None, Work::Control(Control::Snapshot(job))) => {
-                    vec![Output::Snapshot { doc: job.doc, snapshot: None }]
+                    out.send(Output::Snapshot { doc: job.doc, snapshot: None })
                 }
-                (None, Work::Control(Control::Outline(doc))) => vec![Output::Outline { doc, entries: vec![] }],
-                (None, Work::Render(batch)) => batch.into_iter().map(Output::Failed).collect(),
-            };
+                (None, Work::Control(Control::Outline(doc))) => out.send(Output::Outline { doc, entries: vec![] }),
+                (None, Work::Render(batch)) => batch.into_iter().for_each(|key| out.send(Output::Failed(key))),
+            }
             if let Some(mut o) = current {
                 o.pages.extend(pages.iter().flatten());
                 if pages.is_some() && o.pages.len() <= pages_per_open {
                     open.push(o);
                 }
             }
-            outputs
         });
-
-        let mut q = lock.lock().unwrap();
-        q.done.extend(outputs);
-        q.busy.clear();
-        drop(q);
-        ctx.request_repaint();
+        // Skipped keys never produce an output.
+        lock.lock().unwrap().busy.clear();
     }
 }
 
-fn run(doc: &Document, doc_id: DocId, work: Work) -> Vec<Output> {
+/// Hands the render thread's outputs to the UI as each is made, so a page's visible tiles
+/// don't wait for the rest of its batch.
+struct Delivery<'a> {
+    shared: &'a (Mutex<Queue>, Condvar),
+    ctx: &'a egui::Context,
+}
+
+impl Delivery<'_> {
+    fn send(&self, output: Output) {
+        let mut q = self.shared.0.lock().unwrap();
+        if let Some(key) = output.key() {
+            q.busy.retain(|k| *k != key);
+        }
+        q.done.push(output);
+        drop(q);
+        self.ctx.request_repaint();
+    }
+
+    /// Whether the UI still wants `key`; a batch skips it otherwise.
+    fn wanted(&self, key: &Key) -> bool {
+        self.shared.0.lock().unwrap().current.contains(key)
+    }
+}
+
+fn run(doc: &Document, doc_id: DocId, work: Work, out: &Delivery) {
     match work {
         Work::Control(Control::Open(_)) => {
             let sizes = (0..doc.page_count()).map(|i| doc.page(i).map_or(vec2(612.0, 792.0), |p| p.size())).collect();
-            vec![Output::Opened { doc: doc_id, result: Ok(sizes) }]
+            out.send(Output::Opened { doc: doc_id, result: Ok(sizes) });
         }
         Work::Control(Control::Snapshot(job)) => {
-            vec![Output::Snapshot { doc: job.doc, snapshot: render_snapshot(doc, &job) }]
+            out.send(Output::Snapshot { doc: job.doc, snapshot: render_snapshot(doc, &job) });
         }
-        Work::Control(Control::Outline(_)) => vec![Output::Outline { doc: doc_id, entries: doc.outline() }],
+        Work::Control(Control::Outline(_)) => out.send(Output::Outline { doc: doc_id, entries: doc.outline() }),
         Work::Render(batch) => {
             let Some(page) = doc.page(batch[0].page()) else {
-                return batch.into_iter().map(Output::Failed).collect();
+                return batch.into_iter().for_each(|key| out.send(Output::Failed(key)));
             };
-            batch
-                .into_iter()
-                .map(|key| match key {
+            for key in batch.into_iter().filter(|key| out.wanted(key)) {
+                out.send(match key {
                     Key::Links { doc: d, page: p } => Output::Links { doc: d, page: p, links: page.links() },
                     _ => render_key(&page, key).unwrap_or(Output::Failed(key)),
-                })
-                .collect()
+                });
+            }
         }
     }
 }
