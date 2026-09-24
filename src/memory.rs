@@ -21,10 +21,13 @@ pub struct Tuning {
     /// GPU budget for rendered tiles and thumbnails, shared by every tab. Tiles on screen are
     /// never evicted, so a budget below what the window shows only stops older tiles being kept.
     pub texture_budget: usize,
-    /// Distinct pages the render thread draws before reopening the document. CoreGraphics
+    /// Distinct pages a render thread draws before reopening the document. CoreGraphics
     /// keeps every page it has drawn parsed (~0.3 MB each for a textbook) until the document
     /// is closed; reopening takes a millisecond or two.
     pub pages_per_open: usize,
+    /// Render threads, each drawing a different page at once. Each keeps its own copy of the
+    /// documents it draws, and so of CoreGraphics' caches for them.
+    pub render_threads: usize,
     /// Screen heights rendered ahead, above and below the visible area.
     pub prefetch: f32,
     /// Makes the allocator hand freed memory back to macOS promptly (see [`relaunch`]).
@@ -42,6 +45,7 @@ impl Memory {
             Memory::Low => Tuning {
                 texture_budget: 16 * MB,
                 pages_per_open: 16,
+                render_threads: 1,
                 prefetch: 0.25,
                 space_efficient_malloc: true,
                 sleep_after: Some(2.0),
@@ -49,6 +53,7 @@ impl Memory {
             Memory::Balanced => Tuning {
                 texture_budget: 48 * MB,
                 pages_per_open: 32,
+                render_threads: 2,
                 prefetch: 0.5,
                 space_efficient_malloc: true,
                 sleep_after: Some(10.0),
@@ -56,6 +61,7 @@ impl Memory {
             Memory::Fast => Tuning {
                 texture_budget: 128 * MB,
                 pages_per_open: 256,
+                render_threads: 3,
                 prefetch: 1.0,
                 space_efficient_malloc: false,
                 sleep_after: None,

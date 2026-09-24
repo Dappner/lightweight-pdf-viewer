@@ -220,7 +220,7 @@ impl State {
         let tuning = config.memory.tuning();
         let mut app = Self {
             shared: Shared {
-                renderer: Renderer::spawn(ctx.clone(), tuning.pages_per_open),
+                renderer: Renderer::spawn(ctx.clone(), tuning.render_threads, tuning.pages_per_open),
                 cache: TextureCache::new(tuning.texture_budget),
                 prefetch: tuning.prefetch,
                 failed: HashSet::default(),

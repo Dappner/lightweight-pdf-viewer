@@ -1,7 +1,9 @@
-//! Background render thread: rasterizes pages and reads document structure (outline, links)
-//! with the [`crate::engine`], and decides what to render next.
+//! Background render threads: rasterize pages and read document structure (outline, links)
+//! with the [`crate::engine`], and decide what to render next.
 //!
-//! Every document lives on this one thread. At most one document per window is kept open:
+//! Each thread takes one page's work at a time from a shared queue, so several threads draw
+//! different pages at once (see [`crate::memory::Tuning::render_threads`]). A thread opens
+//! its own copy of each document it works on, and keeps at most one per window open:
 //! touching another one closes the least recently used, which frees its per-document caches
 //! (decoded images, fonts, parsed content streams). CoreGraphics keeps every page it
 //! has drawn in that cache until the document is released, so a document is also closed
@@ -206,11 +208,13 @@ struct Queue {
     /// Everything the UI wanted in its latest frame, in flight or not. A batch skips keys
     /// that have left it, such as tiles of a tab switched away from mid-page.
     current: HashSet<Key>,
+    /// Keys being worked on by any thread.
     busy: Vec<Key>,
     done: Vec<Output>,
     paths: HashMap<DocId, PathBuf>,
-    /// Close the open documents, releasing CoreGraphics' caches for them.
-    release: bool,
+    /// Bumped to have every thread close its open documents, releasing CoreGraphics' caches
+    /// for them.
+    release: u64,
     /// How many documents may be open at once: one for each window showing one.
     open_limit: usize,
 }
@@ -220,26 +224,25 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    /// `pages_per_open`: see [`crate::memory::Tuning::pages_per_open`].
-    pub fn spawn(ctx: egui::Context, pages_per_open: usize) -> Self {
+    /// `threads` and `pages_per_open`: see [`crate::memory::Tuning`].
+    pub fn spawn(ctx: egui::Context, threads: usize, pages_per_open: usize) -> Self {
         let shared = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
-        let worker_shared = shared.clone();
-        std::thread::Builder::new()
-            .name("pdf-render".into())
-            // TODO(perf): on AC power (M1 Pro) QoS makes no difference, even background
-            // (`render_spike`); QOS_CLASS_USER_INITIATED may still matter on battery.
-            // TODO(perf): a second worker with its own Document draws 1.5-1.75x as many pages
-            // a second (`render_spike`), at the cost of a second copy of CoreGraphics'
-            // per-document caches.
-            .spawn(move || worker(&worker_shared, &ctx, pages_per_open))
-            .expect("spawn render thread");
+        for _ in 0..threads.max(1) {
+            let (shared, ctx) = (shared.clone(), ctx.clone());
+            std::thread::Builder::new()
+                .name("pdf-render".into())
+                // TODO(perf): on AC power (M1 Pro) QoS makes no difference, even background
+                // (`render_spike`); QOS_CLASS_USER_INITIATED may still matter on battery.
+                .spawn(move || worker(&shared, &ctx, pages_per_open))
+                .expect("spawn render thread");
+        }
         Self { shared }
     }
 
     fn with_queue(&self, f: impl FnOnce(&mut Queue)) {
         let (lock, cvar) = &*self.shared;
         f(&mut lock.lock().unwrap());
-        cvar.notify_one();
+        cvar.notify_all();
     }
 
     pub fn open(&self, doc: DocId, path: PathBuf) {
@@ -268,7 +271,7 @@ impl Renderer {
         self.with_queue(|q| {
             q.wanted.clear();
             q.current.clear();
-            q.release = true;
+            q.release += 1;
         });
     }
 
@@ -308,13 +311,15 @@ struct OpenDoc {
 fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context, pages_per_open: usize) {
     // Least recently used first.
     let mut open: Vec<OpenDoc> = Vec::new();
+    let mut released = 0;
 
     loop {
         let (lock, cvar) = shared;
         let (work, path, limit) = {
             let mut q = lock.lock().unwrap();
             loop {
-                if std::mem::take(&mut q.release) {
+                if q.release != released {
+                    released = q.release;
                     open.clear();
                 }
                 open.retain(|o| q.paths.contains_key(&o.id));
@@ -336,7 +341,7 @@ fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context, pages_per_open:
                         !same
                     });
                     if let Some(path) = q.paths.get(&first.doc()).cloned() {
-                        q.busy = batch.clone();
+                        q.busy.extend(&batch);
                         break (Work::Render(batch), path, q.open_limit.max(1));
                     }
                 }
@@ -345,6 +350,10 @@ fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context, pages_per_open:
         };
 
         let out = Delivery { shared, ctx };
+        let mine = match &work {
+            Work::Render(batch) => batch.clone(),
+            Work::Control(_) => vec![],
+        };
         let doc_id = work.doc();
         let pages = work.pages();
         // CoreGraphics may autorelease internally; drain per job so nothing piles up on
@@ -378,7 +387,7 @@ fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context, pages_per_open:
             }
         });
         // Skipped keys never produce an output.
-        lock.lock().unwrap().busy.clear();
+        lock.lock().unwrap().busy.retain(|k| !mine.contains(k));
     }
 }
 
