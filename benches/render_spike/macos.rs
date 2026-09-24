@@ -100,6 +100,9 @@ pub fn main() {
         if wants("parallel") {
             parallel(file, &pages, width, rounds);
         }
+        if wants("gray") {
+            gray(file, count, width);
+        }
     }
 }
 
@@ -326,5 +329,46 @@ fn parallel(file: &str, pages: &[usize], width: f64, rounds: usize) {
             .min()
             .unwrap();
         println!("    {workers} worker(s) {:>12.1} ms / page", ms(best) / pages.len() as f64);
+    }
+}
+
+/// How many of every page's tiles have no colour (R = G = B), exactly or within a level or
+/// two, and so could be single-channel textures; and what that would save.
+fn gray(file: &str, count: usize, width: f64) {
+    const TOLERANCES: [u8; 3] = [0, 1, 2];
+    let (mut tiles, mut bytes) = (0usize, 0usize);
+    let mut gray = [0usize; 3];
+    let mut gray_bytes = [0usize; 3];
+    let mut check = Duration::ZERO;
+    autoreleasepool(|_| {
+        let (_pdf, cg) = open(file);
+        for p in 0..count {
+            let page = CGPDFDocument::page(Some(&cg), p + 1).unwrap();
+            render_page(&page, width, Variant { mode: Mode::Row, ..BASE }, &mut |tile| {
+                let start = Instant::now();
+                let spread =
+                    tile.chunks_exact(4).map(|px| px[0].max(px[1]).max(px[2]) - px[0].min(px[1]).min(px[2])).max();
+                check += start.elapsed();
+                let spread = spread.unwrap_or(0);
+                tiles += 1;
+                bytes += tile.len();
+                for (i, t) in TOLERANCES.iter().enumerate() {
+                    if spread <= *t {
+                        gray[i] += 1;
+                        gray_bytes[i] += tile.len();
+                    }
+                }
+            });
+        }
+    });
+    println!("  grey tiles ({tiles} tiles over all {count} pages, check {:.2} ms a tile):", ms(check) / tiles as f64);
+    for (i, t) in TOLERANCES.iter().enumerate() {
+        // A grey tile would keep a quarter of its bytes.
+        let saved = gray_bytes[i] * 3 / 4;
+        println!(
+            "    channels within {t}: {:>5.1}% of tiles   texture memory {:>5.1}% of now",
+            100.0 * gray[i] as f64 / tiles as f64,
+            100.0 * (bytes - saved) as f64 / bytes as f64
+        );
     }
 }
