@@ -179,10 +179,13 @@ fn extract_mode(path: &str, batch: usize) {
 // ---------------------------------------------------------------------------------------------
 // Cache and matching
 
+/// Normalized text, its offset runs, and how many entries a per-character map would need.
+type Normalized = (String, Vec<(u32, u32)>, usize);
+
 /// Lowercased, whitespace runs collapsed to one space. Returns the text and the mapping from
 /// normalized byte offsets to UTF-16 offsets as runs of (normalized start, UTF-16 start):
 /// within a run both advance together, one byte per unit.
-fn normalize(text: &str) -> (String, Vec<(u32, u32)>, usize) {
+fn normalize(text: &str) -> Normalized {
     let mut out = String::with_capacity(text.len());
     let mut runs: Vec<(u32, u32)> = Vec::new();
     let mut per_char_entries = 0;
@@ -223,7 +226,7 @@ fn analyze(texts: &[Option<PageText>], order: &[usize]) {
     let utf16: usize = pages.iter().map(|p| p.utf16_len * 2).sum();
 
     let t = Instant::now();
-    let normalized: Vec<(String, Vec<(u32, u32)>, usize)> = texts
+    let normalized: Vec<Normalized> = texts
         .iter()
         .map(|p| p.as_ref().map_or_else(|| (String::new(), vec![], 0), |p| normalize(&p.text)))
         .collect();

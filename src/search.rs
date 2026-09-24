@@ -387,6 +387,11 @@ impl Search {
         }
     }
 
+    /// Every page is counted for the field's text, with no typing waiting to be searched for.
+    pub fn done(&self) -> bool {
+        self.edited_at.is_none() && self.counted == self.page_count
+    }
+
     pub fn current(&self) -> Option<Hit> {
         self.current
     }

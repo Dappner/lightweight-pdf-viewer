@@ -122,6 +122,8 @@ pub struct Stats {
     pub find: Option<String>,
     /// The active tab's search: its reads of page text from the disk index, and with PDFKit.
     pub find_reads: (u64, u64),
+    /// The active tab's search has counted every page for the find field's text.
+    pub find_done: bool,
     /// Searches with a worker attached, in every window and tab.
     pub search_workers: usize,
 }
@@ -669,6 +671,7 @@ impl State {
             asleep: self.sleep == Sleep::Asleep,
             find: active.and_then(|t| t.search.as_ref()).map(|s| s.status().unwrap_or_default()),
             find_reads: active.and_then(|t| t.search.as_ref()).map_or((0, 0), |s| (s.stats().loaded, s.stats().extracted)),
+            find_done: active.and_then(|t| t.search.as_ref()).is_some_and(|s| s.done()),
             search_workers: self
                 .windows
                 .iter()
