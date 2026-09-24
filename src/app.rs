@@ -498,6 +498,10 @@ impl State {
             // Tiles that were in flight when the app fell asleep.
             Output::Image { key: Key::Tile { .. }, .. } if self.sleep != Sleep::Awake => self.discarded += 1,
             Output::Image { key, size, pixels } if self.is_active(key.doc()) => {
+                // TODO(perf, memory): most pages are text: grayscale tiles could be single-channel
+                // (R8) textures, a quarter of the memory, and on M-series GPU memory is system
+                // memory. egui 0.33 only uploads RGBA, so this needs its own wgpu texture and a
+                // paint callback that samples .rrr; measure texture MB in the session benchmark.
                 let image = ColorImage::new(size, pixels);
                 let texture = ctx.load_texture("page", image, TextureOptions::LINEAR);
                 self.shared.cache.insert(key, texture, size[0] * size[1] * 4);
