@@ -82,6 +82,9 @@ struct Harness {
     ppp: f32,
     focused: bool,
     events: Vec<Event>,
+    /// How long each main-window frame took on the UI thread since the phase began: what
+    /// decides whether scrolling stays smooth (8.3 ms a frame at 120 Hz).
+    frame_times: Vec<Duration>,
     /// Highest footprint seen since the phase began.
     peak: f64,
     phase_cpu: f64,
@@ -112,7 +115,9 @@ impl Harness {
         );
         let app = &mut self.app;
         // The output (including texture uploads) is dropped: there is no GPU.
+        let t = Instant::now();
         let output = self.ctx.run(raw, |ctx| app.ui(ctx));
+        self.frame_times.push(t.elapsed());
         self.windows = output
             .viewport_output
             .into_iter()
@@ -144,12 +149,19 @@ impl Harness {
     }
 
     fn begin_phase(&mut self) {
+        self.frame_times.clear();
         self.peak = footprint_mb();
         self.phase_cpu = cpu_seconds();
     }
 
     fn end_phase(&self) {
-        println!("  cpu {:.2} s   peak footprint {:.1} MB", cpu_seconds() - self.phase_cpu, self.peak);
+        println!(
+            "  cpu {:.2} s   peak footprint {:.1} MB   UI frame {} ms over {} frames",
+            cpu_seconds() - self.phase_cpu,
+            self.peak,
+            summary(self.frame_times.clone()),
+            self.frame_times.len()
+        );
     }
 
     fn stats(&self) -> Stats {
@@ -329,7 +341,7 @@ fn main() {
     let _ = std::fs::remove_dir_all(&search_cache);
     config.search_cache_dir = Some(search_cache.clone());
     let app = App::new(&ctx, config, History::default(), Vec::new());
-    let mut h = Harness { ctx, app, start: Instant::now(), size, ppp, focused: true, events: Vec::new(), peak: 0.0, phase_cpu: 0.0,
+    let mut h = Harness { ctx, app, start: Instant::now(), size, ppp, focused: true, events: Vec::new(), frame_times: Vec::new(), peak: 0.0, phase_cpu: 0.0,
         windows: HashMap::new(),
         draw_others: false,
         others_focused: false,
