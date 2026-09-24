@@ -1,5 +1,5 @@
 //! The macOS PDF engine: pages are rasterized with CoreGraphics (Preview's engine) and
-//! document structure (outline, links) is read with PDFKit.
+//! document structure (outline, links) and text are read with PDFKit.
 
 use std::marker::PhantomData;
 use std::path::Path;
@@ -12,8 +12,8 @@ use objc2_core_graphics::{
     CGBitmapContextCreate, CGColorSpace, CGContext, CGImageAlphaInfo, CGInterpolationQuality, CGPDFBox, CGPDFDocument,
     CGPDFPage, kCGColorSpaceSRGB,
 };
-use objc2_foundation::NSURL;
-use objc2_pdf_kit::{PDFActionGoTo, PDFActionURL, PDFDestination, PDFDocument, PDFOutline};
+use objc2_foundation::{NSRange, NSURL};
+use objc2_pdf_kit::{PDFActionGoTo, PDFActionURL, PDFDestination, PDFDocument, PDFOutline, PDFPage};
 
 use crate::renderer::{Link, OutlineEntry, Target};
 
@@ -39,9 +39,8 @@ pub struct Page<'a> {
 
 impl Document {
     pub fn open(path: &Path) -> Option<Self> {
-        let url = NSURL::from_file_path(path)?;
-        // SAFETY: `url` is a valid file URL.
-        let pdf = unsafe { PDFDocument::initWithURL(PDFDocument::alloc(), &url) }?;
+        let pdf = open_pdf(path)?;
+        // SAFETY: plain PDFKit getter.
         let cg = unsafe { pdf.documentRef() }?;
         (CGPDFDocument::number_of_pages(Some(&cg)) > 0).then_some(Document { pdf, cg })
     }
@@ -130,15 +129,90 @@ impl Page<'_> {
     }
 }
 
+fn open_pdf(path: &Path) -> Option<Retained<PDFDocument>> {
+    let url = NSURL::from_file_path(path)?;
+    // SAFETY: `url` is a valid file URL.
+    unsafe { PDFDocument::initWithURL(PDFDocument::alloc(), &url) }
+}
+
+/// A document opened for its text alone, as the search worker reads it. PDFKit keeps each
+/// page it touches parsed until the document is closed (dropped).
+pub struct TextDocument {
+    pdf: Retained<PDFDocument>,
+}
+
+/// One page of a [`TextDocument`].
+pub struct TextPage {
+    page: Retained<PDFPage>,
+    geometry: Option<PageGeometry>,
+}
+
+impl TextDocument {
+    pub fn open(path: &Path) -> Option<Self> {
+        open_pdf(path).map(|pdf| Self { pdf })
+    }
+
+    /// Frees the pages PDFKit holds parsed, which it autoreleases.
+    pub fn close(self) {
+        autoreleasepool(|| drop(self));
+    }
+
+    pub fn page(&self, index: u32) -> Option<TextPage> {
+        // SAFETY: plain PDFKit getters on objects owned by `self`.
+        let page = unsafe { self.pdf.pageAtIndex(index as usize) }?;
+        let geometry = unsafe { page.pageRef() }.map(|cg| PageGeometry::of(&cg));
+        Some(TextPage { page, geometry })
+    }
+}
+
+impl TextPage {
+    /// The page's text, indexed in UTF-16 code units as the other methods take it.
+    pub fn text(&self) -> Option<String> {
+        // SAFETY: plain PDFKit getter.
+        unsafe { self.page.string() }.map(|s| s.to_string())
+    }
+
+    /// The top of character `index`, as a fraction of the displayed page from its top.
+    pub fn char_top(&self, index: u32) -> Option<f32> {
+        let geometry = self.geometry.as_ref()?;
+        // SAFETY: plain PDFKit getter.
+        let b = unsafe { self.page.characterBoundsAtIndex(index as isize) };
+        let a = geometry.to_fraction(b.origin.x, b.origin.y).y;
+        Some(a.min(geometry.to_fraction(b.origin.x + b.size.width, b.origin.y + b.size.height).y))
+    }
+
+    /// Rectangles of the text `start..start + len`, one per line, as fractions of the
+    /// displayed page with a top-left origin.
+    pub fn line_rects(&self, start: u32, len: u32) -> Vec<Rect> {
+        let Some(geometry) = &self.geometry else { return vec![] };
+        // SAFETY: plain PDFKit getters on objects owned by `self`.
+        let Some(selection) = (unsafe { self.page.selectionForRange(NSRange::new(start as usize, len as usize)) })
+        else {
+            return vec![];
+        };
+        let lines = unsafe { selection.selectionsByLine() };
+        (0..lines.count())
+            .map(|line| {
+                let b = unsafe { lines.objectAtIndex(line).boundsForPage(&self.page) };
+                let corners = [
+                    geometry.to_fraction(b.origin.x, b.origin.y),
+                    geometry.to_fraction(b.origin.x + b.size.width, b.origin.y + b.size.height),
+                ];
+                Rect::from_two_pos(corners[0], corners[1])
+            })
+            .collect()
+    }
+}
+
 /// Crop box and rotation of a page, which together define what is displayed.
-pub(crate) struct PageGeometry {
+struct PageGeometry {
     crop: CGRect,
     /// Clockwise rotation in degrees: 0, 90, 180 or 270.
     rotation: i32,
 }
 
 impl PageGeometry {
-    pub(crate) fn of(page: &CGPDFPage) -> Self {
+    fn of(page: &CGPDFPage) -> Self {
         let crop = CGPDFPage::box_rect(Some(page), CGPDFBox::CropBox);
         let rotation = CGPDFPage::rotation_angle(Some(page)).rem_euclid(360) / 90 * 90;
         Self { crop, rotation }
@@ -150,7 +224,7 @@ impl PageGeometry {
     }
 
     /// A point in PDF user space as fractions of the displayed page, top-left origin.
-    pub(crate) fn to_fraction(&self, x: f64, y: f64) -> Pos2 {
+    fn to_fraction(&self, x: f64, y: f64) -> Pos2 {
         let t = self.page_to_display();
         let size = self.size();
         let u = t.a * x + t.c * y + t.tx;

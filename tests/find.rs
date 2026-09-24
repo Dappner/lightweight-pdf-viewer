@@ -1,4 +1,6 @@
-//! Headless checks of ⌘F search through the real app, on a generated PDF with text.
+//! Headless checks of ⌘F search through the real app, on a generated PDF with text. macOS only:
+//! elsewhere the synthetic engine has no text to find.
+#![cfg(target_os = "macos")]
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

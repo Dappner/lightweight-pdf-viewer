@@ -35,19 +35,14 @@
 //! worker until you use the find bar again.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Duration;
 
-use eframe::egui::{self, Rect, pos2};
-use objc2::AnyThread;
-use objc2::rc::{Retained, autoreleasepool};
-use objc2_foundation::{NSRange, NSURL};
-use objc2_pdf_kit::{PDFDocument, PDFPage};
-
-use crate::engine::PageGeometry;
+use crate::engine::{TextDocument, TextPage, autoreleasepool};
 use crate::search_index::{self, Index, Store};
 use crate::text::{PageText, Query};
+use eframe::egui::{self, Rect, pos2};
 
 /// Distinct pages the worker touches before reopening its document.
 pub const REOPEN_PAGES: usize = 16;
@@ -823,7 +818,7 @@ struct Worker {
     generation: u64,
     query: Option<Query>,
     counted: Vec<bool>,
-    doc: Option<Retained<PDFDocument>>,
+    doc: Option<TextDocument>,
     /// Pages touched since the document was (re)opened.
     touched: Vec<u32>,
     failed: bool,
@@ -908,16 +903,13 @@ impl Worker {
                     }
                     // Nothing to do (or paused) until the query changes or highlights are
                     // wanted: let go of the pages PDFKit holds parsed meanwhile.
-                    if self.doc.is_some() {
-                        autoreleasepool(|_| drop(self.doc.take()));
-                        self.touched.clear();
-                    }
+                    self.close_doc();
                     inbox = cvar.wait(inbox).unwrap();
                 }
             };
             let Some((job, focus)) = next else { break };
             let urgent = matches!(job, Job::Geometry(_));
-            let (counts, highlights) = autoreleasepool(|_| self.run_job(job, focus));
+            let (counts, highlights) = autoreleasepool(|| self.run_job(job, focus));
 
             let (lock, _) = &*self.channel;
             let mut inbox = lock.lock().unwrap();
@@ -941,7 +933,7 @@ impl Worker {
                 self.ctx.request_repaint_after(Duration::from_millis(50));
             }
         }
-        autoreleasepool(|_| drop(self.doc.take()));
+        self.close_doc();
         // Let go of the lock before sweeping, so this document's file counts too.
         drop(self.index.take());
         if let Some(store) = &self.store {
@@ -1023,28 +1015,33 @@ impl Worker {
         (!std::mem::replace(&mut self.counted[p as usize], true)).then(|| (p, text.count(query)))
     }
 
+    fn close_doc(&mut self) {
+        if let Some(doc) = self.doc.take() {
+            doc.close();
+        }
+        self.touched.clear();
+    }
+
     /// The PDFKit page, reopening the document first if it has touched enough others.
-    fn page(&mut self, p: u32) -> Option<Retained<PDFPage>> {
+    fn page(&mut self, p: u32) -> Option<TextPage> {
         if self.failed {
             return None;
         }
         if !self.touched.contains(&p) && self.touched.len() >= REOPEN_PAGES {
-            autoreleasepool(|_| drop(self.doc.take()));
-            self.touched.clear();
+            self.close_doc();
         }
         if self.doc.is_none() {
             // The saved text is only good while the file is the one it came from.
             if self.index.as_ref().is_some_and(|i| !i.is_current()) {
                 self.index = None;
             }
-            self.doc = open(&self.path);
+            self.doc = TextDocument::open(&self.path);
             self.failed = self.doc.is_none();
         }
         if !self.touched.contains(&p) {
             self.touched.push(p);
         }
-        // SAFETY: plain PDFKit getter on a document this thread owns.
-        unsafe { self.doc.as_ref()?.pageAtIndex(p as usize) }
+        self.doc.as_ref()?.page(p)
     }
 
     /// Page `p`'s text: saved, or extracted with PDFKit and then saved.
@@ -1057,7 +1054,7 @@ impl Worker {
             }
             None => {
                 let page = self.page(p);
-                let source = page.and_then(|page| unsafe { page.string() }).map(|s| s.to_string());
+                let source = page.and_then(|page| page.text());
                 let text = PageText::new(source.as_deref().unwrap_or(""));
                 self.extracted += 1;
                 // A page PDFKit couldn't open isn't known to be empty.
@@ -1082,53 +1079,20 @@ impl Worker {
         let starts: Vec<u32> = text.source_ranges(query, 0..u32::MAX).into_iter().map(|(start, _)| start).collect();
         let y = y as f32 / 65536.0;
         let Some(page) = self.page(p) else { return 0 };
-        // SAFETY: plain PDFKit getters on objects this thread owns.
-        let Some(cg) = (unsafe { page.pageRef() }) else { return 0 };
-        let geometry = PageGeometry::of(&cg);
-        starts
-            .iter()
-            .position(|&start| {
-                let b = unsafe { page.characterBoundsAtIndex(start as isize) };
-                let top = geometry
-                    .to_fraction(b.origin.x, b.origin.y)
-                    .y
-                    .min(geometry.to_fraction(b.origin.x + b.size.width, b.origin.y + b.size.height).y);
-                top >= y
-            })
-            .unwrap_or(starts.len()) as u32
+        // Without the page's geometry no top is known, and this finds the first match.
+        starts.iter().position(|&start| page.char_top(start).is_none_or(|top| top >= y)).unwrap_or(starts.len()) as u32
     }
 
     /// Rectangles of matches `want.first..` on the page, one per line of each match.
     fn geometry(&mut self, want: Want, text: &PageText, query: &Query) -> Vec<(u32, Rect)> {
         let ranges = text.source_ranges(query, want.first..want.first + want.count);
         let Some(page) = self.page(want.page) else { return vec![] };
-        // SAFETY: plain PDFKit getters on objects this thread owns.
-        let Some(cg) = (unsafe { page.pageRef() }) else { return vec![] };
-        let geometry = PageGeometry::of(&cg);
         let mut rects = Vec::new();
         for (i, (start, len)) in ranges.into_iter().enumerate() {
-            let Some(selection) = (unsafe { page.selectionForRange(NSRange::new(start as usize, len as usize)) })
-            else {
-                continue;
-            };
-            let lines = unsafe { selection.selectionsByLine() };
-            for line in 0..lines.count() {
-                let b = unsafe { lines.objectAtIndex(line).boundsForPage(&page) };
-                let corners = [
-                    geometry.to_fraction(b.origin.x, b.origin.y),
-                    geometry.to_fraction(b.origin.x + b.size.width, b.origin.y + b.size.height),
-                ];
-                rects.push((want.first + i as u32, Rect::from_two_pos(corners[0], corners[1])));
-            }
+            rects.extend(page.line_rects(start, len).into_iter().map(|rect| (want.first + i as u32, rect)));
         }
         rects
     }
-}
-
-fn open(path: &Path) -> Option<Retained<PDFDocument>> {
-    let url = NSURL::from_file_path(path)?;
-    // SAFETY: `url` is a valid file URL.
-    unsafe { PDFDocument::initWithURL(PDFDocument::alloc(), &url) }
 }
 
 #[cfg(test)]

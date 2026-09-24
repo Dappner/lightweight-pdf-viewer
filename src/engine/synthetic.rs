@@ -5,12 +5,13 @@
 //! `/Count` says (the largest one, the root's) if it can be read uncompressed, else the number
 //! ending its name (`book-800.pdf` has 800), else 300. Pages draw as grey text-like lines on white,
 //! which costs time in proportion to the pixels drawn, as rasterizing does. There are no
-//! links or outline.
+//! links, outline or text: a document never opens for search, which then finds nothing.
 
+use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::path::Path;
 
-use eframe::egui::{Vec2, vec2};
+use eframe::egui::{Rect, Vec2, vec2};
 
 use crate::renderer::{Link, OutlineEntry};
 
@@ -69,6 +70,42 @@ impl Page<'_> {
 
     pub fn links(&self) -> Vec<Link> {
         Vec::new()
+    }
+}
+
+pub struct TextDocument {
+    _none: Infallible,
+}
+
+pub struct TextPage {
+    _none: Infallible,
+}
+
+impl TextDocument {
+    pub fn open(_path: &Path) -> Option<Self> {
+        None
+    }
+
+    pub fn close(self) {
+        match self._none {}
+    }
+
+    pub fn page(&self, _index: u32) -> Option<TextPage> {
+        match self._none {}
+    }
+}
+
+impl TextPage {
+    pub fn text(&self) -> Option<String> {
+        match self._none {}
+    }
+
+    pub fn char_top(&self, _index: u32) -> Option<f32> {
+        match self._none {}
+    }
+
+    pub fn line_rects(&self, _start: u32, _len: u32) -> Vec<Rect> {
+        match self._none {}
     }
 }
 
