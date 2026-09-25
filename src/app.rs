@@ -513,6 +513,13 @@ impl State {
             Output::Image { .. } => self.discarded += 1,
             Output::Failed(key) => {
                 self.shared.failed.insert(key);
+                // The render thread reopens the file by its path, which fails once it is gone.
+                let Some((w, i)) = self.find_doc(key.doc()) else { return };
+                let tab = &mut self.windows[w].tabs[i];
+                if matches!(tab.doc, DocState::Ready(_)) && !tab.path.exists() {
+                    tab.doc = DocState::Failed(format!("{} was moved or deleted", tab.path.display()));
+                    self.shared.cache.evict_doc(key.doc());
+                }
             }
             Output::Snapshot { doc, snapshot } => {
                 let Some((w, i)) = self.find_doc(doc) else { return };
@@ -885,6 +892,24 @@ mod tests {
         state.finish_falling_asleep();
         assert_eq!(state.sleep, Sleep::Asleep);
         assert!(!state.shared.cache.contains(&tile(doc)));
+    }
+
+    #[test]
+    fn deleted_file_shows_an_error_instead_of_empty_pages() {
+        let (ctx, mut state, doc) = app();
+        state.windows[0].tabs[0].doc = DocState::Ready(DocLayout::new(vec![Vec2::splat(100.0)], Default::default()));
+        state.handle(&ctx, Output::Failed(tile(doc)));
+        assert!(matches!(state.windows[0].tabs[0].doc, DocState::Failed(_)));
+        assert!(!state.shared.cache.contains(&tile(doc)), "tiles were not released");
+    }
+
+    #[test]
+    fn switching_back_retries_failed_tiles() {
+        let (ctx, mut state, doc) = app();
+        state.open(&ctx, "/nonexistent/b.pdf".into());
+        state.shared.failed.insert(tile(doc));
+        state.windows[0].activate(&ctx, &mut state.shared, 0);
+        assert!(!state.shared.failed.contains(&tile(doc)));
     }
 
     #[test]

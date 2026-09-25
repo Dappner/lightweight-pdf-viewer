@@ -174,6 +174,8 @@ impl Window {
         self.active = index;
 
         let tab = &mut self.tabs[index];
+        // Retried, in case the file was only briefly missing (an app saving by replacing it).
+        shared.failed.retain(|k| k.doc() != tab.id);
         if let Some(search) = &mut tab.search {
             search.pause(false);
         }
