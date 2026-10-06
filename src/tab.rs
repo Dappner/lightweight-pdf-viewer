@@ -7,6 +7,7 @@ use crate::history::Place;
 use crate::layout::{DocLayout, Rotations};
 use crate::renderer::{DocId, Link, OutlineEntry, Snapshot};
 use crate::search::Search;
+use crate::text_boxes::TextBoxes;
 use crate::text_layers::TextLayers;
 
 pub enum DocState {
@@ -38,6 +39,8 @@ pub struct Tab {
     pub search: Option<Search>,
     /// Page text read for selecting, and the selection.
     pub text: TextLayers,
+    /// Text boxes on the pages, and edits to them not yet saved into the file.
+    pub text_boxes: TextBoxes,
 }
 
 /// Scroll and zoom state of a tab. Survives while the tab is in the background.
@@ -64,7 +67,14 @@ pub struct View {
 }
 
 impl Tab {
-    pub fn new(id: DocId, path: PathBuf, rotations: Rotations, restore: Option<Place>) -> Self {
+    /// `text_boxes_dir`: see [`crate::config::Config::text_boxes_dir`].
+    pub fn new(
+        id: DocId,
+        path: PathBuf,
+        rotations: Rotations,
+        restore: Option<Place>,
+        text_boxes_dir: Option<&std::path::Path>,
+    ) -> Self {
         let title =
             path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
         Self {
@@ -82,6 +92,7 @@ impl Tab {
             restore,
             search: None,
             text: TextLayers::new(path.clone(), rotations),
+            text_boxes: TextBoxes::load(&path, text_boxes_dir),
         }
     }
 }

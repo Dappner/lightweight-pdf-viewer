@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::memory::Memory;
 use crate::search_index::{self, Limits, Store};
 use crate::sidebar;
+use crate::text_boxes;
 
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
@@ -23,6 +24,10 @@ pub struct Config {
     /// Where searched text is saved; `None` doesn't save it (tests, benchmarks).
     #[serde(skip)]
     pub search_cache_dir: Option<PathBuf>,
+    /// Where text boxes not yet saved into their PDFs are kept; `None` keeps them in memory
+    /// only (tests, benchmarks).
+    #[serde(skip)]
+    pub text_boxes_dir: Option<PathBuf>,
     /// Where the settings are saved; `None` keeps them in memory only (tests, benchmarks).
     #[serde(skip)]
     path: Option<PathBuf>,
@@ -37,6 +42,7 @@ impl Default for Config {
             memory: Memory::default(),
             search_cache: Limits::default(),
             search_cache_dir: None,
+            text_boxes_dir: None,
             path: None,
         }
     }
@@ -57,6 +63,7 @@ impl Config {
     pub fn load() -> Self {
         let mut config = support_file("config.json").map_or_else(Self::default, Self::load_from);
         config.search_cache_dir = search_index::user_dir();
+        config.text_boxes_dir = text_boxes::dir();
         config
     }
 

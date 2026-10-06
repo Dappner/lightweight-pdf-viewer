@@ -75,6 +75,8 @@ enum Sleep {
 #[derive(Clone, Copy, Debug)]
 pub enum Command {
     Open,
+    /// Writes the active tab's text boxes into its PDF.
+    Save,
     /// Shows or hides the recent-files palette.
     QuickOpen,
     NewWindow,
@@ -556,11 +558,13 @@ impl State {
                         snapshot.and_then(|snapshot| snapshot_texture(ctx, &snapshot));
                 }
             }
-            Output::Links { doc, page, links } => {
+            Output::Links { doc, page, links, text_boxes } => {
                 if let Some((w, i)) = self.find_doc(doc)
                     && self.windows[w].active == i
                 {
-                    self.windows[w].tabs[i].links.insert(page, links);
+                    let tab = &mut self.windows[w].tabs[i];
+                    tab.links.insert(page, links);
+                    tab.text_boxes.set_file(page, text_boxes);
                 }
             }
             Output::Outline { doc, entries } => {

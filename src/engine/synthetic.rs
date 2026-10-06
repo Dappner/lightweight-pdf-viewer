@@ -15,6 +15,7 @@ use eframe::egui::{Rect, Vec2, vec2};
 
 use crate::layout::{Rotation, Rotations};
 use crate::renderer::{Link, OutlineEntry};
+use crate::text_boxes::{PageSave, TextBox};
 
 const LETTER: Vec2 = vec2(612.0, 792.0);
 
@@ -74,6 +75,14 @@ impl Page<'_> {
     pub fn links(&self) -> Vec<Link> {
         Vec::new()
     }
+
+    pub fn text_boxes(&self) -> Vec<TextBox> {
+        Vec::new()
+    }
+}
+
+pub fn save_text_boxes(_path: &Path, _pages: &[PageSave]) -> Result<(), String> {
+    Err("Saving text boxes needs macOS".into())
 }
 
 pub struct TextDocument {

@@ -1,29 +1,38 @@
 //! The macOS engine: PDF pages are rasterized with CoreGraphics (Preview's engine) and
-//! document structure (outline, links) and text are read with PDFKit. Images open as a
-//! document of one page, decoded with ImageIO and drawn as they are, not wrapped in a PDF.
+//! document structure (outline, links) and text are read with PDFKit. Text boxes are read
+//! from the page's annotations with CoreGraphics and written back with PDFKit. Images open as
+//! a document of one page, decoded with ImageIO and drawn as they are, not wrapped in a PDF.
 
+use std::ffi::{CStr, c_char};
 use std::marker::PhantomData;
 use std::path::Path;
+use std::ptr::{NonNull, null, null_mut};
 
 use eframe::egui::{Pos2, Rect, Vec2, pos2, vec2};
 use objc2::AnyThread;
 use objc2::rc::Retained;
+use objc2_app_kit::{NSColor, NSFont};
 use objc2_core_foundation::{
     CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType, CFURL, CGAffineTransform, CGPoint, CGRect, CGSize,
 };
 use objc2_core_graphics::{
-    CGBitmapContextCreate, CGColorSpace, CGContext, CGImage, CGImageAlphaInfo, CGInterpolationQuality, CGPDFBox,
-    CGPDFDocument, CGPDFPage, kCGColorSpaceSRGB,
+    CGAffineTransformInvert, CGBitmapContextCreate, CGColorSpace, CGContext, CGImage, CGImageAlphaInfo,
+    CGInterpolationQuality, CGPDFArray, CGPDFArrayRef, CGPDFBox, CGPDFDictionary, CGPDFDictionaryRef, CGPDFDocument,
+    CGPDFPage, CGPDFReal, CGPDFString, CGPDFStringRef, kCGColorSpaceSRGB,
 };
-use objc2_foundation::{NSRange, NSURL};
+use objc2_foundation::{NSRange, NSString, NSURL};
 use objc2_image_io::{
     CGImageSource, kCGImagePropertyDPIHeight, kCGImagePropertyDPIWidth, kCGImagePropertyOrientation,
     kCGImageSourceShouldCacheImmediately,
 };
-use objc2_pdf_kit::{PDFActionGoTo, PDFActionURL, PDFDestination, PDFDocument, PDFOutline, PDFPage};
+use objc2_pdf_kit::{
+    PDFActionGoTo, PDFActionURL, PDFAnnotation, PDFAnnotationSubtypeFreeText, PDFDestination, PDFDocument, PDFOutline,
+    PDFPage,
+};
 
 use crate::layout::{Rotation, Rotations};
 use crate::renderer::{Link, OutlineEntry, Target};
+use crate::text_boxes::{self, PageSave, TextBox};
 
 /// Runs `f`, releasing what CoreGraphics autoreleased during it.
 pub fn autoreleasepool<R>(f: impl FnOnce() -> R) -> R {
@@ -91,6 +100,13 @@ impl Page<'_> {
     pub fn links(&self) -> Vec<Link> {
         match &self.0 {
             PageSource::Pdf(page) => page.links(),
+            PageSource::Image(_) => Vec::new(),
+        }
+    }
+
+    pub fn text_boxes(&self) -> Vec<TextBox> {
+        match &self.0 {
+            PageSource::Pdf(page) => page.text_boxes(),
             PageSource::Image(_) => Vec::new(),
         }
     }
@@ -251,6 +267,210 @@ impl PdfPage<'_> {
     }
 }
 
+impl PdfPage<'_> {
+    /// The page's FreeText annotations, read from its dictionary: PDFKit doesn't read back
+    /// the font size and colour it writes (it saves them as a name, not a string).
+    fn text_boxes(&self) -> Vec<TextBox> {
+        // Positions are on the page as the file turns it, before the reader's rotation.
+        let geometry = PageGeometry::of(&self.page, Rotation::default());
+        let page = CGPDFPage::dictionary(Some(&self.page));
+        let mut annots: CGPDFArrayRef = null_mut();
+        // SAFETY: `page` is the page's dictionary or null, and the out-pointers are valid.
+        if page.is_null() || !unsafe { CGPDFDictionary::array(page, key(c"Annots"), &mut annots) } {
+            return Vec::new();
+        }
+        let mut boxes = Vec::new();
+        let mut ordinal = 0;
+        // SAFETY: `annots` is a valid array owned by the page, and the out-pointers are valid.
+        for i in 0..unsafe { CGPDFArray::count(annots) } {
+            let mut annot: CGPDFDictionaryRef = null_mut();
+            if !unsafe { CGPDFArray::dictionary(annots, i, &mut annot) }
+                || unsafe { name(annot, c"Subtype") }.as_deref() != Some("FreeText")
+            {
+                continue;
+            }
+            let origin = ordinal;
+            ordinal += 1;
+            let Some([x0, y0, x1, y1]) = (unsafe { numbers::<4>(annot, c"Rect") }) else { continue };
+            let corners = Rect::from_two_pos(geometry.to_fraction(x0, y0), geometry.to_fraction(x1, y1));
+            let contents = unsafe { text(annot, c"Contents") }.unwrap_or_default();
+            let appearance = unsafe { text(annot, c"DA").or_else(|| name(annot, c"DA")) }.unwrap_or_default();
+            let (size, color) = default_appearance(&appearance);
+            boxes.push(TextBox {
+                text: contents.replace('\r', "\n"),
+                at: [corners.min.x, corners.min.y],
+                size,
+                color,
+                width: Some(corners.width() * geometry.size().x),
+                origin: Some(origin),
+                changed: false,
+            });
+        }
+        boxes
+    }
+}
+
+/// A dictionary key, for the CGPDF getters.
+fn key(k: &CStr) -> NonNull<c_char> {
+    NonNull::from(k).cast()
+}
+
+/// # Safety
+/// `dict` must be a valid dictionary.
+unsafe fn name(dict: CGPDFDictionaryRef, k: &CStr) -> Option<String> {
+    let mut value: *const c_char = null();
+    // SAFETY: the out-pointer is valid; CoreGraphics returns a NUL-terminated name.
+    unsafe { CGPDFDictionary::name(dict, key(k), &mut value) && !value.is_null() }
+        .then(|| unescape_name(unsafe { CStr::from_ptr(value) }.to_bytes()))
+}
+
+/// A name with its `#xx` escapes decoded, which CoreGraphics leaves in.
+fn unescape_name(name: &[u8]) -> String {
+    let mut out = Vec::with_capacity(name.len());
+    let mut i = 0;
+    while i < name.len() {
+        let hex = name.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok());
+        match (name[i], hex) {
+            (b'#', Some(byte)) => {
+                out.push(byte);
+                i += 3;
+            }
+            (byte, _) => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// # Safety
+/// `dict` must be a valid dictionary.
+unsafe fn text(dict: CGPDFDictionaryRef, k: &CStr) -> Option<String> {
+    let mut value: CGPDFStringRef = null_mut();
+    // SAFETY: the out-pointer is valid.
+    if !unsafe { CGPDFDictionary::string(dict, key(k), &mut value) } {
+        return None;
+    }
+    unsafe { CGPDFString::text_string(value) }.map(|s| s.to_string())
+}
+
+/// An array of `N` numbers.
+///
+/// # Safety
+/// `dict` must be a valid dictionary.
+unsafe fn numbers<const N: usize>(dict: CGPDFDictionaryRef, k: &CStr) -> Option<[f64; N]> {
+    let mut array: CGPDFArrayRef = null_mut();
+    // SAFETY: the out-pointers are valid, and `array` is checked to hold `N` entries.
+    if !unsafe { CGPDFDictionary::array(dict, key(k), &mut array) } || unsafe { CGPDFArray::count(array) } != N {
+        return None;
+    }
+    let mut out = [0.0; N];
+    for (i, n) in out.iter_mut().enumerate() {
+        let mut value: CGPDFReal = 0.0;
+        if !unsafe { CGPDFArray::number(array, i, &mut value) } {
+            return None;
+        }
+        *n = value;
+    }
+    Some(out)
+}
+
+/// Font size and colour from a FreeText's default appearance string, such as
+/// `/Helv 12 Tf 0 0 1 rg`. Black at the default size for what it doesn't say.
+fn default_appearance(da: &str) -> (f32, [u8; 3]) {
+    let tokens: Vec<&str> = da.split_whitespace().collect();
+    let number = |i: usize| tokens.get(i).and_then(|t| t.parse::<f32>().ok());
+    let mut size = text_boxes::DEFAULT_SIZE;
+    let mut color = [0.0f32; 3];
+    for (i, &op) in tokens.iter().enumerate() {
+        match op {
+            "Tf" => size = i.checked_sub(1).and_then(number).filter(|s| *s > 0.0).unwrap_or(size),
+            "g" if i >= 1 => color = [number(i - 1).unwrap_or(0.0); 3],
+            "rg" if i >= 3 => color = [0, 1, 2].map(|k| number(i - 3 + k).unwrap_or(0.0)),
+            "k" if i >= 4 => {
+                let [c, m, y, k] = [0, 1, 2, 3].map(|j| number(i - 4 + j).unwrap_or(0.0));
+                color = [c, m, y].map(|v| (1.0 - v) * (1.0 - k));
+            }
+            _ => {}
+        }
+    }
+    (size, color.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8))
+}
+
+/// Writes text boxes into the PDF at `path`: changes and removes the file's own as `pages`
+/// says, and adds the new ones. Writes a copy and moves it over the file, so a failed save
+/// leaves the file as it was. PDFKit rewrites the whole document, so this can take seconds.
+pub fn save_text_boxes(path: &Path, pages: &[PageSave]) -> Result<(), String> {
+    autoreleasepool(|| {
+        let pdf = open_pdf(path).ok_or("The file couldn't be opened")?;
+        for save in pages {
+            // SAFETY: plain PDFKit calls on objects owned by `pdf`.
+            let Some(page) = (unsafe { pdf.pageAtIndex(save.page as usize) }) else { continue };
+            let Some(cg) = (unsafe { page.pageRef() }) else { continue };
+            let geometry = PageGeometry::of(&cg, Rotation::default());
+            let theirs: Vec<Retained<PDFAnnotation>> = unsafe { page.annotations() }
+                .iter()
+                .filter(|a| unsafe { a.r#type() }.is_some_and(|t| t.to_string() == "FreeText"))
+                .collect();
+            for (ordinal, annotation) in theirs.iter().enumerate() {
+                match save.boxes.iter().find(|(b, _)| b.origin == Some(ordinal as u32)) {
+                    Some((b, rect)) if b.changed => style(annotation, b, geometry.fraction_rect_to_pdf(*rect)),
+                    Some(_) => {}
+                    None if save.complete => unsafe { page.removeAnnotation(annotation) },
+                    None => {}
+                }
+            }
+            for (b, rect) in save.boxes.iter().filter(|(b, _)| b.origin.is_none()) {
+                let bounds = geometry.fraction_rect_to_pdf(*rect);
+                // SAFETY: a new FreeText annotation, added to a page of `pdf`.
+                let annotation = unsafe {
+                    PDFAnnotation::initWithBounds_forType_withProperties(
+                        PDFAnnotation::alloc(),
+                        bounds,
+                        PDFAnnotationSubtypeFreeText,
+                        None,
+                    )
+                };
+                style(&annotation, b, bounds);
+                unsafe { page.addAnnotation(&annotation) };
+            }
+        }
+        let name = path.file_name().ok_or("Not a file")?.to_string_lossy();
+        let temp = path.with_file_name(format!(".{name}.saving"));
+        let url = NSURL::from_file_path(&temp).ok_or("Bad file name")?;
+        // SAFETY: plain PDFKit call.
+        if !unsafe { pdf.writeToURL(&url) } {
+            let _ = std::fs::remove_file(&temp);
+            return Err("PDFKit couldn't write the file".into());
+        }
+        if let Ok(meta) = std::fs::metadata(path) {
+            let _ = std::fs::set_permissions(&temp, meta.permissions());
+        }
+        std::fs::rename(&temp, path).map_err(|e| {
+            let _ = std::fs::remove_file(&temp);
+            format!("The file couldn't be replaced: {e}")
+        })
+    })
+}
+
+/// Sets a FreeText annotation to show `b` in `bounds` (PDF user space).
+fn style(annotation: &PDFAnnotation, b: &TextBox, bounds: CGRect) {
+    // Generic (calibrated) RGB is the one colour space PDFKit writes into the appearance
+    // string as given; sRGB and device RGB it converts first.
+    let [r, g, bl] = b.color.map(|v| v as f64 / 255.0);
+    // SAFETY: plain PDFKit and AppKit calls on objects this thread owns.
+    unsafe {
+        annotation.setBounds(bounds);
+        annotation.setContents(Some(&NSString::from_str(&b.text)));
+        let font = NSFont::fontWithName_size(&NSString::from_str(text_boxes::FONT), b.size as f64);
+        annotation.setFont(font.as_deref());
+        annotation.setFontColor(Some(&NSColor::colorWithCalibratedRed_green_blue_alpha(r, g, bl, 1.0)));
+        // Without this PDFKit fills the box yellow.
+        annotation.setColor(&NSColor::clearColor());
+    }
+}
+
 fn open_pdf(path: &Path) -> Option<Retained<PDFDocument>> {
     let url = NSURL::from_file_path(path)?;
     // SAFETY: `url` is a valid file URL.
@@ -407,6 +627,22 @@ impl PageGeometry {
         let u = t.a * x + t.c * y + t.tx;
         let v = t.b * x + t.d * y + t.ty;
         pos2(u as f32 / size.x, 1.0 - v as f32 / size.y)
+    }
+
+    /// The inverse of [`Self::to_fraction`], for a rect: PDF user space.
+    fn fraction_rect_to_pdf(&self, rect: Rect) -> CGRect {
+        let t = CGAffineTransformInvert(self.page_to_display());
+        let size = self.size();
+        let point = |p: Pos2| {
+            let (u, v) = (p.x as f64 * size.x as f64, (1.0 - p.y as f64) * size.y as f64);
+            (t.a * u + t.c * v + t.tx, t.b * u + t.d * v + t.ty)
+        };
+        let (x0, y0) = point(rect.min);
+        let (x1, y1) = point(rect.max);
+        CGRect {
+            origin: CGPoint { x: x0.min(x1), y: y0.min(y1) },
+            size: CGSize { width: (x1 - x0).abs(), height: (y1 - y0).abs() },
+        }
     }
 
     /// Maps PDF user space onto the displayed page, with the origin at its bottom-left.
@@ -677,6 +913,53 @@ mod tests {
         let text = TextDocument::open(&path, &Rotations::default());
         let _ = std::fs::remove_file(&path);
         assert!(text.is_none());
+    }
+
+    fn read_boxes(path: &Path, rotations: &Rotations) -> Vec<TextBox> {
+        Document::open(path, rotations).expect("open").page(0).unwrap().text_boxes()
+    }
+
+    #[test]
+    fn saved_text_boxes_read_back() {
+        let path = text_pdf("text-box", &[("Alpha", 700)]);
+        let new =
+            TextBox { size: 16.0, color: [24, 88, 214], ..TextBox::new(pos2(0.1, 0.2), "Note é\nline two".into()) };
+        let rect = Rect::from_min_max(pos2(0.1, 0.2), pos2(0.4, 0.25));
+        let save = PageSave { page: 0, boxes: vec![(new.clone(), rect)], complete: false };
+        save_text_boxes(&path, &[save]).expect("save");
+
+        let boxes = read_boxes(&path, &Rotations::default());
+        assert_eq!(boxes.len(), 1);
+        let read = &boxes[0];
+        assert_eq!(read.text, new.text);
+        assert_eq!(read.origin, Some(0));
+        assert!(!read.changed);
+        assert!((read.size - 16.0).abs() < 0.01, "size {}", read.size);
+        for (got, want) in read.color.iter().zip(new.color) {
+            assert!(got.abs_diff(want) <= 3, "colour {:?}", read.color);
+        }
+        assert!((read.at() - rect.min).length() < 1.0 / 612.0, "at {:?}", read.at);
+        assert!((read.width.unwrap() - rect.width() * 612.0).abs() < 1.0, "width {:?}", read.width);
+        // Where a box is doesn't depend on how the reader turns the pages.
+        assert_eq!(read_boxes(&path, &turned_all(true))[0].at, read.at);
+
+        // Changed, then deleted.
+        let changed = TextBox { text: "Changed".into(), changed: true, ..read.clone() };
+        let save = PageSave { page: 0, boxes: vec![(changed, rect)], complete: true };
+        save_text_boxes(&path, &[save]).expect("save");
+        assert_eq!(read_boxes(&path, &Rotations::default())[0].text, "Changed");
+        save_text_boxes(&path, &[PageSave { page: 0, boxes: Vec::new(), complete: true }]).expect("save");
+        assert!(read_boxes(&path, &Rotations::default()).is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn default_appearance_gives_size_and_colour() {
+        assert_eq!(default_appearance("/Helv 14 Tf 1 0 0 rg"), (14.0, [255, 0, 0]));
+        assert_eq!(default_appearance("0.5 g /Helvetica 9 Tf"), (9.0, [128, 128, 128]));
+        assert_eq!(default_appearance("/F1 0 Tf 0 0 0 1 k"), (text_boxes::DEFAULT_SIZE, [0, 0, 0]));
+        assert_eq!(default_appearance(""), (text_boxes::DEFAULT_SIZE, [0, 0, 0]));
+        assert_eq!(unescape_name(b"Helvetica#2012#20Tf#200#20g"), "Helvetica 12 Tf 0 g");
     }
 
     /// Writes a one-page US Letter PDF drawing `content` with font F1 (`font`, a dictionary,

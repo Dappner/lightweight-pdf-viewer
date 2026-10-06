@@ -12,6 +12,7 @@ use eframe::egui::{
 use crate::app::Command;
 use crate::cache::TextureCache;
 use crate::config::Config;
+use crate::engine;
 use crate::find_bar;
 use crate::history::{self, History};
 use crate::layout::PageLayout;
@@ -21,6 +22,7 @@ use crate::search::{Anchor, Search};
 use crate::sidebar::{self, Mode as SidebarMode};
 use crate::tab::{DocState, Tab};
 use crate::tab_bar::{self, Action};
+use crate::text_boxes::{self, Saving};
 use crate::text_layers::TextLayers;
 use crate::theme::{Palette, palette};
 use crate::view::{Canvas, Wants, fit_width_zoom};
@@ -136,7 +138,7 @@ impl Window {
         let rotations = shared.history.rotations(&path);
         shared.renderer.open(id, path.clone(), rotations.clone());
         let restore = shared.history.place(&path);
-        self.tabs.push(Tab::new(id, path, rotations, restore));
+        self.tabs.push(Tab::new(id, path, rotations, restore, shared.config.text_boxes_dir.as_deref()));
         self.activate(ctx, shared, self.tabs.len() - 1);
     }
 
@@ -159,6 +161,7 @@ impl Window {
             }
             old.snapshot_texture = None;
             old.links.clear();
+            old.text_boxes.clear_file();
             old.text.clear();
             if let Some(search) = &mut old.search {
                 search.pause(true);
@@ -299,6 +302,7 @@ impl Window {
             Command::Find => self.open_find(ctx, shared),
             Command::FindNext => self.find_step(true),
             Command::FindPrevious => self.find_step(false),
+            Command::Save => self.save(ctx),
             _ => {}
         }
     }
@@ -474,30 +478,75 @@ impl Window {
             None => tab.rotations.turn_all(clockwise),
         }
         shared.history.set_rotations(&tab.path, &tab.rotations, history::now());
+        reopen(ctx, shared, tab, restore);
+    }
 
-        shared.renderer.forget(tab.id);
-        shared.cache.evict_doc(tab.id);
-        shared.failed.retain(|k| k.doc() != tab.id);
-        tab.id = shared.next_id;
-        shared.next_id += 1;
-        shared.renderer.open(tab.id, tab.path.clone(), tab.rotations.clone());
-        tab.doc = DocState::Loading;
-        tab.restore = restore;
-        tab.snapshot = None;
-        tab.snapshot_texture = None;
-        tab.links.clear();
-        tab.outline = None;
-        tab.outline_requested = false;
-        tab.text = TextLayers::new(tab.path.clone(), tab.rotations.clone());
-        if let Some(old) = tab.search.take() {
-            let start = restore.map_or(0, |p| p.page);
-            let store = shared.config.search_store();
-            let mut search = Search::new(ctx, tab.path.clone(), tab.rotations.clone(), old.page_count(), start, store);
-            search.query = old.query.clone();
-            search.focus = false;
-            search.edited(ctx.input(|i| i.time));
-            tab.search = Some(search);
+    /// Writes the active tab's text boxes into its PDF, on a thread of its own as PDFKit
+    /// rewrites the whole file. The tab reopens once it's done (see [`Self::check_saves`]).
+    fn save(&mut self, ctx: &Context) {
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        let DocState::Ready(layout) = &tab.doc else { return };
+        let boxes = &mut tab.text_boxes;
+        boxes.finish_editing();
+        if !boxes.unsaved() || matches!(boxes.saving, Some(Saving::Running(_))) {
+            return;
         }
+        let rotations = &tab.rotations;
+        let job = boxes.save_job(|page, b| {
+            let shown = layout.page_size(page as usize);
+            let upright = if rotations.of(page).degrees() % 180 == 90 { vec2(shown.y, shown.x) } else { shown };
+            text_boxes::rect_on_page(ctx, b, upright)
+        });
+        let job = match job {
+            Ok(job) => job,
+            Err(e) => {
+                boxes.saving = Some(Saving::Failed(e));
+                return;
+            }
+        };
+        let (done, result) = std::sync::mpsc::channel();
+        let (path, ctx) = (tab.path.clone(), ctx.clone());
+        let spawned = std::thread::Builder::new().name("save".into()).spawn(move || {
+            let _ = done.send(engine::save_text_boxes(&path, &job));
+            ctx.request_repaint();
+        });
+        boxes.saving = Some(match spawned {
+            Ok(_) => Saving::Running(result),
+            Err(e) => Saving::Failed(e.to_string()),
+        });
+    }
+
+    /// Takes in finished saves: a saved tab reopens, so its pages and boxes are read from the
+    /// file as it now is.
+    fn check_saves(&mut self, ctx: &Context, shared: &mut Shared) {
+        for tab in &mut self.tabs {
+            let Some(Saving::Running(result)) = &tab.text_boxes.saving else { continue };
+            let result = match result.try_recv() {
+                Ok(result) => result,
+                Err(std::sync::mpsc::TryRecvError::Empty) => continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("The save stopped unexpectedly".into()),
+            };
+            match result {
+                Ok(()) => {
+                    tab.text_boxes.saving = None;
+                    tab.text_boxes.saved();
+                    let restore = match &tab.doc {
+                        DocState::Ready(layout) if tab.view.zoom > 0.0 => Some(tab.view.place(layout)),
+                        _ => tab.restore,
+                    };
+                    reopen(ctx, shared, tab, restore);
+                }
+                Err(e) => tab.text_boxes.saving = Some(Saving::Failed(e)),
+            }
+        }
+    }
+
+    /// A text field has the keyboard: the find bar, the recent-files palette, or a text box
+    /// being typed into.
+    fn typing(&self, ctx: &Context) -> bool {
+        self.quick_open.is_some()
+            || find_bar::focused(ctx, self.serial)
+            || self.active_tab().is_some_and(|t| t.text_boxes.typing())
     }
 
     /// Keyboard shortcuts. In the app, the menu bar receives the ⌘ shortcuts before egui
@@ -530,6 +579,7 @@ impl Window {
                 (cmd | alt, KeyCode::ArrowLeft, Command::PreviousTab),
                 (cmd | alt, KeyCode::ArrowRight, Command::NextTab),
                 (cmd, KeyCode::O, Command::Open),
+                (cmd, KeyCode::S, Command::Save),
                 (cmd, KeyCode::N, Command::NewWindow),
                 (cmd, KeyCode::K, Command::QuickOpen),
                 (cmd, KeyCode::W, Command::CloseTab),
@@ -563,7 +613,7 @@ impl Window {
             commands
         });
         // The palette's list and the text fields take the arrow and editing keys.
-        if self.quick_open.is_none() && !find_bar::focused(ctx, self.serial) {
+        if !self.typing(ctx) {
             self.view_shortcuts(ctx);
         }
         commands
@@ -572,14 +622,18 @@ impl Window {
     /// ⌘C copies the active tab's selection, ⌘A selects all its text and Escape clears the
     /// selection, unless a text field has the keys. Copied text goes on the clipboard here.
     fn selection_keys(&mut self, ctx: &Context) {
-        let typing = self.quick_open.is_some() || find_bar::focused(ctx, self.serial);
+        let typing = self.typing(ctx);
         let Some(tab) = self.tabs.get_mut(self.active) else { return };
         if !typing && let DocState::Ready(layout) = &tab.doc {
-            let (copy, all, escape) = ctx.input_mut(|i| {
+            let (copy, all, escape, undo, delete) = ctx.input_mut(|i| {
                 (
                     i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
                     i.consume_key(Modifiers::COMMAND, KeyCode::A),
                     i.consume_key(Modifiers::NONE, KeyCode::Escape),
+                    i.consume_key(Modifiers::COMMAND, KeyCode::Z),
+                    tab.text_boxes.selected.is_some()
+                        && (i.consume_key(Modifiers::NONE, KeyCode::Backspace)
+                            || i.consume_key(Modifiers::NONE, KeyCode::Delete)),
                 )
             });
             if all {
@@ -587,6 +641,13 @@ impl Window {
             }
             if escape {
                 tab.text.clear_selection();
+                tab.text_boxes.selected = None;
+            }
+            if undo {
+                tab.text_boxes.undo();
+            }
+            if delete && let Some(r) = tab.text_boxes.selected {
+                tab.text_boxes.delete(r);
             }
             if copy {
                 tab.text.copy(ctx);
@@ -649,7 +710,13 @@ impl Window {
             1 => format!("{}", spread.start + 1),
             _ => format!("{}–{}", spread.start + 1, spread.end),
         };
-        Some(format!("{pages} / {}   {:.0}%", layout.page_count(), tab.view.zoom * 100.0))
+        let edits = match &tab.text_boxes.saving {
+            Some(Saving::Running(_)) => "   Saving…".to_string(),
+            Some(Saving::Failed(e)) => format!("   Not saved: {e}"),
+            None if tab.text_boxes.unsaved() => "   Edited".to_string(),
+            None => String::new(),
+        };
+        Some(format!("{pages} / {}   {:.0}%{edits}", layout.page_count(), tab.view.zoom * 100.0))
     }
 
     /// Draws one frame of the window. `ctx` must be in this window's viewport.
@@ -684,11 +751,16 @@ impl Window {
         }
 
         let find_open = self.active_tab().is_some_and(|t| t.search.is_some());
-        if find_open && self.quick_open.is_none() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, KeyCode::Escape))
+        let typing_box = self.active_tab().is_some_and(|t| t.text_boxes.typing());
+        if find_open
+            && self.quick_open.is_none()
+            && !typing_box
+            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, KeyCode::Escape))
         {
             self.tabs[self.active].search = None;
         }
         self.selection_keys(ctx);
+        self.check_saves(ctx, shared);
         self.update_find(ctx);
 
         let palette = palette(ctx.style().visuals.dark_mode);
@@ -774,6 +846,8 @@ impl Window {
                             links: &tab.links,
                             search: tab.search.as_ref(),
                             text: &mut tab.text,
+                            text_boxes: &mut tab.text_boxes,
+                            rotations: &tab.rotations,
                             thumb_px: shared.thumb_px,
                             prefetch: shared.prefetch,
                             page_border: palette.page_border,
@@ -838,4 +912,33 @@ fn empty_state(ui: &mut egui::Ui, palette: &Palette, text: &str) {
         FontId::proportional(14.0),
         palette.text_weak,
     );
+}
+
+/// Reopens `tab`'s file as a new document, at `restore`: its tiles, links, outline positions
+/// and text layers go with the old one. The search starts over with the same text.
+fn reopen(ctx: &Context, shared: &mut Shared, tab: &mut Tab, restore: Option<history::Place>) {
+    shared.renderer.forget(tab.id);
+    shared.cache.evict_doc(tab.id);
+    shared.failed.retain(|k| k.doc() != tab.id);
+    tab.id = shared.next_id;
+    shared.next_id += 1;
+    shared.renderer.open(tab.id, tab.path.clone(), tab.rotations.clone());
+    tab.doc = DocState::Loading;
+    tab.restore = restore;
+    tab.snapshot = None;
+    tab.snapshot_texture = None;
+    tab.links.clear();
+    tab.text_boxes.clear_file();
+    tab.outline = None;
+    tab.outline_requested = false;
+    tab.text = TextLayers::new(tab.path.clone(), tab.rotations.clone());
+    if let Some(old) = tab.search.take() {
+        let start = restore.map_or(0, |p| p.page);
+        let store = shared.config.search_store();
+        let mut search = Search::new(ctx, tab.path.clone(), tab.rotations.clone(), old.page_count(), start, store);
+        search.query = old.query.clone();
+        search.focus = false;
+        search.edited(ctx.input(|i| i.time));
+        tab.search = Some(search);
+    }
 }

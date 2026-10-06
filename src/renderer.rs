@@ -22,6 +22,7 @@ use eframe::egui::{self, Color32, Rect, Vec2, vec2};
 use crate::engine::{self, Bitmap, Document, Page};
 use crate::grey;
 use crate::layout::Rotations;
+use crate::text_boxes::TextBox;
 
 pub type DocId = u64;
 
@@ -44,7 +45,7 @@ pub enum Key {
         page: u32,
         width: u32,
     },
-    /// The page's link annotations.
+    /// The page's link annotations and text boxes.
     Links {
         doc: DocId,
         page: u32,
@@ -143,6 +144,7 @@ pub enum Output {
         doc: DocId,
         page: u32,
         links: Vec<Link>,
+        text_boxes: Vec<TextBox>,
     },
     Outline {
         doc: DocId,
@@ -459,7 +461,9 @@ fn run(doc: &Document, doc_id: DocId, work: Work, out: &Delivery) {
             let mut keys = batch.into_iter().filter(|key| out.wanted(key)).peekable();
             while let Some(key) = keys.next() {
                 match key {
-                    Key::Links { doc: d, page: p } => out.send(Output::Links { doc: d, page: p, links: page.links() }),
+                    Key::Links { doc: d, page: p } => {
+                        out.send(Output::Links { doc: d, page: p, links: page.links(), text_boxes: page.text_boxes() })
+                    }
                     Key::Thumb { width, .. } => {
                         out.send(render_thumb(&page, key, width).unwrap_or(Output::Failed(key)))
                     }

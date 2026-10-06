@@ -3,10 +3,11 @@
 use eframe::egui::ahash::{HashMap, HashSet};
 use std::time::Duration;
 
+use eframe::egui::epaint::TextShape;
 use eframe::egui::scroll_area::ScrollSource;
 use eframe::egui::{
-    Button, Color32, CursorIcon, Pos2, Rect, Response, ScrollArea, Sense, Stroke, StrokeKind, TextureHandle, Ui, Vec2,
-    pos2, vec2,
+    Button, Color32, CursorIcon, Margin, Pos2, Rect, Response, ScrollArea, Sense, Stroke, StrokeKind, TextEdit,
+    TextureHandle, Ui, Vec2, pos2, vec2,
 };
 
 use crate::app::Command;
@@ -14,11 +15,12 @@ use crate::cache::TextureCache;
 use crate::find_bar;
 use crate::grey;
 use crate::history::Place;
-use crate::layout::{DocLayout, MARGIN, PageLayout};
+use crate::layout::{DocLayout, MARGIN, PageLayout, Rotation, Rotations};
 use crate::renderer::{DocId, Key, Link, SnapshotJob, SnapshotPage, TILE, Target, page_pixels, scale_key};
 use crate::search::Search;
 use crate::selection::Unit;
 use crate::tab::View;
+use crate::text_boxes::{self, BoxRef, PAD, TextBox, TextBoxes, turn, unturn};
 use crate::text_layers::{MIN_LAYER_HEIGHT, TextLayers};
 
 pub const MIN_ZOOM: f32 = 0.1;
@@ -201,6 +203,9 @@ pub struct Canvas<'a> {
     pub search: Option<&'a Search>,
     /// Text layers and the selection, which the pointer selects with.
     pub text: &'a mut TextLayers,
+    pub text_boxes: &'a mut TextBoxes,
+    /// How the reader has turned the pages, which the text boxes turn with.
+    pub rotations: &'a Rotations,
     /// Width of the sidebar's thumbnails, drawn as placeholders until tiles arrive.
     pub thumb_px: u32,
     /// Screen heights rendered ahead, above and below the visible area.
@@ -220,8 +225,22 @@ pub struct CanvasOutput {
 
 impl Canvas<'_> {
     pub fn show(self, ui: &mut Ui, wants: &mut Wants) -> CanvasOutput {
-        let Canvas { doc, layout, view, snapshot, cache, failed, links, search, text, thumb_px, prefetch, page_border } =
-            self;
+        let Canvas {
+            doc,
+            layout,
+            view,
+            snapshot,
+            cache,
+            failed,
+            links,
+            search,
+            text,
+            text_boxes,
+            rotations,
+            thumb_px,
+            prefetch,
+            page_border,
+        } = self;
         let ppp = ui.ctx().pixels_per_point();
         let now = ui.input(|i| i.time);
         let area = ui.available_rect_before_wrap();
@@ -359,7 +378,7 @@ impl Canvas<'_> {
             }
 
             select(ui, &pointer, text, view, &page_rects, over_link, screen_viewport);
-            let command = page_menu(ui, &pointer, &page_rects, layout.page_count(), text);
+            let command = page_menu(ui, &pointer, &page_rects, layout.page_count(), text, text_boxes, rotations);
             // Over the tiles: the selection, then every match on screen, the current one stronger.
             if let Some(selection) = text.selection() {
                 for &(page, rect) in &visible_pages {
@@ -390,6 +409,9 @@ impl Canvas<'_> {
                     }
                 }
             }
+
+            let zooming = view.zoom != view.render_zoom;
+            show_text_boxes(ui, &pointer, text_boxes, &visible_pages, layout, rotations, doc, zooming);
 
             (
                 all_visible_ready,
@@ -430,18 +452,32 @@ fn page_menu(
     pages: &[(u32, Rect)],
     page_count: usize,
     text: &mut TextLayers,
+    text_boxes: &mut TextBoxes,
+    rotations: &Rotations,
 ) -> Option<Command> {
-    // The page clicked, kept while its menu is open.
+    // The page clicked and where on it (fractions of the page as shown), kept while its menu
+    // is open.
     let key = pointer.id.with("menu_page");
     if pointer.secondary_clicked()
         && let Some(p) = pointer.interact_pointer_pos()
     {
         let nearest = pages.iter().min_by(|a, b| a.1.distance_sq_to_pos(p).total_cmp(&b.1.distance_sq_to_pos(p)));
-        ui.data_mut(|d| d.insert_temp(key, nearest.map(|&(page, _)| page)));
+        let at = nearest.map(|&(page, rect)| (page, ((p - rect.min) / rect.size()).to_pos2()));
+        ui.data_mut(|d| d.insert_temp(key, at));
     }
-    let clicked = ui.data(|d| d.get_temp::<Option<u32>>(key)).flatten();
+    let clicked = ui.data(|d| d.get_temp::<Option<(u32, Pos2)>>(key)).flatten();
     let mut command = None;
     pointer.context_menu(|ui| {
+        // Only once the page's own boxes are read, which a new one is added to.
+        let can_add = clicked.filter(|&(page, at)| {
+            text_boxes.page(page).is_some() && Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)).contains(at)
+        });
+        if ui.add_enabled(can_add.is_some(), Button::new("Add Text")).clicked()
+            && let Some((page, at)) = can_add
+        {
+            text_boxes.add(page, unturn(at, rotations.of(page)));
+        }
+        ui.separator();
         if ui.add_enabled(text.selection().is_some(), Button::new("Copy").shortcut_text("⌘C")).clicked() {
             text.copy(ui.ctx());
         }
@@ -451,7 +487,7 @@ fn page_menu(
                 command = Some(chosen);
             }
         };
-        match clicked.filter(|_| page_count > 1) {
+        match clicked.map(|(page, _)| page).filter(|_| page_count > 1) {
             Some(page) => {
                 let page = page as usize;
                 item(ui, "Rotate This Page Left", "", Command::RotatePage { page, clockwise: false });
@@ -467,6 +503,262 @@ fn page_menu(
         }
     });
     command
+}
+
+/// What was done to a text box this frame, applied once they're all drawn.
+enum BoxAction {
+    Select(BoxRef),
+    Edit(BoxRef),
+    Drag(BoxRef, Vec2),
+    Drop(BoxRef),
+    Size(BoxRef, f32),
+    Color(BoxRef, [u8; 3]),
+    Delete(BoxRef),
+    /// Typing ended.
+    Finish,
+    /// Typing ended, throwing the box away.
+    Discard,
+}
+
+/// Where typing into a box stands after a frame.
+enum Typing {
+    Going,
+    Done,
+    Discard,
+}
+
+/// Draws the text boxes of the pages on screen and takes the pointer's part in editing them:
+/// a click selects a box, dragging moves it, a double click types into it, and its right-click
+/// menu sizes, colours and deletes it. A click elsewhere ends typing. `pages` are the pages
+/// on screen, with their screen rects. While `zooming`, text is drawn at a rounded size (see
+/// [`text_boxes::glyph_scale`]).
+#[allow(clippy::too_many_arguments)]
+fn show_text_boxes(
+    ui: &mut Ui,
+    pointer: &Response,
+    boxes: &mut TextBoxes,
+    pages: &[(u32, Rect)],
+    layout: &DocLayout,
+    rotations: &Rotations,
+    doc: DocId,
+    zooming: bool,
+) {
+    let ctx = ui.ctx().clone();
+    if pointer.clicked() || pointer.drag_started() || pointer.secondary_clicked() {
+        boxes.finish_editing();
+        boxes.selected = None;
+    }
+    let accent = ui.visuals().selection.stroke.color;
+    let mut actions = Vec::new();
+    for &(page, rect) in pages {
+        let Some(list) = boxes.page(page).map(<[TextBox]>::to_vec) else { continue };
+        let rotation = rotations.of(page);
+        let shown = layout.page_size(page as usize);
+        let upright = if rotation.degrees() % 180 == 90 { vec2(shown.y, shown.x) } else { shown };
+        let scale = rect.width() / shown.x;
+        let typing_into = boxes.editing.as_ref().filter(|e| e.page == page).map(|e| e.index);
+        for (index, b) in list.iter().enumerate() {
+            if typing_into == Some(Some(index)) {
+                continue;
+            }
+            let r = BoxRef { page, index };
+            let offset = boxes.dragging.filter(|(d, _)| *d == r).map_or(Vec2::ZERO, |(_, o)| o);
+            let glyphs = text_boxes::glyph_scale(scale, zooming);
+            let galley = b.galley(&ctx, &b.text, glyphs);
+            let size = b.size_around(&galley, glyphs) * scale;
+            let (anchor, area) = placed(rect, rotation, b.at() + offset, size);
+            let angle = (rotation.degrees() as f32).to_radians();
+            let text_at = anchor + turn_vec(vec2(PAD, PAD) * scale, rotation);
+            ui.painter().add(TextShape::new(text_at, galley, b.color32()).with_angle(angle));
+
+            let response = ui
+                .interact(area, ui.id().with(("text box", doc, page, index)), Sense::click_and_drag())
+                .on_hover_cursor(CursorIcon::Grab);
+            if boxes.selected == Some(r) {
+                ui.painter().rect_stroke(area, 0.0, Stroke::new(1.5, accent), StrokeKind::Outside);
+            } else if response.hovered() {
+                ui.painter().rect_stroke(area, 0.0, Stroke::new(1.0, accent.gamma_multiply(0.5)), StrokeKind::Outside);
+            }
+            if response.double_clicked() {
+                actions.push(BoxAction::Edit(r));
+            } else if response.clicked() || response.drag_started() || response.secondary_clicked() {
+                actions.push(BoxAction::Select(r));
+            }
+            if response.dragged() {
+                ctx.set_cursor_icon(CursorIcon::Grabbing);
+                let delta = unturn_vec(response.drag_delta(), rotation) / (upright * scale);
+                actions.push(BoxAction::Drag(r, delta));
+            }
+            if response.drag_stopped() {
+                actions.push(BoxAction::Drop(r));
+            }
+            response.context_menu(|ui| {
+                if ui.button("Edit Text").clicked() {
+                    actions.push(BoxAction::Edit(r));
+                }
+                ui.menu_button("Size", |ui| {
+                    for size in text_boxes::SIZES {
+                        if ui.radio(b.size == size, format!("{size} pt")).clicked() {
+                            actions.push(BoxAction::Size(r, size));
+                        }
+                    }
+                });
+                ui.menu_button("Colour", |ui| {
+                    for (name, color) in text_boxes::COLORS {
+                        if ui.radio(b.color == color, name).clicked() {
+                            actions.push(BoxAction::Color(r, color));
+                        }
+                    }
+                });
+                ui.separator();
+                if ui.button("Delete").clicked() {
+                    actions.push(BoxAction::Delete(r));
+                }
+            });
+        }
+        if let Some(editing) = boxes.editing.as_mut().filter(|e| e.page == page) {
+            let existing = editing.index.and_then(|i| list.get(i));
+            match type_into(ui, editing, existing, rect, rotation, scale, accent, doc) {
+                Typing::Going => {}
+                Typing::Done => actions.push(BoxAction::Finish),
+                Typing::Discard => actions.push(BoxAction::Discard),
+            }
+        }
+    }
+    for action in actions {
+        match action {
+            BoxAction::Select(r) => {
+                boxes.finish_editing();
+                boxes.selected = Some(r);
+            }
+            BoxAction::Edit(r) => boxes.edit(r),
+            BoxAction::Drag(r, delta) => {
+                let so_far = boxes.dragging.filter(|(d, _)| *d == r).map_or(Vec2::ZERO, |(_, o)| o);
+                boxes.dragging = Some((r, so_far + delta));
+            }
+            BoxAction::Drop(r) => {
+                if let Some((_, offset)) = boxes.dragging.take().filter(|(d, _)| *d == r)
+                    && offset != Vec2::ZERO
+                {
+                    boxes.change_box(r, |b| {
+                        let at = (b.at() + offset).clamp(Pos2::ZERO, pos2(1.0, 1.0));
+                        b.at = [at.x, at.y];
+                    });
+                }
+            }
+            BoxAction::Size(r, size) => boxes.change_box(r, |b| b.size = size),
+            BoxAction::Color(r, color) => boxes.change_box(r, |b| b.color = color),
+            BoxAction::Delete(r) => boxes.delete(r),
+            BoxAction::Finish => boxes.finish_editing(),
+            BoxAction::Discard => boxes.discard_editing(),
+        }
+    }
+}
+
+/// The text field a box's text is typed into, in place of the box. Upright even on a turned
+/// page, so typing reads normally. Its right-click menu sizes and colours the box, or ends
+/// typing. Typing also ends once the field loses the keyboard (Escape, or a click elsewhere).
+#[allow(clippy::too_many_arguments)]
+fn type_into(
+    ui: &mut Ui,
+    editing: &mut text_boxes::Editing,
+    existing: Option<&TextBox>,
+    page_rect: Rect,
+    rotation: Rotation,
+    scale: f32,
+    accent: Color32,
+    doc: DocId,
+) -> Typing {
+    let ctx = ui.ctx().clone();
+    let b = TextBox {
+        size: editing.size,
+        color: editing.color,
+        ..existing.cloned().unwrap_or_else(|| TextBox::new(editing.at, String::new()))
+    };
+    let galley = b.galley(&ctx, &editing.draft, scale);
+    // Room for the next letter, so the field grows ahead of the typing.
+    let size = (b.size_around(&galley, scale) + vec2(if b.width.is_some() { 0.0 } else { b.size }, 0.0)) * scale;
+    let anchor = page_rect.min + turn(b.at(), rotation).to_vec2() * page_rect.size();
+    let area = Rect::from_min_size(anchor, size);
+    let pad = (PAD * scale).round().clamp(0.0, 127.0) as i8;
+    let field = TextEdit::multiline(&mut editing.draft)
+        .id(ui.id().with(("typing", doc, editing.page)))
+        .font(b.font(&ctx, scale))
+        .text_color(b.color32())
+        .frame(false)
+        .margin(Margin::same(pad))
+        .desired_width(size.x - 2.0 * pad as f32)
+        .desired_rows(1);
+    ui.painter().rect_filled(area, 0.0, Color32::from_white_alpha(140));
+    let response = ui.put(area, field);
+    ui.painter().rect_stroke(area, 0.0, Stroke::new(1.5, accent), StrokeKind::Outside);
+    let mut outcome = None;
+    let menu = response.context_menu(|ui| {
+        ui.menu_button("Size", |ui| {
+            for size in text_boxes::SIZES {
+                if ui.radio(editing.size == size, format!("{size} pt")).clicked() {
+                    editing.size = size;
+                }
+            }
+        });
+        ui.menu_button("Colour", |ui| {
+            for (name, color) in text_boxes::COLORS {
+                if ui.radio(editing.color == color, name).clicked() {
+                    editing.color = color;
+                }
+            }
+        });
+        ui.separator();
+        if ui.button("Delete").clicked() {
+            outcome = Some(Typing::Discard);
+        }
+        if ui.button("Done").clicked() {
+            outcome = Some(Typing::Done);
+        }
+    });
+    if let Some(outcome) = outcome {
+        return outcome;
+    }
+    if menu.is_some() {
+        // The menu has the pointer, not the keyboard: typing goes on once it closes.
+        editing.focus = true;
+        return Typing::Going;
+    }
+    if editing.focus {
+        response.request_focus();
+        editing.focus = false;
+        return Typing::Going;
+    }
+    if response.has_focus() { Typing::Going } else { Typing::Done }
+}
+
+/// A box of `size` (screen points, upright) with its top-left corner at `at` (fractions of
+/// the page upright), on a page shown in `page_rect` turned by `rotation`: the screen point
+/// its top-left corner lands on, and the screen area it covers.
+fn placed(page_rect: Rect, rotation: Rotation, at: Pos2, size: Vec2) -> (Pos2, Rect) {
+    let anchor = page_rect.min + turn(at, rotation).to_vec2() * page_rect.size();
+    let far = anchor + turn_vec(size, rotation);
+    (anchor, Rect::from_two_pos(anchor, far))
+}
+
+/// The inverse of [`turn_vec`].
+fn unturn_vec(v: Vec2, rotation: Rotation) -> Vec2 {
+    match rotation.degrees() {
+        90 => vec2(v.y, -v.x),
+        180 => -v,
+        270 => vec2(-v.y, v.x),
+        _ => v,
+    }
+}
+
+/// `v` turned by `rotation`, clockwise on screen.
+fn turn_vec(v: Vec2, rotation: Rotation) -> Vec2 {
+    match rotation.degrees() {
+        90 => vec2(-v.y, v.x),
+        180 => -v,
+        270 => vec2(v.y, -v.x),
+        _ => v,
+    }
 }
 
 /// Takes the pointer's part in selecting text: asks for the layer of a page it moves over,

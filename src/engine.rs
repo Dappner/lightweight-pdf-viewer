@@ -5,9 +5,9 @@
 #[cfg(target_os = "macos")]
 mod coregraphics;
 #[cfg(target_os = "macos")]
-pub use coregraphics::{Bitmap, Document, Page, TextDocument, TextPage, autoreleasepool};
+pub use coregraphics::{Bitmap, Document, Page, TextDocument, TextPage, autoreleasepool, save_text_boxes};
 
 #[cfg(not(target_os = "macos"))]
 mod synthetic;
 #[cfg(not(target_os = "macos"))]
-pub use synthetic::{Bitmap, Document, Page, TextDocument, TextPage, autoreleasepool};
+pub use synthetic::{Bitmap, Document, Page, TextDocument, TextPage, autoreleasepool, save_text_boxes};

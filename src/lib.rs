@@ -24,6 +24,7 @@ mod sidebar;
 mod tab;
 mod tab_bar;
 mod text;
+mod text_boxes;
 mod text_layers;
 mod theme;
 #[cfg(target_os = "macos")]
