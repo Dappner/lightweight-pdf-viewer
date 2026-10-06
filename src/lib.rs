@@ -20,6 +20,7 @@ mod renderer;
 pub mod search;
 pub mod search_index;
 mod selection;
+mod settings;
 mod sidebar;
 mod tab;
 mod tab_bar;

@@ -71,6 +71,74 @@ impl Memory {
     }
 }
 
+/// Where the process's memory goes, in bytes, as macOS counts it.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Usage {
+    /// The whole footprint, the "Memory" column in Activity Monitor. On Apple Silicon it
+    /// includes GPU memory, which is system memory.
+    pub footprint: u64,
+    /// Memory allocated with `malloc`: CoreGraphics' parsed pages and fonts, text, egui.
+    pub heap: u64,
+    /// Memory the graphics driver allocated for the app: textures and buffers.
+    pub graphics: u64,
+}
+
+#[cfg(target_os = "macos")]
+pub fn usage() -> Option<Usage> {
+    // SAFETY: each call fills a struct of the kind it is given, of the size it is told.
+    unsafe {
+        let mut vm: TaskVmInfo = std::mem::zeroed();
+        let mut count = (size_of::<TaskVmInfo>() / size_of::<libc::natural_t>()) as libc::mach_msg_type_number_t;
+        let ok = libc::task_info(mach_task_self_, TASK_VM_INFO, &mut vm as *mut _ as libc::task_info_t, &mut count);
+        if ok != libc::KERN_SUCCESS {
+            return None;
+        }
+        let mut heap: libc::malloc_statistics_t = std::mem::zeroed();
+        // A null zone sums every zone.
+        libc::malloc_zone_statistics(std::ptr::null_mut(), &mut heap);
+        Some(Usage {
+            footprint: vm.phys_footprint,
+            heap: heap.size_in_use as u64,
+            graphics: vm.ledger_tag_graphics_footprint.max(0) as u64,
+        })
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn usage() -> Option<Usage> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+const TASK_VM_INFO: libc::task_flavor_t = 22;
+
+// The port for this process, which `mach_task_self()` returns in C. libc's binding is
+// deprecated in favour of the `mach2` crate, which is a lot of crate for one static.
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    static mach_task_self_: libc::mach_port_t;
+}
+
+/// `task_vm_info` from `<mach/task_info.h>` up to its revision 3 fields; `task_info` fills
+/// only as much as it is told is there.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct TaskVmInfo {
+    virtual_size: u64,
+    region_count: i32,
+    page_size: i32,
+    /// `resident_size` to `compressed_lifetime`.
+    sizes: [u64; 16],
+    phys_footprint: u64,
+    min_address: u64,
+    max_address: u64,
+    /// `ledger_phys_footprint_peak` to `ledger_tag_media_nofootprint_compressed`.
+    ledgers: [i64; 13],
+    ledger_tag_graphics_footprint: i64,
+    /// `ledger_tag_graphics_footprint_compressed` to `ledger_tag_neural_nofootprint_compressed`.
+    more_ledgers: [i64; 7],
+}
+
 const SPACE_EFFICIENT: &str = "MallocSpaceEfficient";
 
 /// Restarts the process if `MallocSpaceEfficient=1` is not set as the preset wants. Without

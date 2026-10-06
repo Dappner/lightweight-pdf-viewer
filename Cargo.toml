@@ -22,6 +22,8 @@ serde_json = "1.0.151"
 # The PDF engine (CoreGraphics, PDFKit) and the native menu bar, Finder and file dialog glue.
 # Elsewhere the crate still builds, so the portable core can be tested and benchmarked.
 [target.'cfg(target_os = "macos")'.dependencies]
+# The process footprint shown in Settings.
+libc = "0.2.189"
 block2 = { version = "0.6.2", default-features = false, features = ["std"] }
 objc2 = { version = "0.6.4", default-features = false, features = ["std"] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSCell", "NSMenu", "NSMenuItem", "NSApplication", "NSResponder", "NSEvent", "NSFont", "NSColor", "objc2-core-foundation"] }

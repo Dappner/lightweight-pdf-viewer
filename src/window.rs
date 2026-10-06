@@ -19,6 +19,7 @@ use crate::layout::PageLayout;
 use crate::quick_open::{Outcome, QuickOpen};
 use crate::renderer::{DocId, Key, Renderer, Snapshot, Target};
 use crate::search::{Anchor, Search};
+use crate::settings::{self, Settings};
 use crate::sidebar::{self, Mode as SidebarMode};
 use crate::tab::{DocState, Tab};
 use crate::tab_bar::{self, Action};
@@ -40,6 +41,10 @@ pub struct Shared {
     pub cache: TextureCache,
     /// Screen heights rendered ahead of the visible area (see [`crate::memory::Tuning`]).
     pub prefetch: f32,
+    /// The memory preset the app launched with.
+    pub launched: crate::memory::Memory,
+    /// What the windows' screen buffers take, estimated from their sizes.
+    pub window_buffers: u64,
     pub failed: HashSet<Key>,
     pub config: Config,
     pub history: History,
@@ -93,6 +98,8 @@ pub struct Window {
     pub active: usize,
     /// The ⌘K recent-files palette, while it is open.
     quick_open: Option<QuickOpen>,
+    /// The ⌘, settings, while they are open.
+    settings: Option<Settings>,
     sidebar: bool,
     sidebar_mode: SidebarMode,
     pub tab_scroll: f32,
@@ -115,6 +122,7 @@ impl Window {
             tabs: Vec::new(),
             active: 0,
             quick_open: None,
+            settings: None,
             sidebar: true,
             sidebar_mode: SidebarMode::Pages,
             tab_scroll: 0.0,
@@ -274,7 +282,17 @@ impl Window {
     pub fn run(&mut self, ctx: &Context, shared: &mut Shared, command: Command) {
         let n = self.tabs.len();
         match command {
-            Command::QuickOpen => self.toggle_quick_open(shared),
+            Command::QuickOpen => {
+                self.settings = None;
+                self.toggle_quick_open(shared);
+            }
+            Command::Settings => {
+                self.quick_open = None;
+                self.settings = match self.settings {
+                    Some(_) => None,
+                    None => Some(Settings::default()),
+                };
+            }
             Command::CloseTab if n > 0 => self.close(ctx, shared, self.active),
             Command::NextTab if n > 0 => self.activate(ctx, shared, (self.active + 1) % n),
             Command::PreviousTab if n > 0 => self.activate(ctx, shared, (self.active + n - 1) % n),
@@ -544,12 +562,16 @@ impl Window {
         }
     }
 
-    /// A text field has the keyboard: the find bar, the recent-files palette, or a text box
-    /// being typed into.
+    /// A text field or a modal has the keyboard: the find bar, the recent-files palette, the
+    /// settings, or a text box being typed into.
     fn typing(&self, ctx: &Context) -> bool {
-        self.quick_open.is_some()
+        self.modal_open()
             || find_bar::focused(ctx, self.serial)
             || self.active_tab().is_some_and(|t| t.text_boxes.typing())
+    }
+
+    fn modal_open(&self) -> bool {
+        self.quick_open.is_some() || self.settings.is_some()
     }
 
     /// Keyboard shortcuts. In the app, the menu bar receives the ⌘ shortcuts before egui
@@ -585,6 +607,7 @@ impl Window {
                 (cmd, KeyCode::S, Command::Save),
                 (cmd, KeyCode::N, Command::NewWindow),
                 (cmd, KeyCode::K, Command::QuickOpen),
+                (cmd, KeyCode::Comma, Command::Settings),
                 (cmd, KeyCode::W, Command::CloseTab),
                 (cmd | alt, KeyCode::B, Command::ToggleOutline),
                 (cmd, KeyCode::B, Command::ToggleSidebar),
@@ -758,7 +781,7 @@ impl Window {
         let find_open = self.active_tab().is_some_and(|t| t.search.is_some());
         let typing_box = self.active_tab().is_some_and(|t| t.text_boxes.typing());
         if find_open
-            && self.quick_open.is_none()
+            && !self.modal_open()
             && !typing_box
             && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, KeyCode::Escape))
         {
@@ -884,7 +907,7 @@ impl Window {
             self.run(ctx, shared, command);
         }
 
-        if self.quick_open.is_none()
+        if !self.modal_open()
             && let Some(tab) = self.tabs.get_mut(self.active)
             && let Some(search) = &mut tab.search
         {
@@ -904,6 +927,22 @@ impl Window {
             self.quick_open = None;
             if let Outcome::Open(path) = outcome {
                 requests.push(Request::Open(vec![path]));
+            }
+        }
+
+        let status = settings::Status {
+            config: &shared.config,
+            launched: shared.launched,
+            window_buffers: shared.window_buffers,
+            texture_bytes: shared.cache.bytes(),
+            texture_budget: shared.cache.budget(),
+        };
+        if let Some(settings) = &mut self.settings
+            && let Some(outcome) = settings.show(ctx, &palette, &status)
+        {
+            match outcome {
+                settings::Outcome::Run(command) => requests.push(Request::Run(command)),
+                settings::Outcome::Dismiss => self.settings = None,
             }
         }
         requests

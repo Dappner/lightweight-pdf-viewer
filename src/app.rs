@@ -20,8 +20,10 @@ use crate::finder;
 use crate::grey::{GreyTexture, Texture};
 use crate::history::{self, History};
 use crate::layout::{DocLayout, PageLayout};
+use crate::memory::Memory;
 use crate::menu;
 use crate::renderer::{DocId, Key, Output, Pixels, Renderer};
+use crate::search_index::Limits;
 use crate::sidebar::{self, Mode as SidebarMode};
 use crate::tab::DocState;
 use crate::tab_bar;
@@ -31,6 +33,9 @@ use crate::window::{Request, Shared, Window, snapshot_texture};
 const DEFAULT_SIZE: Vec2 = vec2(960.0, 1080.0);
 /// How far a new window is offset from the one it was opened from.
 const CASCADE: Vec2 = vec2(28.0, 28.0);
+/// Screen buffers each window keeps (see `desired_maximum_frame_latency` in `main.rs`), each
+/// the window's size in pixels at 4 bytes a pixel. `footprint` counts them as IOSurface.
+const WINDOW_BUFFERS: f32 = 2.0;
 
 /// The app, shared with the other windows' frame callbacks.
 pub struct App {
@@ -111,6 +116,11 @@ pub enum Command {
     FindPrevious,
     /// Deletes the page text searches saved to disk.
     ClearSearchCache,
+    /// Shows or hides the settings.
+    Settings,
+    SetMemory(Memory),
+    SetRestoreTabs(bool),
+    SetSearchCache(Limits),
     Quit,
 }
 
@@ -241,6 +251,8 @@ impl State {
                 renderer: Renderer::spawn(ctx.clone(), tuning.render_threads, tuning.pages_per_open),
                 cache: TextureCache::new(tuning.texture_budget),
                 prefetch: tuning.prefetch,
+                launched: config.memory,
+                window_buffers: 0,
                 failed: HashSet::default(),
                 thumb_px: sidebar::thumb_width_px(config.sidebar_width, ctx.pixels_per_point()),
                 config,
@@ -657,6 +669,24 @@ impl State {
                     store.clear();
                 }
             }
+            // What a preset sets in the render threads and the allocator waits for a relaunch.
+            Command::SetMemory(memory) => {
+                let tuning = memory.tuning();
+                self.texture_budget = tuning.texture_budget;
+                self.sleep_after = tuning.sleep_after;
+                self.shared.prefetch = tuning.prefetch;
+                self.shared.config.memory = memory;
+                self.shared.config.save();
+            }
+            Command::SetRestoreTabs(restore) => {
+                self.shared.config.restore_tabs = restore;
+                self.shared.config.save();
+            }
+            // Searches already open keep the limits they started with.
+            Command::SetSearchCache(limits) => {
+                self.shared.config.search_cache = limits;
+                self.shared.config.save();
+            }
             Command::Quit => {
                 self.quitting = true;
                 ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::Close);
@@ -774,6 +804,14 @@ impl State {
             self.close_window(ctx, 0);
         }
         let Some(w) = self.index_of(serial) else { return };
+
+        let ppp = ctx.pixels_per_point();
+        self.shared.window_buffers = self
+            .windows
+            .iter()
+            .filter_map(|w| w.inner_rect)
+            .map(|r| (r.area() * ppp * ppp * 4.0 * WINDOW_BUFFERS) as u64)
+            .sum();
 
         let mut wants = Wants::default();
         let requests = self.windows[w].ui(ctx, &mut self.shared, &mut wants);
@@ -940,6 +978,19 @@ mod tests {
         state.shared.failed.insert(tile(doc));
         state.windows[0].activate(&ctx, &mut state.shared, 0);
         assert!(!state.shared.failed.contains(&tile(doc)));
+    }
+
+    #[test]
+    fn memory_preset_applies_without_a_relaunch() {
+        let (ctx, mut state, _) = app();
+        state.run(&ctx, 0, Command::SetMemory(Memory::Low));
+        let low = Memory::Low.tuning();
+        assert_eq!(state.shared.config.memory, Memory::Low);
+        assert_eq!(state.texture_budget, low.texture_budget);
+        assert_eq!(state.sleep_after, low.sleep_after);
+        assert_eq!(state.shared.prefetch, low.prefetch);
+        state.request_renders();
+        assert_eq!(state.shared.cache.budget(), low.texture_budget);
     }
 
     #[test]

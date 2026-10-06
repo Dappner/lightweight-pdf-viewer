@@ -99,6 +99,8 @@ pub fn install(ctx: &egui::Context) {
             vec![
                 System("About Lightweight PDF", sel!(orderFrontStandardAboutPanel:), "", none),
                 Separator,
+                Item("Settings…", Command::Settings, ",", cmd),
+                Separator,
                 System("Hide Lightweight PDF", sel!(hide:), "h", cmd),
                 System("Hide Others", sel!(hideOtherApplications:), "h", cmd_option),
                 System("Show All", sel!(unhideAllApplications:), "", none),

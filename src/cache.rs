@@ -55,6 +55,10 @@ impl TextureCache {
         self.budget = budget;
     }
 
+    pub fn budget(&self) -> usize {
+        self.budget
+    }
+
     /// Returns the texture and marks it as shown by the window drawing now.
     pub fn get(&mut self, key: &Key) -> Option<Image> {
         let entry = self.entries.get_mut(key)?;
