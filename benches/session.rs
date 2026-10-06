@@ -43,6 +43,8 @@ use lightweight_pdf_viewer::memory::{self, Memory};
 use lightweight_pdf_viewer::search::CACHE_BUDGET;
 
 const TIMEOUT: Duration = Duration::from_secs(20);
+/// Scrolling steps slower than this to sharpen are reported one by one.
+const SLOW_STEP: Duration = Duration::from_millis(250);
 /// Seconds a tab left behind keeps its tiles and search (the app's `PARK_SECONDS`), plus a
 /// margin.
 const GRACE: Duration = Duration::from_millis(3500);
@@ -455,35 +457,15 @@ fn main() {
     }
 
     println!("\nscrolling the active document page by page");
-    h.press(Key::Home, Modifiers::NONE);
-    h.wait(|s| s.ready);
-    h.begin_phase();
-    let mut steps = Vec::new();
-    let mut peak = 0;
-    // Pages taller than the viewport take several steps; stop if the page stops advancing.
-    let (mut last, mut stuck) = (usize::MAX, 0);
-    for _ in 0..rounds.scroll.min(5000) {
-        let s = h.stats();
-        stuck = if s.current_page == last { stuck + 1 } else { 0 };
-        if s.current_page + 1 >= s.page_count || stuck > 8 {
-            break;
-        }
-        last = s.current_page;
-        h.press(Key::PageDown, Modifiers::NONE);
-        let t = Instant::now();
-        h.wait(|s| s.ready);
-        steps.push(t.elapsed());
-        peak = peak.max(h.stats().texture_bytes);
-    }
-    println!(
-        "  {} steps, to sharp {}   peak textures {:.1} MB   footprint {:.1} MB",
-        steps.len(),
-        summary(steps),
-        mb(peak),
-        footprint_mb()
-    );
-    h.end_phase();
+    scroll_through(&mut h, &rounds);
     breakdown("after scrolling");
+
+    // Every visible page's text is read to highlight it: the cost of a selection on screen.
+    println!("\nscrolling page by page with everything selected (⌘A)");
+    h.press(Key::A, Modifiers::COMMAND);
+    scroll_through(&mut h, &rounds);
+    h.press(Key::Escape, Modifiers::NONE);
+    h.frame();
 
     println!("\nzoom (includes the 150 ms settle delay before re-rendering)");
     h.begin_phase();
@@ -527,6 +509,54 @@ fn main() {
     if h.timeouts > 0 || !h.failures.is_empty() {
         std::process::exit(1);
     }
+}
+
+/// Scrolls the active document from the top, a page at a time, waiting for each step to be
+/// sharp, as one phase.
+fn scroll_through(h: &mut Harness, rounds: &Rounds) {
+    h.press(Key::Home, Modifiers::NONE);
+    h.wait(|s| s.ready);
+    h.begin_phase();
+    let phase = Instant::now();
+    let mut steps = Vec::new();
+    let (mut peak, mut peak_text) = (0, 0);
+    // Pages taller than the viewport take several steps; stop if the page stops advancing.
+    let (mut last, mut stuck) = (usize::MAX, 0);
+    for _ in 0..rounds.scroll.min(5000) {
+        let s = h.stats();
+        stuck = if s.current_page == last { stuck + 1 } else { 0 };
+        if s.current_page + 1 >= s.page_count || stuck > 8 {
+            break;
+        }
+        last = s.current_page;
+        h.press(Key::PageDown, Modifiers::NONE);
+        let t = Instant::now();
+        h.wait(|s| s.ready);
+        let took = t.elapsed();
+        if took > SLOW_STEP {
+            println!(
+                "    slow step {}: page {last} -> {}, {} ms, {:.1} s into the phase, {} rendered so far",
+                steps.len(),
+                h.stats().current_page,
+                ms(Some(took)),
+                phase.elapsed().as_secs_f64(),
+                h.stats().rendered - h.phase_renders.0,
+            );
+        }
+        steps.push(took);
+        let s = h.stats();
+        peak = peak.max(s.texture_bytes);
+        peak_text = peak_text.max(s.text_bytes);
+    }
+    println!(
+        "  {} steps, to sharp {}   peak textures {:.1} MB   peak text layers {:.2} MB   footprint {:.1} MB",
+        steps.len(),
+        summary(steps),
+        mb(peak),
+        mb(peak_text),
+        footprint_mb()
+    );
+    h.end_phase();
 }
 
 /// Searches every tab for "the", then checks that only the active tab's search keeps a worker

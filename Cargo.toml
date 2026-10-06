@@ -56,3 +56,7 @@ harness = false
 [[bench]]
 name = "render_spike"
 harness = false
+
+[[bench]]
+name = "text_spike"
+harness = false
