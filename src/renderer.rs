@@ -232,6 +232,17 @@ struct Queue {
     open_limit: usize,
 }
 
+impl Queue {
+    /// Queues `job`, dropping a snapshot of the same tab still waiting: only the latest is of
+    /// use. Snapshots go before tiles, so flipping quickly between tabs would otherwise pile
+    /// up one per switch, each a full viewport render, and hold back the tiles of the tab
+    /// shown (a second of them after 40 flips between two dense documents).
+    fn queue_snapshot(&mut self, job: SnapshotJob) {
+        self.control.retain(|c| !matches!(c, Control::Snapshot(queued) if queued.doc == job.doc));
+        self.control.push_back(Control::Snapshot(job));
+    }
+}
+
 pub struct Renderer {
     shared: Arc<(Mutex<Queue>, Condvar)>,
 }
@@ -288,8 +299,9 @@ impl Renderer {
         });
     }
 
+    /// Renders a snapshot of a tab's viewport, replacing one of the same tab still queued.
     pub fn snapshot(&self, job: SnapshotJob) {
-        self.with_queue(|q| q.control.push_back(Control::Snapshot(job)));
+        self.with_queue(|q| q.queue_snapshot(job));
     }
 
     /// Reads the document outline. Resolving entries to pages parses those pages, so this is
@@ -549,6 +561,30 @@ mod tests {
         let mut enc = png::Encoder::new(std::fs::File::create(path).unwrap(), w, h);
         enc.set_color(png::ColorType::Rgba);
         enc.write_header().unwrap().write_image_data(rgba).unwrap();
+    }
+
+    #[test]
+    fn a_tab_has_at_most_one_snapshot_queued() {
+        let job = |doc| SnapshotJob { doc, size: [1, 1], pages: vec![] };
+        let mut q = Queue::default();
+        q.control.push_back(Control::Open(1));
+        // Flipping between two tabs: each switch snapshots the one left.
+        for _ in 0..20 {
+            q.queue_snapshot(job(1));
+            q.queue_snapshot(job(2));
+        }
+        q.control.push_back(Control::Outline(1));
+        let queued: Vec<_> = q
+            .control
+            .iter()
+            .map(|c| match c {
+                Control::Open(_) => "open",
+                Control::Snapshot(job) if job.doc == 1 => "snapshot 1",
+                Control::Snapshot(_) => "snapshot 2",
+                Control::Outline(_) => "outline",
+            })
+            .collect();
+        assert_eq!(queued, ["open", "snapshot 1", "snapshot 2", "outline"]);
     }
 
     /// Headless render check: `RENDER_TEST_PDF=<pdf> RENDER_TEST_OUT=<dir> cargo test`.
