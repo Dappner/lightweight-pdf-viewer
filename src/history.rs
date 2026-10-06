@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{support_file, write_atomically};
-use crate::layout::PageLayout;
+use crate::layout::{PageLayout, Rotations};
 
 const HALF_LIFE: f64 = 5.0 * 24.0 * 60.0 * 60.0;
 /// The lowest-ranked files are forgotten past this many.
@@ -30,6 +30,8 @@ struct Entry {
     updated: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     place: Option<Place>,
+    #[serde(default, skip_serializing_if = "Rotations::is_upright")]
+    rotations: Rotations,
 }
 
 /// Where a file was left: how its pages were laid out and what was on screen.
@@ -69,7 +71,13 @@ impl History {
                 entry.score = entry.score_at(now) + 1.0;
                 entry.updated = now;
             }
-            None => self.entries.push(Entry { path: path.to_path_buf(), score: 1.0, updated: now, place: None }),
+            None => self.entries.push(Entry {
+                path: path.to_path_buf(),
+                score: 1.0,
+                updated: now,
+                place: None,
+                rotations: Rotations::default(),
+            }),
         }
         if self.entries.len() > MAX_ENTRIES {
             self.sort(now);
@@ -88,7 +96,34 @@ impl History {
         match self.entries.iter_mut().find(|e| e.path == path) {
             Some(entry) if entry.place == Some(place) => return,
             Some(entry) => entry.place = Some(place),
-            None => self.entries.push(Entry { path: path.to_path_buf(), score: 0.0, updated: now, place: Some(place) }),
+            None => self.entries.push(Entry {
+                path: path.to_path_buf(),
+                score: 0.0,
+                updated: now,
+                place: Some(place),
+                rotations: Rotations::default(),
+            }),
+        }
+        self.save();
+    }
+
+    /// How `path`'s pages were last turned; upright if they never were.
+    pub fn rotations(&self, path: &Path) -> Rotations {
+        self.entries.iter().find(|e| e.path == path).map(|e| e.rotations.clone()).unwrap_or_default()
+    }
+
+    /// Records how `path`'s pages are turned. Doesn't count as opening it.
+    pub fn set_rotations(&mut self, path: &Path, rotations: &Rotations, now: u64) {
+        match self.entries.iter_mut().find(|e| e.path == path) {
+            Some(entry) if entry.rotations == *rotations => return,
+            Some(entry) => entry.rotations = rotations.clone(),
+            None => self.entries.push(Entry {
+                path: path.to_path_buf(),
+                score: 0.0,
+                updated: now,
+                place: None,
+                rotations: rotations.clone(),
+            }),
         }
         self.save();
     }
@@ -168,6 +203,16 @@ mod tests {
         assert_eq!(names(&loaded, 5), ["/b.pdf", "/a.pdf"]);
         assert_eq!(loaded.place(Path::new("/a.pdf")), Some(place));
         assert_eq!(loaded.place(Path::new("/b.pdf")), None);
+        assert!(loaded.rotations(Path::new("/a.pdf")).is_upright());
+        let mut h = loaded;
+        let mut rotations = Rotations::default();
+        rotations.turn_all(false);
+        rotations.turn_page(3, true);
+        h.set_rotations(Path::new("/a.pdf"), &rotations, 7);
+        let loaded = History::load_from(path.clone());
+        assert_eq!(loaded.rotations(Path::new("/a.pdf")), rotations);
+        assert_eq!(loaded.rotations(Path::new("/a.pdf")).of(3).degrees(), 0);
+        assert_eq!(loaded.place(Path::new("/a.pdf")), Some(place));
         let _ = std::fs::remove_file(path);
     }
 }

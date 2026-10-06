@@ -13,6 +13,7 @@ use std::path::Path;
 
 use eframe::egui::{Rect, Vec2, vec2};
 
+use crate::layout::{Rotation, Rotations};
 use crate::renderer::{Link, OutlineEntry};
 
 const LETTER: Vec2 = vec2(612.0, 792.0);
@@ -23,14 +24,16 @@ pub fn autoreleasepool<R>(f: impl FnOnce() -> R) -> R {
 
 pub struct Document {
     pages: u32,
+    rotations: Rotations,
 }
 
 pub struct Page<'a> {
+    rotation: Rotation,
     _doc: PhantomData<&'a Document>,
 }
 
 impl Document {
-    pub fn open(path: &Path) -> Option<Self> {
+    pub fn open(path: &Path, rotations: &Rotations) -> Option<Self> {
         let bytes = std::fs::read(path).ok()?;
         let count = bytes
             .windows(7)
@@ -42,7 +45,7 @@ impl Document {
         let digits = stem.len() - stem.trim_end_matches(|c: char| c.is_ascii_digit()).len();
         let named = stem[stem.len() - digits..].parse().ok();
         let pages = count.or(named).filter(|n| *n > 0).unwrap_or(300);
-        Some(Self { pages })
+        Some(Self { pages, rotations: rotations.clone() })
     }
 
     pub fn page_count(&self) -> u32 {
@@ -50,7 +53,7 @@ impl Document {
     }
 
     pub fn page(&self, index: u32) -> Option<Page<'_>> {
-        (index < self.pages).then_some(Page { _doc: PhantomData })
+        (index < self.pages).then_some(Page { rotation: self.rotations.of(index), _doc: PhantomData })
     }
 
     pub fn outline(&self) -> Vec<OutlineEntry> {
@@ -65,7 +68,7 @@ fn leading_number(bytes: &[u8]) -> Option<u32> {
 
 impl Page<'_> {
     pub fn size(&self) -> Vec2 {
-        LETTER
+        if self.rotation.degrees() % 180 == 90 { vec2(LETTER.y, LETTER.x) } else { LETTER }
     }
 
     pub fn links(&self) -> Vec<Link> {
@@ -82,7 +85,7 @@ pub struct TextPage {
 }
 
 impl TextDocument {
-    pub fn open(_path: &Path) -> Option<Self> {
+    pub fn open(_path: &Path, _rotations: &Rotations) -> Option<Self> {
         None
     }
 

@@ -139,6 +139,9 @@ pub fn install(ctx: &egui::Context) {
                 Item("Zoom In", Command::ZoomIn, "=", cmd),
                 Item("Zoom Out", Command::ZoomOut, "-", cmd),
                 Item("Fit Width", Command::ZoomToFit, "0", cmd),
+                Separator,
+                Item("Rotate Left", Command::RotateLeft, "l", cmd),
+                Item("Rotate Right", Command::RotateRight, "r", cmd),
             ],
         ),
         (

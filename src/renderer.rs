@@ -21,6 +21,7 @@ use eframe::egui::{self, Color32, Rect, Vec2, vec2};
 
 use crate::engine::{self, Bitmap, Document, Page};
 use crate::grey;
+use crate::layout::Rotations;
 
 pub type DocId = u64;
 
@@ -224,7 +225,8 @@ struct Queue {
     /// Keys being worked on by any thread.
     busy: Vec<Key>,
     done: Vec<Output>,
-    paths: HashMap<DocId, PathBuf>,
+    /// Each document's file, and how its pages are turned.
+    paths: HashMap<DocId, (PathBuf, Rotations)>,
     /// Bumped to have every thread close its open documents, releasing CoreGraphics' caches
     /// for them.
     release: u64,
@@ -269,9 +271,9 @@ impl Renderer {
         cvar.notify_all();
     }
 
-    pub fn open(&self, doc: DocId, path: PathBuf) {
+    pub fn open(&self, doc: DocId, path: PathBuf, rotations: Rotations) {
         self.with_queue(|q| {
-            q.paths.insert(doc, path);
+            q.paths.insert(doc, (path, rotations));
             q.control.push_back(Control::Open(doc));
         });
     }
@@ -340,7 +342,7 @@ fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context, pages_per_open:
 
     loop {
         let (lock, cvar) = shared;
-        let (work, path, limit) = {
+        let (work, (path, rotations), limit) = {
             let mut q = lock.lock().unwrap();
             loop {
                 if q.release != released {
@@ -390,7 +392,7 @@ fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context, pages_per_open:
                     // Close documents over the limit before opening another.
                     let excess = (open.len() + 1).saturating_sub(limit);
                     open.drain(..excess);
-                    Document::open(&path).map(|doc| OpenDoc { id: doc_id, doc, pages: HashSet::new() })
+                    Document::open(&path, &rotations).map(|doc| OpenDoc { id: doc_id, doc, pages: HashSet::new() })
                 }
             };
             match (&current, work) {
@@ -593,7 +595,7 @@ mod tests {
         let (Ok(pdf), Ok(out)) = (std::env::var("RENDER_TEST_PDF"), std::env::var("RENDER_TEST_OUT")) else {
             return;
         };
-        let document = Document::open(std::path::Path::new(&pdf)).expect("open");
+        let document = Document::open(std::path::Path::new(&pdf), &Rotations::default()).expect("open");
         let entries = document.outline();
         println!("outline: {} entries", entries.len());
         for e in entries.iter().take(4) {

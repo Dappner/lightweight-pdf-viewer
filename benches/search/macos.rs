@@ -77,7 +77,8 @@ fn run(path: &str, budget: usize, index: Option<PathBuf>, warm: bool) -> bool {
     let mut max_cache = 0;
     let mut errors: Vec<String> = Vec::new();
 
-    let mut search = Search::with_budget(&ctx, PathBuf::from(path), pages, start, budget, store.clone());
+    let mut search =
+        Search::with_budget(&ctx, PathBuf::from(path), Default::default(), pages, start, budget, store.clone());
     let t = Instant::now();
     search.set_query("the", (start, 0.0));
     let mut first_hit = None;

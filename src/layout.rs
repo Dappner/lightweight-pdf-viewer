@@ -3,6 +3,7 @@
 //!
 //! All positions are in egui points, relative to the top-left of the scroll content.
 
+use std::collections::BTreeMap;
 use std::ops::Range;
 
 use eframe::egui::{Pos2, Rect, Vec2, pos2, vec2};
@@ -23,6 +24,74 @@ pub enum PageLayout {
     TwoPages,
     /// Two pages per row with the cover on its own, like a printed book: 1, 2–3, 4–5, …
     Book,
+}
+
+/// Quarter turns clockwise applied to every page of a document, on top of any rotation the
+/// pages have of their own.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub struct Rotation(u8);
+
+impl Rotation {
+    pub fn degrees(self) -> i32 {
+        self.0 as i32 * 90
+    }
+
+    pub fn clockwise(self) -> Self {
+        Self((self.0 + 1) % 4)
+    }
+
+    pub fn counterclockwise(self) -> Self {
+        Self((self.0 + 3) % 4)
+    }
+
+    pub fn turned(self, clockwise: bool) -> Self {
+        if clockwise { self.clockwise() } else { self.counterclockwise() }
+    }
+
+    /// This turn followed by `other`.
+    pub fn then(self, other: Rotation) -> Self {
+        Self((self.0 + other.0) % 4)
+    }
+
+    pub fn is_upright(&self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// How a document's pages are turned: all of them alike, and single pages further.
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub struct Rotations {
+    #[serde(default, skip_serializing_if = "Rotation::is_upright")]
+    all: Rotation,
+    /// Further turns of single pages, by index. Pages turned back level with the rest are
+    /// left out.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pages: BTreeMap<u32, Rotation>,
+}
+
+impl Rotations {
+    /// How far `page` is turned in all.
+    pub fn of(&self, page: u32) -> Rotation {
+        self.all.then(self.pages.get(&page).copied().unwrap_or_default())
+    }
+
+    /// Turns every page a quarter further, single pages keeping their turn relative to the rest.
+    pub fn turn_all(&mut self, clockwise: bool) {
+        self.all = self.all.turned(clockwise);
+    }
+
+    pub fn turn_page(&mut self, page: u32, clockwise: bool) {
+        let turn = self.pages.get(&page).copied().unwrap_or_default().turned(clockwise);
+        if turn.is_upright() {
+            self.pages.remove(&page);
+        } else {
+            self.pages.insert(page, turn);
+        }
+    }
+
+    pub fn is_upright(&self) -> bool {
+        self.all.is_upright() && self.pages.is_empty()
+    }
 }
 
 impl PageLayout {
@@ -202,6 +271,23 @@ mod tests {
     use super::*;
 
     const LETTER: Vec2 = vec2(612.0, 792.0);
+
+    #[test]
+    fn single_pages_turn_on_top_of_all() {
+        let mut r = Rotations::default();
+        r.turn_page(2, true);
+        r.turn_all(true);
+        assert_eq!((r.of(0).degrees(), r.of(2).degrees()), (90, 180));
+        // Turning all again keeps page 2 a quarter ahead of the rest.
+        r.turn_all(true);
+        assert_eq!((r.of(0).degrees(), r.of(2).degrees()), (180, 270));
+        // Turned back level with the rest, a page is forgotten, and four quarters are upright.
+        r.turn_page(2, false);
+        r.turn_all(false);
+        r.turn_all(false);
+        assert!(r.is_upright());
+        assert_eq!(r, Rotations::default());
+    }
 
     fn spreads(mode: PageLayout, pages: usize) -> Vec<Range<usize>> {
         let layout = DocLayout::new(vec![LETTER; pages], mode);

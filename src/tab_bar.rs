@@ -4,7 +4,8 @@
 //! Dragging a tab reorders it; dragging it well below the strip, or out of the window,
 //! detaches it: released over another window's strip it joins that window, and anywhere
 //! else it gets a window of its own (a window's only tab just moves its window there).
-//! Left of the tabs, a Preview-style button opens a menu of sidebar and page layout options.
+//! Left of the tabs, a Preview-style button opens a menu of sidebar and page layout options;
+//! at the right end, after the page and zoom status, a button rotates the pages.
 
 use eframe::egui::{
     Align2, Button, CornerRadius, CursorIcon, FontId, LayerId, Order, Painter, Popup, Pos2, Rect, Response, Sense,
@@ -31,6 +32,8 @@ const MIN_TAB: f32 = 110.0;
 const MAX_TAB: f32 = 220.0;
 const PLUS_WIDTH: f32 = 36.0;
 const STATUS_WIDTH: f32 = 150.0;
+/// The rotate button at the right end of the strip.
+const ROTATE_WIDTH: f32 = 32.0;
 /// How far below the strip a dragged tab must go to detach.
 const DETACH_DISTANCE: f32 = 60.0;
 /// Where a detached tab's new window goes relative to the pointer: the pointer ends up
@@ -218,8 +221,13 @@ pub fn show(
     }
 
     if let Some(status) = status {
+        let rotate = Rect::from_center_size(pos2(bar.right() - 8.0 - 12.0, plus_center.y), vec2(24.0, 24.0));
+        if let Some(command) = rotate_button(ui, rotate, palette) {
+            action = Some(Action::Run(command));
+        }
+        let painter = ui.painter();
         painter.text(
-            pos2(bar.right() - 14.0, plus_center.y),
+            pos2(rotate.left() - 6.0, plus_center.y),
             Align2::RIGHT_CENTER,
             status,
             FontId::proportional(12.0),
@@ -235,7 +243,7 @@ fn strip(bar: Rect, n: usize) -> (Rect, f32) {
     let leading = LEADING + VIEW_BUTTON;
     let area = Rect::from_min_max(
         pos2(bar.left() + leading, bar.top() + TAB_TOP),
-        pos2((bar.right() - STATUS_WIDTH - PLUS_WIDTH).max(bar.left() + leading), bar.bottom()),
+        pos2((bar.right() - STATUS_WIDTH - ROTATE_WIDTH - PLUS_WIDTH).max(bar.left() + leading), bar.bottom()),
     );
     let tab_width = if n == 0 { 0.0 } else { (area.width() / n as f32).clamp(MIN_TAB, MAX_TAB) };
     (area, tab_width)
@@ -319,6 +327,32 @@ fn view_button(ui: &mut Ui, rect: Rect, menu: &ViewMenu, palette: &Palette) -> O
         }
     });
     chosen
+}
+
+/// Rotates left, as Preview's toolbar button does; with ⌥ held, right.
+fn rotate_button(ui: &mut Ui, rect: Rect, palette: &Palette) -> Option<Command> {
+    let response = ui
+        .interact(rect, ui.id().with("rotate"), Sense::click())
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text("Rotate Left (⌘L), ⌥-click to Rotate Right (⌘R)");
+    let painter = ui.painter();
+    if response.hovered() {
+        painter.rect_filled(rect, CornerRadius::same(6), palette.hover);
+    }
+    // A counterclockwise arrow: an arc from the top round the right to the left, with its
+    // head at the top pointing left.
+    let stroke = Stroke::new(1.3, palette.text_weak);
+    let (center, radius) = (rect.center() + vec2(0.0, 0.5), 5.5);
+    let at = |degrees: f32| {
+        let a = degrees.to_radians();
+        center + vec2(a.cos(), -a.sin()) * radius
+    };
+    let arc: Vec<Pos2> = (0..=24).map(|i| at(90.0 - i as f32 * 270.0 / 24.0)).collect();
+    painter.add(eframe::egui::Shape::line(arc, stroke));
+    let head = at(90.0);
+    painter.line_segment([head, head + vec2(3.0, -3.0)], stroke);
+    painter.line_segment([head, head + vec2(3.0, 3.0)], stroke);
+    response.clicked().then(|| if ui.input(|i| i.modifiers.alt) { Command::RotateRight } else { Command::RotateLeft })
 }
 
 fn close_rect(tab: Rect) -> Rect {

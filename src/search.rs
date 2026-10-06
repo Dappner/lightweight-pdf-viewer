@@ -40,6 +40,7 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Duration;
 
 use crate::engine::{TextDocument, TextPage, autoreleasepool};
+use crate::layout::Rotations;
 use crate::search_index::{self, Index, Store};
 use crate::text::{PageText, Query};
 use eframe::egui::{self, Rect, pos2};
@@ -229,6 +230,8 @@ pub struct Search {
     pub query: String,
     ctx: egui::Context,
     path: PathBuf,
+    /// How the document's pages are turned, which highlights follow.
+    rotations: Rotations,
     budget: usize,
     /// Where page text is saved; `None` keeps it in memory only.
     store: Option<Store>,
@@ -269,15 +272,24 @@ pub struct Search {
 }
 
 impl Search {
-    /// Starts reading the document at `path` from page `start`, saving its text in `store`.
-    pub fn new(ctx: &egui::Context, path: PathBuf, page_count: usize, start: usize, store: Option<Store>) -> Self {
-        Self::with_budget(ctx, path, page_count, start, CACHE_BUDGET, store)
+    /// Starts reading the document at `path`, its pages turned by `rotations`, from page
+    /// `start`, saving its text in `store`.
+    pub fn new(
+        ctx: &egui::Context,
+        path: PathBuf,
+        rotations: Rotations,
+        page_count: usize,
+        start: usize,
+        store: Option<Store>,
+    ) -> Self {
+        Self::with_budget(ctx, path, rotations, page_count, start, CACHE_BUDGET, store)
     }
 
     /// [`Self::new`] with a different cache budget, in bytes.
     pub fn with_budget(
         ctx: &egui::Context,
         path: PathBuf,
+        rotations: Rotations,
         page_count: usize,
         start: usize,
         budget: usize,
@@ -287,6 +299,7 @@ impl Search {
             query: String::new(),
             ctx: ctx.clone(),
             path,
+            rotations,
             budget,
             store,
             channel: None,
@@ -318,6 +331,11 @@ impl Search {
         search
     }
 
+    /// Pages in the document searched.
+    pub fn page_count(&self) -> usize {
+        self.page_count
+    }
+
     /// Starts a worker if there is none, picking up from what the UI already knows.
     fn start_worker(&mut self) {
         if self.channel.is_some() || self.dormant {
@@ -334,6 +352,7 @@ impl Search {
         let known = (0..self.page_count).map(|p| self.searched.is_some() && self.counts[p].is_some()).collect();
         let seed = Seed {
             path: self.path.clone(),
+            rotations: self.rotations.clone(),
             ctx: self.ctx.clone(),
             budget: self.budget,
             store: self.store.clone(),
@@ -732,6 +751,7 @@ impl Drop for Search {
 /// What a new worker starts from.
 struct Seed {
     path: PathBuf,
+    rotations: Rotations,
     ctx: egui::Context,
     budget: usize,
     store: Option<Store>,
@@ -804,6 +824,7 @@ impl TextCache {
 
 struct Worker {
     path: PathBuf,
+    rotations: Rotations,
     ctx: egui::Context,
     channel: Channel,
     /// Pages in reading order: from the start page on, wrapping.
@@ -843,6 +864,7 @@ impl Worker {
         let start = seed.start.min(page_count.saturating_sub(1));
         Self {
             path: seed.path,
+            rotations: seed.rotations,
             ctx: seed.ctx,
             channel,
             order: (start..page_count).chain(0..start).map(|p| p as u32).collect(),
@@ -1035,7 +1057,7 @@ impl Worker {
             if self.index.as_ref().is_some_and(|i| !i.is_current()) {
                 self.index = None;
             }
-            self.doc = TextDocument::open(&self.path);
+            self.doc = TextDocument::open(&self.path, &self.rotations);
             self.failed = self.doc.is_none();
         }
         if !self.touched.contains(&p) {
@@ -1171,7 +1193,7 @@ mod tests {
     /// tests need.
     fn search(pages: usize) -> (egui::Context, Search) {
         let ctx = egui::Context::default();
-        let search = Search::new(&ctx, PathBuf::from("/nonexistent.pdf"), pages, 0, None);
+        let search = Search::new(&ctx, PathBuf::from("/nonexistent.pdf"), Rotations::default(), pages, 0, None);
         (ctx, search)
     }
 

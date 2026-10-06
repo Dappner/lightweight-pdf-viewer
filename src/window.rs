@@ -21,6 +21,7 @@ use crate::search::{Anchor, Search};
 use crate::sidebar::{self, Mode as SidebarMode};
 use crate::tab::{DocState, Tab};
 use crate::tab_bar::{self, Action};
+use crate::text_layers::TextLayers;
 use crate::theme::{Palette, palette};
 use crate::view::{Canvas, Wants, fit_width_zoom};
 
@@ -132,9 +133,10 @@ impl Window {
         }
         let id = shared.next_id;
         shared.next_id += 1;
-        shared.renderer.open(id, path.clone());
+        let rotations = shared.history.rotations(&path);
+        shared.renderer.open(id, path.clone(), rotations.clone());
         let restore = shared.history.place(&path);
-        self.tabs.push(Tab::new(id, path, restore));
+        self.tabs.push(Tab::new(id, path, rotations, restore));
         self.activate(ctx, shared, self.tabs.len() - 1);
     }
 
@@ -291,6 +293,9 @@ impl Window {
             Command::ShowSidebar(mode) => self.set_sidebar_mode(shared, mode),
             Command::SetLayout(mode) => self.set_layout(ctx, mode),
             Command::ZoomIn | Command::ZoomOut | Command::ZoomToFit => self.zoom(ctx, command),
+            Command::RotateLeft => self.rotate(ctx, shared, None, false),
+            Command::RotateRight => self.rotate(ctx, shared, None, true),
+            Command::RotatePage { page, clockwise } => self.rotate(ctx, shared, Some(page as u32), clockwise),
             Command::Find => self.open_find(ctx, shared),
             Command::FindNext => self.find_step(true),
             Command::FindPrevious => self.find_step(false),
@@ -304,7 +309,14 @@ impl Window {
         let DocState::Ready(layout) = &tab.doc else { return };
         let start = tab.view.current_page;
         let search = tab.search.get_or_insert_with(|| {
-            Search::new(ctx, tab.path.clone(), layout.page_count(), start, shared.config.search_store())
+            Search::new(
+                ctx,
+                tab.path.clone(),
+                tab.rotations.clone(),
+                layout.page_count(),
+                start,
+                shared.config.search_store(),
+            )
         });
         search.focus = true;
         search.wake();
@@ -439,6 +451,55 @@ impl Window {
         view.zoom_about(layout, zoom, center, ctx.input(|i| i.time));
     }
 
+    /// Turns the active tab's `page`, or all its pages, a quarter turn, keeping the reading
+    /// position. The file is
+    /// reopened as a new document turned the new way: its tiles, links, outline positions and
+    /// text boxes all depend on the turn, and go with the old one. The search starts over with
+    /// the same text.
+    fn rotate(&mut self, ctx: &Context, shared: &mut Shared, page: Option<u32>, clockwise: bool) {
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        let restore = match &tab.doc {
+            DocState::Ready(layout) if tab.view.zoom > 0.0 => {
+                let place = tab.view.place(layout);
+                // A page that fit the window's width fits it again once turned.
+                let fits = (tab.view.zoom - fit_width_zoom(layout, tab.view.viewport.width())).abs() < 1e-3;
+                Some(history::Place { zoom: if fits { 0.0 } else { place.zoom }, ..place })
+            }
+            // Turned again before the last turn (or the first open) loaded: keep where that lands.
+            DocState::Loading => tab.restore,
+            _ => return,
+        };
+        match page {
+            Some(page) => tab.rotations.turn_page(page, clockwise),
+            None => tab.rotations.turn_all(clockwise),
+        }
+        shared.history.set_rotations(&tab.path, &tab.rotations, history::now());
+
+        shared.renderer.forget(tab.id);
+        shared.cache.evict_doc(tab.id);
+        shared.failed.retain(|k| k.doc() != tab.id);
+        tab.id = shared.next_id;
+        shared.next_id += 1;
+        shared.renderer.open(tab.id, tab.path.clone(), tab.rotations.clone());
+        tab.doc = DocState::Loading;
+        tab.restore = restore;
+        tab.snapshot = None;
+        tab.snapshot_texture = None;
+        tab.links.clear();
+        tab.outline = None;
+        tab.outline_requested = false;
+        tab.text = TextLayers::new(tab.path.clone(), tab.rotations.clone());
+        if let Some(old) = tab.search.take() {
+            let start = restore.map_or(0, |p| p.page);
+            let store = shared.config.search_store();
+            let mut search = Search::new(ctx, tab.path.clone(), tab.rotations.clone(), old.page_count(), start, store);
+            search.query = old.query.clone();
+            search.focus = false;
+            search.edited(ctx.input(|i| i.time));
+            tab.search = Some(search);
+        }
+    }
+
     /// Keyboard shortcuts. In the app, the menu bar receives the ⌘ shortcuts before egui
     /// does; these also cover them when running without a menu (benchmarks).
     fn shortcuts(&mut self, ctx: &Context) -> Vec<Command> {
@@ -478,6 +539,8 @@ impl Window {
                 (cmd, KeyCode::Plus, Command::ZoomIn),
                 (cmd, KeyCode::Minus, Command::ZoomOut),
                 (cmd, KeyCode::Num0, Command::ZoomToFit),
+                (cmd, KeyCode::L, Command::RotateLeft),
+                (cmd, KeyCode::R, Command::RotateRight),
                 (cmd | alt, KeyCode::Num1, Command::SetLayout(PageLayout::Single)),
                 (cmd | alt, KeyCode::Num2, Command::SetLayout(PageLayout::TwoPages)),
                 (cmd | alt, KeyCode::Num3, Command::SetLayout(PageLayout::Book)),
@@ -686,19 +749,19 @@ impl Window {
             }
         }
 
-        let clicked_link = CentralPanel::default()
+        let (clicked_link, menu_command) = CentralPanel::default()
             .frame(content_frame)
             .show(ctx, |ui| {
                 self.visible_ready = false;
                 let Some(tab) = self.tabs.get_mut(self.active) else {
-                    empty_state(ui, &palette, "Drop a PDF here or press ⌘O");
-                    return None;
+                    empty_state(ui, &palette, "Drop a PDF or image here, or press ⌘O");
+                    return (None, None);
                 };
                 match &tab.doc {
-                    DocState::Loading => None,
+                    DocState::Loading => (None, None),
                     DocState::Failed(e) => {
                         empty_state(ui, &palette, e);
-                        None
+                        (None, None)
                     }
                     DocState::Ready(layout) => {
                         let out = Canvas {
@@ -720,13 +783,16 @@ impl Window {
                         if let Some(search) = &mut tab.search {
                             search.want_geometry(&out.visible_pages);
                         }
-                        out.clicked_link
+                        (out.clicked_link, out.command)
                     }
                 }
             })
             .inner;
         if let Some(target) = clicked_link {
             self.follow(target);
+        }
+        if let Some(command) = menu_command {
+            self.run(ctx, shared, command);
         }
 
         if self.quick_open.is_none()

@@ -35,6 +35,7 @@ use eframe::egui::ahash::{HashMap, HashSet};
 use eframe::egui::{self, Pos2};
 
 use crate::engine::{TextDocument, autoreleasepool};
+use crate::layout::Rotations;
 use crate::search::REOPEN_PAGES;
 use crate::selection::{Caret, Selection, TextLayer, Unit};
 
@@ -89,6 +90,7 @@ impl Action {
 
 pub struct TextLayers {
     path: PathBuf,
+    rotations: Rotations,
     layers: HashMap<u32, TextLayer>,
     /// Bytes `layers` hold.
     bytes: usize,
@@ -107,9 +109,10 @@ pub struct TextLayers {
 }
 
 impl TextLayers {
-    pub fn new(path: PathBuf) -> Self {
+    pub fn new(path: PathBuf, rotations: Rotations) -> Self {
         Self {
             path,
+            rotations,
             layers: HashMap::default(),
             bytes: 0,
             requested: HashSet::default(),
@@ -357,10 +360,10 @@ impl TextLayers {
         let mut inbox = Inbox::default();
         f(&mut inbox);
         let channel: Channel = Arc::new((Mutex::new(inbox), Condvar::new()));
-        let (worker, path, ctx) = (channel.clone(), self.path.clone(), ctx.clone());
+        let (worker, path, rotations, ctx) = (channel.clone(), self.path.clone(), self.rotations.clone(), ctx.clone());
         std::thread::Builder::new()
             .name("pdf-text".into())
-            .spawn(move || Worker { path, ctx, channel: worker, doc: None, read: 0, copying: None }.run())
+            .spawn(move || Worker { path, rotations, ctx, channel: worker, doc: None, read: 0, copying: None }.run())
             .expect("spawn text thread");
         self.channel = Some(channel);
     }
@@ -403,6 +406,7 @@ enum Job {
 
 struct Worker {
     path: PathBuf,
+    rotations: Rotations,
     ctx: egui::Context,
     channel: Channel,
     doc: Option<TextDocument>,
@@ -487,7 +491,7 @@ impl Worker {
             doc.close();
         }
         if self.doc.is_none() {
-            self.doc = TextDocument::open(&self.path);
+            self.doc = TextDocument::open(&self.path, &self.rotations);
             self.read = 0;
         }
         self.read += 1;

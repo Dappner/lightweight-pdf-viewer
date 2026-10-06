@@ -5,9 +5,11 @@ use std::time::Duration;
 
 use eframe::egui::scroll_area::ScrollSource;
 use eframe::egui::{
-    Color32, CursorIcon, Pos2, Rect, ScrollArea, Sense, Stroke, StrokeKind, TextureHandle, Ui, Vec2, pos2, vec2,
+    Button, Color32, CursorIcon, Pos2, Rect, Response, ScrollArea, Sense, Stroke, StrokeKind, TextureHandle, Ui, Vec2,
+    pos2, vec2,
 };
 
+use crate::app::Command;
 use crate::cache::TextureCache;
 use crate::find_bar;
 use crate::grey;
@@ -210,6 +212,8 @@ pub struct CanvasOutput {
     /// Every visible tile was drawn at full sharpness.
     pub ready: bool,
     pub clicked_link: Option<Target>,
+    /// Chosen in the right-click menu.
+    pub command: Option<Command>,
     /// Pages at least partly on screen.
     pub visible_pages: Vec<u32>,
 }
@@ -355,6 +359,7 @@ impl Canvas<'_> {
             }
 
             select(ui, &pointer, text, view, &page_rects, over_link, screen_viewport);
+            let command = page_menu(ui, &pointer, &page_rects, layout.page_count(), text);
             // Over the tiles: the selection, then every match on screen, the current one stronger.
             if let Some(selection) = text.selection() {
                 for &(page, rect) in &visible_pages {
@@ -389,11 +394,12 @@ impl Canvas<'_> {
             (
                 all_visible_ready,
                 clicked_link,
+                command,
                 most_visible.1,
                 visible_pages.into_iter().map(|(p, _)| p).collect::<Vec<u32>>(),
             )
         });
-        let (all_visible_ready, clicked_link, most_visible, visible_pages) = output.inner;
+        let (all_visible_ready, clicked_link, command, most_visible, visible_pages) = output.inner;
 
         let scrolled = output.state.offset != view.offset;
         if scrolled && !jumped {
@@ -411,8 +417,56 @@ impl Canvas<'_> {
             cache.retain(|k| !matches!(*k, Key::Tile { doc: d, scale: s, .. } if d == doc && s != scale));
         }
         text.tidy(view.current_page as u32, &visible_pages);
-        CanvasOutput { ready: all_visible_ready && view.zoom == view.render_zoom, clicked_link, visible_pages }
+        CanvasOutput { ready: all_visible_ready && view.zoom == view.render_zoom, clicked_link, command, visible_pages }
     }
+}
+
+/// The right-click menu: copies the selection, and turns the page clicked or all of them (a
+/// document of one page, such as an image, only offers the latter). `pages` are the pages
+/// laid out this frame, with their screen rects.
+fn page_menu(
+    ui: &Ui,
+    pointer: &Response,
+    pages: &[(u32, Rect)],
+    page_count: usize,
+    text: &mut TextLayers,
+) -> Option<Command> {
+    // The page clicked, kept while its menu is open.
+    let key = pointer.id.with("menu_page");
+    if pointer.secondary_clicked()
+        && let Some(p) = pointer.interact_pointer_pos()
+    {
+        let nearest = pages.iter().min_by(|a, b| a.1.distance_sq_to_pos(p).total_cmp(&b.1.distance_sq_to_pos(p)));
+        ui.data_mut(|d| d.insert_temp(key, nearest.map(|&(page, _)| page)));
+    }
+    let clicked = ui.data(|d| d.get_temp::<Option<u32>>(key)).flatten();
+    let mut command = None;
+    pointer.context_menu(|ui| {
+        if ui.add_enabled(text.selection().is_some(), Button::new("Copy").shortcut_text("⌘C")).clicked() {
+            text.copy(ui.ctx());
+        }
+        ui.separator();
+        let mut item = |ui: &mut Ui, label: &str, shortcut: &str, chosen: Command| {
+            if ui.add(Button::new(label).shortcut_text(shortcut)).clicked() {
+                command = Some(chosen);
+            }
+        };
+        match clicked.filter(|_| page_count > 1) {
+            Some(page) => {
+                let page = page as usize;
+                item(ui, "Rotate This Page Left", "", Command::RotatePage { page, clockwise: false });
+                item(ui, "Rotate This Page Right", "", Command::RotatePage { page, clockwise: true });
+                ui.separator();
+                item(ui, "Rotate All Left", "⌘L", Command::RotateLeft);
+                item(ui, "Rotate All Right", "⌘R", Command::RotateRight);
+            }
+            None => {
+                item(ui, "Rotate Left", "⌘L", Command::RotateLeft);
+                item(ui, "Rotate Right", "⌘R", Command::RotateRight);
+            }
+        }
+    });
+    command
 }
 
 /// Takes the pointer's part in selecting text: asks for the layer of a page it moves over,

@@ -17,10 +17,12 @@ use objc2_core_graphics::{
 };
 use objc2_foundation::{NSRange, NSURL};
 use objc2_image_io::{
-    CGImageSource, kCGImagePropertyDPIHeight, kCGImagePropertyDPIWidth, kCGImageSourceShouldCacheImmediately,
+    CGImageSource, kCGImagePropertyDPIHeight, kCGImagePropertyDPIWidth, kCGImagePropertyOrientation,
+    kCGImageSourceShouldCacheImmediately,
 };
 use objc2_pdf_kit::{PDFActionGoTo, PDFActionURL, PDFDestination, PDFDocument, PDFOutline, PDFPage};
 
+use crate::layout::{Rotation, Rotations};
 use crate::renderer::{Link, OutlineEntry, Target};
 
 /// Runs `f`, releasing what CoreGraphics autoreleased during it.
@@ -45,9 +47,12 @@ enum PageSource<'a> {
 }
 
 impl Document {
-    /// Opens `path` as a PDF, or failing that as an image.
-    pub fn open(path: &Path) -> Option<Self> {
-        Pdf::open(path).map(Source::Pdf).or_else(|| Image::open(path).map(Source::Image)).map(Self)
+    /// Opens `path` as a PDF, or failing that as an image, with its pages turned by `rotations`.
+    pub fn open(path: &Path, rotations: &Rotations) -> Option<Self> {
+        Pdf::open(path, rotations)
+            .map(Source::Pdf)
+            .or_else(|| Image::open(path, rotations.of(0)).map(Source::Image))
+            .map(Self)
     }
 
     pub fn page_count(&self) -> u32 {
@@ -79,7 +84,7 @@ impl Page<'_> {
     pub fn size(&self) -> Vec2 {
         match &self.0 {
             PageSource::Pdf(page) => page.geometry.size(),
-            PageSource::Image(image) => image.size,
+            PageSource::Image(image) => image.geometry.size(),
         }
     }
 
@@ -95,12 +100,16 @@ impl Page<'_> {
 /// draws never go back to the file (which may since have changed or gone).
 struct Image {
     image: CFRetained<CGImage>,
-    /// In points: pixels at the image's resolution (72 dpi when it gives none), as Preview sizes it.
-    size: Vec2,
+    /// The image as a page: its size in points (pixels at the image's resolution, 72 dpi when
+    /// it gives none, as Preview sizes it), turned as its EXIF orientation says and then by
+    /// the document's rotation.
+    geometry: PageGeometry,
+    /// Flipped left to right before turning, for the mirrored EXIF orientations.
+    mirrored: bool,
 }
 
 impl Image {
-    fn open(path: &Path) -> Option<Self> {
+    fn open(path: &Path, rotation: Rotation) -> Option<Self> {
         let url = CFURL::from_file_path(path)?;
         // SAFETY: `url` is a valid file URL, and ImageIO's property dictionary has CFString keys.
         let (image, properties) = unsafe {
@@ -113,15 +122,30 @@ impl Image {
                 .map(|p| CFRetained::cast_unchecked::<CFDictionary<CFString, CFType>>(p));
             (image, properties)
         };
-        let dpi = |key: &CFString| {
-            let number = properties.as_ref()?.get(key)?.downcast::<CFNumber>().ok()?;
-            number.as_f64().filter(|dpi| *dpi > 0.0)
-        };
+        let number = |key: &CFString| properties.as_ref()?.get(key)?.downcast::<CFNumber>().ok()?.as_f64();
         // SAFETY: ImageIO's property keys are immutable statics.
-        let (dpi_x, dpi_y) = unsafe { (dpi(kCGImagePropertyDPIWidth), dpi(kCGImagePropertyDPIHeight)) };
-        let points = |pixels: usize, dpi: Option<f64>| (pixels as f64 * 72.0 / dpi.unwrap_or(72.0)) as f32;
-        let size = vec2(points(CGImage::width(Some(&image)), dpi_x), points(CGImage::height(Some(&image)), dpi_y));
-        Some(Self { image, size })
+        let (dpi_x, dpi_y, orientation) = unsafe {
+            (number(kCGImagePropertyDPIWidth), number(kCGImagePropertyDPIHeight), number(kCGImagePropertyOrientation))
+        };
+        let points = |pixels: usize, dpi: Option<f64>| pixels as f64 * 72.0 / dpi.filter(|d| *d > 0.0).unwrap_or(72.0);
+        let size = CGSize {
+            width: points(CGImage::width(Some(&image)), dpi_x),
+            height: points(CGImage::height(Some(&image)), dpi_y),
+        };
+        // EXIF orientations 1-8: how the stored pixels are turned (clockwise) and flipped to show.
+        let (turn, mirrored) = match orientation.map(|o| o as i32) {
+            Some(2) => (0, true),
+            Some(3) => (180, false),
+            Some(4) => (180, true),
+            Some(5) => (270, true),
+            Some(6) => (90, false),
+            Some(7) => (90, true),
+            Some(8) => (270, false),
+            _ => (0, false),
+        };
+        let crop = CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size };
+        let geometry = PageGeometry { crop, rotation: (turn + rotation.degrees()) % 360 };
+        Some(Self { image, geometry, mirrored })
     }
 }
 
@@ -130,6 +154,7 @@ impl Image {
 struct Pdf {
     pdf: Retained<PDFDocument>,
     cg: Retained<CGPDFDocument>,
+    rotations: Rotations,
 }
 
 struct PdfPage<'a> {
@@ -140,11 +165,11 @@ struct PdfPage<'a> {
 }
 
 impl Pdf {
-    fn open(path: &Path) -> Option<Self> {
+    fn open(path: &Path, rotations: &Rotations) -> Option<Self> {
         let pdf = open_pdf(path)?;
         // SAFETY: plain PDFKit getter.
         let cg = unsafe { pdf.documentRef() }?;
-        (CGPDFDocument::number_of_pages(Some(&cg)) > 0).then_some(Self { pdf, cg })
+        (CGPDFDocument::number_of_pages(Some(&cg)) > 0).then_some(Self { pdf, cg, rotations: rotations.clone() })
     }
 
     fn page_count(&self) -> u32 {
@@ -154,7 +179,7 @@ impl Pdf {
     /// `index` is zero-based; CoreGraphics numbers pages from 1.
     fn page(&self, index: u32) -> Option<PdfPage<'_>> {
         let page = CGPDFDocument::page(Some(&self.cg), index as usize + 1)?;
-        let geometry = PageGeometry::of(&page);
+        let geometry = PageGeometry::of(&page, self.rotations.of(index));
         Some(PdfPage { doc: self, index, page, geometry })
     }
 
@@ -236,6 +261,7 @@ fn open_pdf(path: &Path) -> Option<Retained<PDFDocument>> {
 /// page it touches parsed until the document is closed (dropped).
 pub struct TextDocument {
     pdf: Retained<PDFDocument>,
+    rotations: Rotations,
 }
 
 /// One page of a [`TextDocument`].
@@ -245,8 +271,9 @@ pub struct TextPage {
 }
 
 impl TextDocument {
-    pub fn open(path: &Path) -> Option<Self> {
-        open_pdf(path).map(|pdf| Self { pdf })
+    /// Opens `path` with its pages turned by `rotations`, as [`Document::open`] does.
+    pub fn open(path: &Path, rotations: &Rotations) -> Option<Self> {
+        open_pdf(path).map(|pdf| Self { pdf, rotations: rotations.clone() })
     }
 
     /// Frees the pages PDFKit holds parsed, which it autoreleases.
@@ -257,7 +284,7 @@ impl TextDocument {
     pub fn page(&self, index: u32) -> Option<TextPage> {
         // SAFETY: plain PDFKit getters on objects owned by `self`.
         let page = unsafe { self.pdf.pageAtIndex(index as usize) }?;
-        let geometry = unsafe { page.pageRef() }.map(|cg| PageGeometry::of(&cg));
+        let geometry = unsafe { page.pageRef() }.map(|cg| PageGeometry::of(&cg, self.rotations.of(index)));
         Some(TextPage { page, geometry })
     }
 }
@@ -361,10 +388,11 @@ struct PageGeometry {
 }
 
 impl PageGeometry {
-    fn of(page: &CGPDFPage) -> Self {
+    /// The page as displayed: its own rotation, then `rotation`.
+    fn of(page: &CGPDFPage, rotation: Rotation) -> Self {
         let crop = CGPDFPage::box_rect(Some(page), CGPDFBox::CropBox);
-        let rotation = CGPDFPage::rotation_angle(Some(page)).rem_euclid(360) / 90 * 90;
-        Self { crop, rotation }
+        let own = CGPDFPage::rotation_angle(Some(page)).rem_euclid(360) / 90 * 90;
+        Self { crop, rotation: (own + rotation.degrees()) % 360 }
     }
 
     fn size(&self) -> Vec2 {
@@ -446,7 +474,15 @@ impl<'a> Bitmap<'a> {
                 CGContext::concat_ctm(c, page.geometry.page_to_display());
                 CGContext::draw_pdf_page(c, Some(&page.page));
             }
-            PageSource::Image(image) => CGContext::draw_image(c, bounds, Some(&image.image)),
+            PageSource::Image(image) => {
+                CGContext::concat_ctm(c, image.geometry.page_to_display());
+                let crop = image.geometry.crop;
+                if image.mirrored {
+                    CGContext::translate_ctm(c, crop.size.width, 0.0);
+                    CGContext::scale_ctm(c, -1.0, 1.0);
+                }
+                CGContext::draw_image(c, crop, Some(&image.image));
+            }
         }
         CGContext::restore_g_state(c);
     }
@@ -462,8 +498,9 @@ mod tests {
     const CLEAR: [u8; 4] = [0, 0, 0, 0];
 
     /// Writes a 40x20 PNG: red top-left, blue top-right and green bottom quarters, with the
-    /// green's last column transparent. `dpi` sets its resolution (pHYs), if any.
-    fn quarters_png(name: &str, dpi: Option<f64>) -> std::path::PathBuf {
+    /// green's last column transparent. `dpi` sets its resolution (pHYs), and `orientation`
+    /// its EXIF orientation (eXIf), if any.
+    fn quarters_png(name: &str, dpi: Option<f64>, orientation: Option<u8>) -> std::path::PathBuf {
         let (w, h) = (40, 20);
         let pixels: Vec<u8> = (0..h)
             .flat_map(|y| (0..w).map(move |x| (x, y)))
@@ -475,7 +512,15 @@ mod tests {
             })
             .collect();
         let path = std::env::temp_dir().join(format!("lightweight-pdf-engine-{}-{name}.png", std::process::id()));
-        let mut enc = png::Encoder::new(std::fs::File::create(&path).unwrap(), w, h);
+        // A big-endian TIFF header and one IFD holding only the Orientation tag (0x0112, a SHORT).
+        let exif = orientation.map(|o| {
+            let mut exif = b"MM\0*\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01\0".to_vec();
+            exif.extend([o, 0, 0, 0, 0, 0, 0]);
+            exif
+        });
+        let mut info = png::Info::with_size(w, h);
+        info.exif_metadata = exif.map(Into::into);
+        let mut enc = png::Encoder::with_info(std::fs::File::create(&path).unwrap(), info).unwrap();
         enc.set_color(png::ColorType::Rgba);
         if let Some(dpi) = dpi {
             let ppm = (dpi / 0.0254).round() as u32;
@@ -490,10 +535,109 @@ mod tests {
         assert!(close, "pixel {at:?} is {actual:?}, expected {expected:?}");
     }
 
+    /// Every page turned a quarter, clockwise or not.
+    fn turned_all(clockwise: bool) -> Rotations {
+        let mut rotations = Rotations::default();
+        rotations.turn_all(clockwise);
+        rotations
+    }
+
+    /// Opens `path` turned by `rotations` and draws its first page at one pixel a point,
+    /// returning the pixel at each of `at` (x, y from the top-left).
+    fn pixels_at(path: &Path, rotations: &Rotations, at: &[(usize, usize)]) -> (Vec2, Vec<[u8; 4]>) {
+        let doc = Document::open(path, rotations).expect("open");
+        let page = doc.page(0).unwrap();
+        let size = page.size();
+        let (w, h) = (size.x as usize, size.y as usize);
+        let mut rgba = vec![0u8; w * h * 4];
+        Bitmap::new(&mut rgba, w as u32, h as u32).unwrap().draw(&page, [w as f64, h as f64], [0.0, 0.0]);
+        let pixels = at.iter().map(|&(x, y)| rgba[(y * w + x) * 4..][..4].try_into().unwrap()).collect();
+        (size, pixels)
+    }
+
+    /// The quarters image turned a quarter clockwise: 20x40, red top-right, blue bottom-right,
+    /// green down the left.
+    fn assert_turned_clockwise(size: Vec2, pixels: &[[u8; 4]]) {
+        assert_eq!(size, vec2(20.0, 40.0));
+        for (pixel, (expected, at)) in pixels.iter().zip([(RED, (15, 5)), (BLUE, (15, 35)), (GREEN, (4, 20))]) {
+            assert_near(pixel, expected, at);
+        }
+    }
+
+    const TURNED: [(usize, usize); 3] = [(15, 5), (15, 35), (4, 20)];
+
+    #[test]
+    fn exif_orientation_turns_the_image() {
+        let path = quarters_png("exif-6", None, Some(6));
+        let (size, pixels) = pixels_at(&path, &Rotations::default(), &TURNED);
+        let _ = std::fs::remove_file(&path);
+        assert_turned_clockwise(size, &pixels);
+    }
+
+    #[test]
+    fn exif_mirroring_flips_the_image() {
+        let path = quarters_png("exif-2", None, Some(2));
+        let (size, pixels) = pixels_at(&path, &Rotations::default(), &[(5, 3), (35, 3), (20, 16)]);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(size, vec2(40.0, 20.0));
+        assert_near(&pixels[0], BLUE, (5, 3));
+        assert_near(&pixels[1], RED, (35, 3));
+        assert_near(&pixels[2], GREEN, (20, 16));
+    }
+
+    #[test]
+    fn rotation_turns_an_image_after_its_orientation() {
+        let plain = quarters_png("turn", None, None);
+        let (size, pixels) = pixels_at(&plain, &turned_all(true), &TURNED);
+        let _ = std::fs::remove_file(&plain);
+        assert_turned_clockwise(size, &pixels);
+
+        // Turning an EXIF-turned image back brings it upright.
+        let turned = quarters_png("turn-back", None, Some(6));
+        let (size, pixels) = pixels_at(&turned, &turned_all(false), &[(5, 3), (35, 3)]);
+        let _ = std::fs::remove_file(&turned);
+        assert_eq!(size, vec2(40.0, 20.0));
+        assert_near(&pixels[0], RED, (5, 3));
+        assert_near(&pixels[1], BLUE, (35, 3));
+    }
+
+    /// Turning one page turns only that page.
+    #[test]
+    fn single_pages_turn_alone() {
+        let path = text_pdf("one-page", &[("Alpha", 700)]);
+        let mut rotations = Rotations::default();
+        rotations.turn_page(1, true);
+        let other = Document::open(&path, &rotations).expect("open").page(0).unwrap().size();
+        rotations.turn_page(0, true);
+        let turned = Document::open(&path, &rotations).expect("open").page(0).unwrap().size();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!((other, turned), (vec2(612.0, 792.0), vec2(792.0, 612.0)));
+    }
+
+    /// A clockwise turn makes a portrait page landscape, and the text boxes turn with it:
+    /// a line along the top runs down the right-hand side.
+    #[test]
+    fn rotation_turns_pdf_pages_and_their_text() {
+        let path = text_pdf("turned", &[("Alpha", 700)]);
+        let clockwise = turned_all(true);
+        let size = Document::open(&path, &clockwise).expect("open").page(0).unwrap().size();
+        let text = TextDocument::open(&path, &clockwise).expect("open text");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(size, vec2(792.0, 612.0));
+        let (units, rects) = text.page(0).unwrap().boxes();
+        let letters = String::from_utf16(&units).unwrap().find("Alpha").unwrap();
+        let alpha = &rects[letters..letters + 5];
+        // The line's top edge, 1 - 700/792 of the way down upright, is now that far from the right.
+        let top = 1.0 - 700.0 / 792.0;
+        assert!(alpha.iter().all(|r| (1.0 - r.center().x - top).abs() < 20.0 / 792.0), "{alpha:?}");
+        assert!((alpha[0].top() - 72.0 / 612.0).abs() < 2.0 / 612.0, "starts at {}", alpha[0].top());
+        assert!(alpha.windows(2).all(|w| w[1].top() >= w[0].top()), "letters run down the page: {alpha:?}");
+    }
+
     #[test]
     fn png_opens_as_one_page_of_its_pixel_size() {
-        let path = quarters_png("plain", None);
-        let doc = Document::open(&path).expect("open");
+        let path = quarters_png("plain", None, None);
+        let doc = Document::open(&path, &Rotations::default()).expect("open");
         let _ = std::fs::remove_file(&path);
         assert_eq!(doc.page_count(), 1);
         assert!(doc.page(1).is_none());
@@ -505,8 +649,8 @@ mod tests {
 
     #[test]
     fn png_resolution_sets_its_size_in_points() {
-        let path = quarters_png("retina", Some(144.0));
-        let doc = Document::open(&path).expect("open");
+        let path = quarters_png("retina", Some(144.0), None);
+        let doc = Document::open(&path, &Rotations::default()).expect("open");
         let _ = std::fs::remove_file(&path);
         let size = doc.page(0).unwrap().size();
         assert!((size - vec2(20.0, 10.0)).length() < 0.01, "size {size:?}");
@@ -514,8 +658,8 @@ mod tests {
 
     #[test]
     fn png_draws_upright_on_white() {
-        let path = quarters_png("draw", None);
-        let doc = Document::open(&path).expect("open");
+        let path = quarters_png("draw", None, None);
+        let doc = Document::open(&path, &Rotations::default()).expect("open");
         let _ = std::fs::remove_file(&path);
         let (w, h) = (40, 20);
         let mut rgba = vec![0u8; w * h * 4];
@@ -529,8 +673,8 @@ mod tests {
 
     #[test]
     fn png_has_no_text_to_search() {
-        let path = quarters_png("text", None);
-        let text = TextDocument::open(&path);
+        let path = quarters_png("text", None, None);
+        let text = TextDocument::open(&path, &Rotations::default());
         let _ = std::fs::remove_file(&path);
         assert!(text.is_none());
     }
@@ -579,7 +723,7 @@ mod tests {
     #[test]
     fn text_boxes_follow_the_page_string() {
         let path = text_pdf("boxes", &[("Alpha beta", 700), ("Gamma delta", 650), ("Epsilon", 600)]);
-        let doc = TextDocument::open(&path).expect("open");
+        let doc = TextDocument::open(&path, &Rotations::default()).expect("open");
         let _ = std::fs::remove_file(&path);
         let (units, rects) = doc.page(0).unwrap().boxes();
         let text = String::from_utf16(&units).unwrap();
@@ -620,7 +764,7 @@ mod tests {
         // "the first 𝒜 end"
         let content = "BT /F1 18 Tf 72 700 Td <7468652001727374200220656E64> Tj ET";
         let path = pdf("ligature", font, content, Some(cmap));
-        let doc = TextDocument::open(&path).expect("open");
+        let doc = TextDocument::open(&path, &Rotations::default()).expect("open");
         let _ = std::fs::remove_file(&path);
         let (units, rects) = doc.page(0).unwrap().boxes();
         let text = String::from_utf16(&units).unwrap();
@@ -652,7 +796,7 @@ mod tests {
     fn other_files_do_not_open() {
         let path = std::env::temp_dir().join(format!("lightweight-pdf-engine-{}-notes.txt", std::process::id()));
         std::fs::write(&path, "not a document").unwrap();
-        let doc = Document::open(&path);
+        let doc = Document::open(&path, &Rotations::default());
         let _ = std::fs::remove_file(&path);
         assert!(doc.is_none());
     }

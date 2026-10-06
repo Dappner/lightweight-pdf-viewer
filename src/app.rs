@@ -25,7 +25,7 @@ use crate::renderer::{DocId, Key, Output, Pixels, Renderer};
 use crate::sidebar::{self, Mode as SidebarMode};
 use crate::tab::DocState;
 use crate::tab_bar;
-use crate::view::{MAX_ZOOM, MIN_ZOOM, Wants};
+use crate::view::{MAX_ZOOM, MIN_ZOOM, Wants, fit_width_zoom};
 use crate::window::{Request, Shared, Window, snapshot_texture};
 
 const DEFAULT_SIZE: Vec2 = vec2(960.0, 1080.0);
@@ -94,6 +94,15 @@ pub enum Command {
     ZoomIn,
     ZoomOut,
     ZoomToFit,
+    /// Turns every page of the active tab a quarter turn counterclockwise.
+    RotateLeft,
+    /// Turns every page of the active tab a quarter turn clockwise.
+    RotateRight,
+    /// Turns one page of the active tab a quarter turn.
+    RotatePage {
+        page: usize,
+        clockwise: bool,
+    },
     /// Opens the find bar, or focuses it.
     Find,
     FindNext,
@@ -115,6 +124,8 @@ pub struct Stats {
     pub snapshot_shown: bool,
     pub current_page: usize,
     pub page_count: usize,
+    /// How far the active tab's current page is turned clockwise, in degrees.
+    pub rotation: i32,
     pub texture_bytes: usize,
     /// Compressed snapshots held by background tabs.
     pub snapshot_bytes: usize,
@@ -344,7 +355,10 @@ impl State {
 
     fn open_dialog(&mut self, ctx: &Context, w: usize) {
         #[cfg(target_os = "macos")]
-        let files = rfd::FileDialog::new().add_filter("PDF or PNG", &["pdf", "png"]).pick_files().unwrap_or_default();
+        let files = rfd::FileDialog::new()
+            .add_filter("PDF or image", &["pdf", "png", "jpg", "jpeg", "heic", "heif", "webp"])
+            .pick_files()
+            .unwrap_or_default();
         #[cfg(not(target_os = "macos"))]
         let files = crate::unsupported::pick_documents();
         for file in files {
@@ -492,7 +506,11 @@ impl State {
                         if let Some(place) = restore
                             && place.page < layout.page_count()
                         {
-                            tab.view.zoom = place.zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+                            // A zero zoom (from rotating a tab that fit its width) fits the new width.
+                            tab.view.zoom = match place.zoom {
+                                0.0 => fit_width_zoom(&layout, tab.view.viewport.width()),
+                                zoom => zoom.clamp(MIN_ZOOM, MAX_ZOOM),
+                            };
                             tab.view.render_zoom = tab.view.zoom;
                             tab.view.go_to_place(&layout, place.page, place.y);
                         }
@@ -691,6 +709,7 @@ impl State {
                 DocState::Ready(layout) => layout.page_count(),
                 _ => 0,
             }),
+            rotation: active.map_or(0, |t| t.rotations.of(t.view.current_page as u32).degrees()),
             texture_bytes: self.shared.cache.bytes(),
             snapshot_bytes: self
                 .windows

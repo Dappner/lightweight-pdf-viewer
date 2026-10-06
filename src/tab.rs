@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use eframe::egui::{Rect, TextureHandle, Vec2};
 
 use crate::history::Place;
-use crate::layout::DocLayout;
+use crate::layout::{DocLayout, Rotations};
 use crate::renderer::{DocId, Link, OutlineEntry, Snapshot};
 use crate::search::Search;
 use crate::text_layers::TextLayers;
@@ -18,6 +18,8 @@ pub enum DocState {
 pub struct Tab {
     pub id: DocId,
     pub path: PathBuf,
+    /// How the pages are turned, saved per file in the history.
+    pub rotations: Rotations,
     pub title: String,
     pub doc: DocState,
     pub view: View,
@@ -62,12 +64,13 @@ pub struct View {
 }
 
 impl Tab {
-    pub fn new(id: DocId, path: PathBuf, restore: Option<Place>) -> Self {
+    pub fn new(id: DocId, path: PathBuf, rotations: Rotations, restore: Option<Place>) -> Self {
         let title =
             path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
         Self {
             id,
             path: path.clone(),
+            rotations: rotations.clone(),
             title,
             doc: DocState::Loading,
             view: View::default(),
@@ -78,7 +81,7 @@ impl Tab {
             outline_requested: false,
             restore,
             search: None,
-            text: TextLayers::new(path.clone()),
+            text: TextLayers::new(path.clone(), rotations),
         }
     }
 }
