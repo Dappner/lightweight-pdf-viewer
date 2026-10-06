@@ -270,36 +270,51 @@ impl TextPage {
     }
 
     /// The page's text as UTF-16 units, each with its box as fractions of the displayed page
-    /// with a top-left origin; [`Rect::NOTHING`] for units without one (spaces and line
-    /// breaks PDFKit inserts).
+    /// with a top-left origin; [`Rect::NOTHING`] for units without one. Both units of a
+    /// surrogate pair get their character's box.
     pub fn boxes(&self) -> (Vec<u16>, Vec<Rect>) {
         // SAFETY: plain PDFKit getter.
         let Some(text) = (unsafe { self.page.string() }) else { return (vec![], vec![]) };
         let units: Vec<u16> = text.to_string().encode_utf16().collect();
         let Some(geometry) = &self.geometry else { return (vec![], vec![]) };
-        let rects = (0..units.len())
-            .map(|i| {
-                // SAFETY: plain PDFKit getter; `i` is within the page's string.
-                let b = unsafe { self.page.characterBoundsAtIndex(i as isize) };
-                if b.size.width <= 0.0 || b.size.height <= 0.0 {
-                    return Rect::NOTHING;
-                }
-                Rect::from_two_pos(
-                    geometry.to_fraction(b.origin.x, b.origin.y),
-                    geometry.to_fraction(b.origin.x + b.size.width, b.origin.y + b.size.height),
-                )
-            })
-            .collect();
+        let mut rects = Vec::with_capacity(units.len());
+        while rects.len() < units.len() {
+            let len = char_len(&units, rects.len());
+            let rect = self.text_box(geometry, rects.len(), len).unwrap_or(Rect::NOTHING);
+            rects.extend(std::iter::repeat_n(rect, len));
+        }
         (units, rects)
     }
 
-    /// The top of character `index`, as a fraction of the displayed page from its top.
+    /// The top of the character starting at UTF-16 unit `index`, as a fraction of the
+    /// displayed page from its top.
     pub fn char_top(&self, index: u32) -> Option<f32> {
         let geometry = self.geometry.as_ref()?;
         // SAFETY: plain PDFKit getter.
-        let b = unsafe { self.page.characterBoundsAtIndex(index as isize) };
-        let a = geometry.to_fraction(b.origin.x, b.origin.y).y;
-        Some(a.min(geometry.to_fraction(b.origin.x + b.size.width, b.origin.y + b.size.height).y))
+        let text = unsafe { self.page.string() }?;
+        let index = index as usize;
+        let next = |i: usize| (i < text.length()).then(|| text.characterAtIndex(i));
+        let len = if next(index).is_some_and(is_high) && next(index + 1).is_some_and(is_low) { 2 } else { 1 };
+        Some(self.text_box(geometry, index, len)?.top())
+    }
+
+    /// The box of the page string's UTF-16 units `start..start + len`, as fractions of the
+    /// displayed page with a top-left origin; `None` if they have none.
+    ///
+    /// From a selection of the units, about 1.5 µs a character, not from
+    /// `characterBoundsAtIndex`: that counts glyphs, not units of the page string, skipping
+    /// the line breaks PDFKit inserts and counting a ligature such as "fi" once, so its boxes
+    /// drift further from the text with every line.
+    fn text_box(&self, geometry: &PageGeometry, start: usize, len: usize) -> Option<Rect> {
+        // SAFETY: plain PDFKit getters on objects owned by `self`.
+        let selection = unsafe { self.page.selectionForRange(NSRange::new(start, len)) }?;
+        let b = unsafe { selection.boundsForPage(&self.page) };
+        (b.size.width > 0.0 && b.size.height > 0.0).then(|| {
+            Rect::from_two_pos(
+                geometry.to_fraction(b.origin.x, b.origin.y),
+                geometry.to_fraction(b.origin.x + b.size.width, b.origin.y + b.size.height),
+            )
+        })
     }
 
     /// Rectangles of the text `start..start + len`, one per line, as fractions of the
@@ -323,6 +338,19 @@ impl TextPage {
             })
             .collect()
     }
+}
+
+/// UTF-16 units in the character starting at `units[i]`: 2 for a surrogate pair, else 1.
+fn char_len(units: &[u16], i: usize) -> usize {
+    if is_high(units[i]) && units.get(i + 1).copied().is_some_and(is_low) { 2 } else { 1 }
+}
+
+fn is_high(unit: u16) -> bool {
+    (0xD800..0xDC00).contains(&unit)
+}
+
+fn is_low(unit: u16) -> bool {
+    (0xDC00..0xE000).contains(&unit)
 }
 
 /// Crop box and rotation of a page, which together define what is displayed.
@@ -505,6 +533,119 @@ mod tests {
         let text = TextDocument::open(&path);
         let _ = std::fs::remove_file(&path);
         assert!(text.is_none());
+    }
+
+    /// Writes a one-page US Letter PDF drawing `content` with font F1 (`font`, a dictionary,
+    /// whose `ToUnicode` refers to object 6 when `to_unicode` is given).
+    fn pdf(name: &str, font: &str, content: &str, to_unicode: Option<&str>) -> std::path::PathBuf {
+        let mut objects = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Count 1 /Kids [4 0 R] >>".to_string(),
+            font.to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>"
+                .to_string(),
+            format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+        ];
+        if let Some(cmap) = to_unicode {
+            objects.push(format!("<< /Length {} >>\nstream\n{cmap}\nendstream", cmap.len()));
+        }
+        let mut pdf = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for (i, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf += &format!("{} 0 obj\n{object}\nendobj\n", i + 1);
+        }
+        let xref = pdf.len();
+        pdf += &format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1);
+        for offset in offsets {
+            pdf += &format!("{offset:010} 00000 n \n");
+        }
+        pdf += &format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objects.len() + 1);
+        let path = std::env::temp_dir().join(format!("lightweight-pdf-engine-{}-{name}.pdf", std::process::id()));
+        std::fs::write(&path, pdf).unwrap();
+        path
+    }
+
+    /// Writes a PDF with lines of 18 pt Helvetica at the given heights (points from the
+    /// bottom), each starting 72 pt from the left.
+    fn text_pdf(name: &str, lines: &[(&str, i32)]) -> std::path::PathBuf {
+        let content: String =
+            lines.iter().map(|(line, y)| format!("BT /F1 18 Tf 72 {y} Td ({line}) Tj ET\n")).collect();
+        pdf(name, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>", &content, None)
+    }
+
+    /// Each unit of the page string gets its own box, also after the line breaks PDFKit
+    /// inserts, which `characterBoundsAtIndex` doesn't count.
+    #[test]
+    fn text_boxes_follow_the_page_string() {
+        let path = text_pdf("boxes", &[("Alpha beta", 700), ("Gamma delta", 650), ("Epsilon", 600)]);
+        let doc = TextDocument::open(&path).expect("open");
+        let _ = std::fs::remove_file(&path);
+        let (units, rects) = doc.page(0).unwrap().boxes();
+        let text = String::from_utf16(&units).unwrap();
+        for (line, word) in ["Alpha", "Gamma", "Epsilon"].into_iter().enumerate() {
+            let at = text[..text.find(word).unwrap()].encode_utf16().count();
+            let first = rects[at];
+            assert!((first.left() - 72.0 / 612.0).abs() < 1.0 / 612.0, "{word} starts at x {}", first.left());
+            // Every letter of the word sits on its line, left to right.
+            let top = 1.0 - (700 - 50 * line as i32) as f32 / 792.0;
+            for i in at..at + word.len() {
+                assert!(
+                    (rects[i].center().y - top).abs() < 20.0 / 792.0,
+                    "{word}[{}] at y {}",
+                    i - at,
+                    rects[i].center().y
+                );
+                assert!(i == at || rects[i].left() >= rects[i - 1].left(), "{word}[{}] left of the one before", i - at);
+            }
+        }
+    }
+
+    /// A ligature (one glyph, the two units "fi") and a character outside the Basic
+    /// Multilingual Plane (one glyph, two units), as LaTeX writes them: the characters after
+    /// each still get their own glyph's box.
+    #[test]
+    fn text_boxes_survive_ligatures_and_surrogate_pairs() {
+        // Code 1 draws Helvetica's "fi" glyph and reads as "fi"; code 2 draws "A" and reads
+        // as U+1D49C (𝒜).
+        let font = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 6 0 R \
+                    /Encoding << /Type /Encoding /BaseEncoding /WinAnsiEncoding /Differences [1 /fi 2 /A] >> >>";
+        let cmap = "/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+                    /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def \
+                    /CMapName /Adobe-Identity-UCS def /CMapType 2 def \
+                    1 begincodespacerange <00> <FF> endcodespacerange \
+                    2 beginbfchar <01> <00660069> <02> <D835DC9C> endbfchar \
+                    1 beginbfrange <20> <7E> <0020> endbfrange \
+                    endcmap CMapName currentdict /CMap defineresource pop end end";
+        // "the first 𝒜 end"
+        let content = "BT /F1 18 Tf 72 700 Td <7468652001727374200220656E64> Tj ET";
+        let path = pdf("ligature", font, content, Some(cmap));
+        let doc = TextDocument::open(&path).expect("open");
+        let _ = std::fs::remove_file(&path);
+        let (units, rects) = doc.page(0).unwrap().boxes();
+        let text = String::from_utf16(&units).unwrap();
+        assert_eq!(text.trim_end(), "the first 𝒜 end");
+
+        // Helvetica's widths, in 1/1000 em, of the glyphs drawn: "the ", fi, "rst ", A, " end".
+        let glyphs = [278, 556, 556, 278, 500, 333, 500, 278, 278, 667, 278, 556, 556, 556];
+        let mut x = 72.0;
+        let mut lefts = Vec::new();
+        for w in glyphs {
+            lefts.push(x);
+            x += 18.0 * w as f32 / 1000.0;
+        }
+        // Each unit of the text, with the glyph it's drawn by.
+        let glyph_of = [0, 1, 2, 3, 4, 4, 5, 6, 7, 8, 9, 9, 10, 11, 12, 13];
+        for (unit, &glyph) in glyph_of.iter().enumerate() {
+            let left = rects[unit].left() * 612.0;
+            assert!(
+                (left - lefts[glyph]).abs() < 1.0,
+                "unit {unit} ({:?}) starts at {left:.1} pt, its glyph at {:.1}",
+                String::from_utf16_lossy(&units[unit..unit + 1]),
+                lefts[glyph]
+            );
+        }
+        assert_eq!(rects[10], rects[11], "both halves of 𝒜 share its box");
     }
 
     #[test]

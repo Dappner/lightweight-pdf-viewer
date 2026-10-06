@@ -3,7 +3,7 @@
 //! A page's layer is only read once the pointer moves over it, a selection action needs it,
 //! or a selection shows on it, so reading and scrolling cost nothing. Measured with
 //! `benches/text_spike.rs`: the first read of a page parses it (2–23 ms), its boxes then take
-//! under a millisecond, and a layer takes 10–85 KB.
+//! 1–12 ms (1.5 µs a character), and a layer takes 10–85 KB.
 //!
 //! The layers are read by a worker thread with its own PDFKit document, started when a page
 //! is wanted. It reopens the document every [`REOPEN_PAGES`] pages, as search does, and
