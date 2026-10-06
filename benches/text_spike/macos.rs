@@ -6,12 +6,14 @@ use std::time::{Duration, Instant};
 use objc2::AnyThread;
 use objc2::rc::{Retained, autoreleasepool};
 use objc2_core_foundation::CGPoint;
-use objc2_foundation::{NSRange, NSURL};
+use objc2_foundation::{NSRange, NSString, NSURL};
 use objc2_pdf_kit::{PDFDisplayBox, PDFDocument, PDFPage};
 
 const SAMPLE_PAGES: usize = 60;
 const HIT_POINTS: usize = 200;
-const REOPEN_EVERY: usize = 32;
+/// As the app's text worker does (`search::REOPEN_PAGES`), draining the autorelease pool
+/// after every page.
+const REOPEN_EVERY: usize = 16;
 
 pub fn main() {
     let files: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with("--")).collect();
@@ -41,19 +43,28 @@ fn open(path: &str) -> Retained<PDFDocument> {
     unsafe { PDFDocument::initWithURL(PDFDocument::alloc(), &url) }.expect("open")
 }
 
-/// Every character's bounds on `page`, whose string is `len` UTF-16 units long; and how many
-/// of them are empty (PDFKit's synthesized spaces and line breaks).
-fn char_bounds(page: &PDFPage, len: usize) -> (Vec<[f32; 4]>, usize) {
+/// Every UTF-16 unit's box on `page`, whose string is `text`, as the app reads them: from a
+/// selection of its character, both units of a surrogate pair sharing one
+/// (`characterBoundsAtIndex` counts glyphs, not units of the string, so its boxes drift from
+/// the text); and how many are empty.
+fn char_bounds(page: &PDFPage, text: &NSString) -> (Vec<[f32; 4]>, usize) {
+    let len = text.length();
     let mut empty = 0;
-    let rects = (0..len)
-        .map(|i| {
-            let b = unsafe { page.characterBoundsAtIndex(i as isize) };
-            if b.size.width <= 0.0 || b.size.height <= 0.0 {
-                empty += 1;
-            }
-            [b.origin.x as f32, b.origin.y as f32, b.size.width as f32, b.size.height as f32]
-        })
-        .collect();
+    let mut rects = Vec::with_capacity(len);
+    while rects.len() < len {
+        let i = rects.len();
+        let pair = (0xD800..0xDC00).contains(&text.characterAtIndex(i))
+            && i + 1 < len
+            && (0xDC00..0xE000).contains(&text.characterAtIndex(i + 1));
+        let units = if pair { 2 } else { 1 };
+        let b = unsafe { page.selectionForRange(NSRange::new(i, units)) }
+            .map_or(Default::default(), |s| unsafe { s.boundsForPage(page) });
+        if b.size.width <= 0.0 || b.size.height <= 0.0 {
+            empty += units;
+        }
+        let rect = [b.origin.x as f32, b.origin.y as f32, b.size.width as f32, b.size.height as f32];
+        rects.extend(std::iter::repeat_n(rect, units));
+    }
     (rects, empty)
 }
 
@@ -71,20 +82,19 @@ fn child(path: &str) {
     let mut max_chars = 0;
     let mut text_pages = 0;
     for chunk in sample.chunks(REOPEN_EVERY) {
-        autoreleasepool(|_| {
-            let doc = open(path);
-            for &i in chunk {
+        let doc = autoreleasepool(|_| open(path));
+        for &i in chunk {
+            autoreleasepool(|_| {
                 let page = unsafe { doc.pageAtIndex(i) }.unwrap();
                 let t = Instant::now();
-                let len = unsafe { page.string() }.map_or(0, |s| s.length());
+                let text = unsafe { page.string() };
+                let len = text.as_ref().map_or(0, |s| s.length());
                 string_t.push(t.elapsed());
-                if len == 0 {
-                    continue;
-                }
+                let Some(text) = text.filter(|_| len > 0) else { return };
                 text_pages += 1;
 
                 let t = Instant::now();
-                let (rects, e) = char_bounds(&page, len);
+                let (rects, e) = char_bounds(&page, &text);
                 let took = t.elapsed();
                 std::hint::black_box(&rects);
                 bounds_t.push(took);
@@ -114,8 +124,9 @@ fn child(path: &str) {
                     hit_t.push(t.elapsed());
                     hits_on_text += (hit >= 0) as usize;
                 }
-            }
-        });
+            });
+        }
+        autoreleasepool(|_| drop(doc));
     }
     let n = text_pages.max(1);
     println!(
@@ -147,14 +158,18 @@ fn whole_document(path: &str, count: usize) {
     let mut last_report = Instant::now();
     let mut layers: Vec<(String, Vec<[f32; 4]>)> = Vec::with_capacity(count);
     for start in (0..count).step_by(REOPEN_EVERY) {
-        autoreleasepool(|_| {
-            let doc = open(path);
-            for i in start..(start + REOPEN_EVERY).min(count) {
+        let doc = autoreleasepool(|_| open(path));
+        for i in start..(start + REOPEN_EVERY).min(count) {
+            autoreleasepool(|_| {
                 let page = unsafe { doc.pageAtIndex(i) }.unwrap();
-                let (text, len) = unsafe { page.string() }.map_or((String::new(), 0), |s| (s.to_string(), s.length()));
-                layers.push((text, char_bounds(&page, len).0));
-            }
-        });
+                let layer = match unsafe { page.string() } {
+                    Some(text) => (text.to_string(), char_bounds(&page, &text).0),
+                    None => (String::new(), vec![]),
+                };
+                layers.push(layer);
+            });
+        }
+        autoreleasepool(|_| drop(doc));
         if last_report.elapsed() > Duration::from_secs(10) {
             eprintln!("  … {}/{count} pages", layers.len());
             last_report = Instant::now();

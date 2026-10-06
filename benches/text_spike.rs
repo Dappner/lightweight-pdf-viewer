@@ -8,11 +8,12 @@
 //! preset). Up to 60 pages spread over the document, each never touched before:
 //!
 //! - string: the first `page.string()`, which parses the page.
-//! - bounds: `characterBoundsAtIndex` for every UTF-16 unit, after the string.
+//! - bounds: a one-unit selection's box for every UTF-16 unit, after the string.
 //! - lines: `selectionForRange(whole page)` → `selectionsByLine` → `boundsForPage`.
 //! - hit: `characterIndexAtPoint` at 200 points on a page already parsed, per call.
 //!
-//! Then the whole document's text layer, reopening every 32 pages: total time, peak
+//! Then the whole document's text layer, reopening every 16 pages and draining the
+//! autorelease pool after each, as the app does: total time, peak
 //! footprint, and what the layer would take in memory at 16 bytes a character.
 //!
 //! macOS only: it reads text with PDFKit, which the synthetic engine elsewhere has no stand-in for.
