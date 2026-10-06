@@ -4,6 +4,8 @@
 
 #[cfg(target_os = "macos")]
 mod coregraphics;
+#[cfg(any(target_os = "macos", test))]
+mod preview;
 #[cfg(target_os = "macos")]
 pub use coregraphics::{Bitmap, Document, Page, TextDocument, TextPage, autoreleasepool, save_text_boxes};
 

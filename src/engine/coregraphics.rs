@@ -30,6 +30,7 @@ use objc2_pdf_kit::{
     PDFPage,
 };
 
+use super::preview::{self, EditedBox};
 use crate::layout::{Rotation, Rotations};
 use crate::renderer::{Link, OutlineEntry, Target};
 use crate::text_boxes::{self, PageSave, TextBox};
@@ -404,18 +405,24 @@ fn default_appearance(da: &str) -> (f32, [u8; 3]) {
 pub fn save_text_boxes(path: &Path, pages: &[PageSave]) -> Result<(), String> {
     autoreleasepool(|| {
         let pdf = open_pdf(path).ok_or("The file couldn't be opened")?;
+        let mut edited_boxes = Vec::new();
         for save in pages {
             // SAFETY: plain PDFKit calls on objects owned by `pdf`.
             let Some(page) = (unsafe { pdf.pageAtIndex(save.page as usize) }) else { continue };
             let Some(cg) = (unsafe { page.pageRef() }) else { continue };
             let geometry = PageGeometry::of(&cg, Rotation::default());
+            let mut styled = Vec::new();
             let theirs: Vec<Retained<PDFAnnotation>> = unsafe { page.annotations() }
                 .iter()
                 .filter(|a| unsafe { a.r#type() }.is_some_and(|t| t.to_string() == "FreeText"))
                 .collect();
             for (ordinal, annotation) in theirs.iter().enumerate() {
                 match save.boxes.iter().find(|(b, _)| b.origin == Some(ordinal as u32)) {
-                    Some((b, rect)) if b.changed => style(annotation, b, geometry.fraction_rect_to_pdf(*rect)),
+                    Some((b, rect)) if b.changed => {
+                        let bounds = geometry.fraction_rect_to_pdf(*rect);
+                        style(annotation, b, bounds);
+                        styled.push((annotation.clone(), b.size, bounds));
+                    }
                     Some(_) => {}
                     None if save.complete => unsafe { page.removeAnnotation(annotation) },
                     None => {}
@@ -434,6 +441,31 @@ pub fn save_text_boxes(path: &Path, pages: &[PageSave]) -> Result<(), String> {
                 };
                 style(&annotation, b, bounds);
                 unsafe { page.addAnnotation(&annotation) };
+                styled.push((annotation, b.size, bounds));
+            }
+            // Deletions shift ordinals, so record identity after all page edits, in the
+            // same FreeText order the saved file exposes. Duplicate text is harmless.
+            for (ordinal, annotation) in unsafe { page.annotations() }
+                .iter()
+                .filter(|a| unsafe { a.r#type() }.is_some_and(|t| t.to_string() == "FreeText"))
+                .enumerate()
+            {
+                if let Some((_, size, bounds)) = styled.iter().find(|(a, _, _)| std::ptr::eq(&**a, &*annotation)) {
+                    edited_boxes.push(EditedBox {
+                        page: save.page,
+                        ordinal,
+                        size: *size,
+                        bounds: [
+                            bounds.origin.x,
+                            bounds.origin.y,
+                            bounds.origin.x + bounds.size.width,
+                            bounds.origin.y + bounds.size.height,
+                        ],
+                    });
+                }
+            }
+            if edited_boxes.iter().filter(|b| b.page == save.page).count() != styled.len() {
+                return Err("The edited text boxes couldn't be identified for saving".into());
             }
         }
         let name = path.file_name().ok_or("Not a file")?.to_string_lossy();
@@ -443,6 +475,10 @@ pub fn save_text_boxes(path: &Path, pages: &[PageSave]) -> Result<(), String> {
         if !unsafe { pdf.writeToURL(&url) } {
             let _ = std::fs::remove_file(&temp);
             return Err("PDFKit couldn't write the file".into());
+        }
+        if let Err(error) = preview::normalize(&temp, &edited_boxes) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(format!("The text edits couldn't be saved for Preview: {error}"));
         }
         if let Ok(meta) = std::fs::metadata(path) {
             let _ = std::fs::set_permissions(&temp, meta.permissions());

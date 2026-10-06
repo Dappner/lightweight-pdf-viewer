@@ -11,6 +11,11 @@ eframe = { version = "0.33.3", default-features = false, features = ["wgpu", "de
 # Only the Metal backend (eframe's defaults would also pull in GL/Vulkan backends).
 egui-wgpu = { version = "0.33.3", default-features = false, features = ["macos-window-resize-jitter-fix"] }
 qoi = "0.4.1"
+# Save-time Preview compatibility: parse PDF dictionaries and Apple's keyed plist without
+# decoding annotation classes or depending on private framework APIs.
+base64 = "0.23.1"
+lopdf = { version = "0.45.0", default-features = false }
+plist = { version = "1.10.1", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 
