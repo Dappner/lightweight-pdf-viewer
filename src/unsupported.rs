@@ -36,6 +36,6 @@ pub mod titlebar {
 }
 
 /// Files picked in an Open dialog.
-pub fn pick_pdfs() -> Vec<std::path::PathBuf> {
+pub fn pick_documents() -> Vec<std::path::PathBuf> {
     Vec::new()
 }

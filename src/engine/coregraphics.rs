@@ -1,5 +1,6 @@
-//! The macOS PDF engine: pages are rasterized with CoreGraphics (Preview's engine) and
-//! document structure (outline, links) and text are read with PDFKit.
+//! The macOS engine: PDF pages are rasterized with CoreGraphics (Preview's engine) and
+//! document structure (outline, links) and text are read with PDFKit. Images open as a
+//! document of one page, decoded with ImageIO and drawn as they are, not wrapped in a PDF.
 
 use std::marker::PhantomData;
 use std::path::Path;
@@ -7,57 +8,158 @@ use std::path::Path;
 use eframe::egui::{Pos2, Rect, Vec2, pos2, vec2};
 use objc2::AnyThread;
 use objc2::rc::Retained;
-use objc2_core_foundation::{CFRetained, CGAffineTransform, CGPoint, CGRect, CGSize};
+use objc2_core_foundation::{
+    CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType, CFURL, CGAffineTransform, CGPoint, CGRect, CGSize,
+};
 use objc2_core_graphics::{
-    CGBitmapContextCreate, CGColorSpace, CGContext, CGImageAlphaInfo, CGInterpolationQuality, CGPDFBox, CGPDFDocument,
-    CGPDFPage, kCGColorSpaceSRGB,
+    CGBitmapContextCreate, CGColorSpace, CGContext, CGImage, CGImageAlphaInfo, CGInterpolationQuality, CGPDFBox,
+    CGPDFDocument, CGPDFPage, kCGColorSpaceSRGB,
 };
 use objc2_foundation::{NSRange, NSURL};
+use objc2_image_io::{
+    CGImageSource, kCGImagePropertyDPIHeight, kCGImagePropertyDPIWidth, kCGImageSourceShouldCacheImmediately,
+};
 use objc2_pdf_kit::{PDFActionGoTo, PDFActionURL, PDFDestination, PDFDocument, PDFOutline, PDFPage};
 
 use crate::renderer::{Link, OutlineEntry, Target};
 
-/// An open document: PDFKit for structure, and the CoreGraphics document it wraps for
-/// rendering. Closing it (dropping) frees CoreGraphics' per-document caches.
 /// Runs `f`, releasing what CoreGraphics autoreleased during it.
 pub fn autoreleasepool<R>(f: impl FnOnce() -> R) -> R {
     objc2::rc::autoreleasepool(|_| f())
 }
 
-pub struct Document {
+/// An open document: a PDF, or an image shown as its only page.
+pub struct Document(Source);
+
+enum Source {
+    Pdf(Pdf),
+    Image(Image),
+}
+
+/// One page of an open [`Document`].
+pub struct Page<'a>(PageSource<'a>);
+
+enum PageSource<'a> {
+    Pdf(PdfPage<'a>),
+    Image(&'a Image),
+}
+
+impl Document {
+    /// Opens `path` as a PDF, or failing that as an image.
+    pub fn open(path: &Path) -> Option<Self> {
+        Pdf::open(path).map(Source::Pdf).or_else(|| Image::open(path).map(Source::Image)).map(Self)
+    }
+
+    pub fn page_count(&self) -> u32 {
+        match &self.0 {
+            Source::Pdf(pdf) => pdf.page_count(),
+            Source::Image(_) => 1,
+        }
+    }
+
+    /// `index` is zero-based.
+    pub fn page(&self, index: u32) -> Option<Page<'_>> {
+        match &self.0 {
+            Source::Pdf(pdf) => pdf.page(index).map(PageSource::Pdf),
+            Source::Image(image) => (index == 0).then_some(PageSource::Image(image)),
+        }
+        .map(Page)
+    }
+
+    pub fn outline(&self) -> Vec<OutlineEntry> {
+        match &self.0 {
+            Source::Pdf(pdf) => pdf.outline(),
+            Source::Image(_) => Vec::new(),
+        }
+    }
+}
+
+impl Page<'_> {
+    /// Displayed size in PDF points, after rotation.
+    pub fn size(&self) -> Vec2 {
+        match &self.0 {
+            PageSource::Pdf(page) => page.geometry.size(),
+            PageSource::Image(image) => image.size,
+        }
+    }
+
+    pub fn links(&self) -> Vec<Link> {
+        match &self.0 {
+            PageSource::Pdf(page) => page.links(),
+            PageSource::Image(_) => Vec::new(),
+        }
+    }
+}
+
+/// An image, decoded when opened and kept decoded for as long as the document is open, so
+/// draws never go back to the file (which may since have changed or gone).
+struct Image {
+    image: CFRetained<CGImage>,
+    /// In points: pixels at the image's resolution (72 dpi when it gives none), as Preview sizes it.
+    size: Vec2,
+}
+
+impl Image {
+    fn open(path: &Path) -> Option<Self> {
+        let url = CFURL::from_file_path(path)?;
+        // SAFETY: `url` is a valid file URL, and ImageIO's property dictionary has CFString keys.
+        let (image, properties) = unsafe {
+            let source = CGImageSource::with_url(&url, None)?;
+            let decode_now =
+                CFDictionary::from_slices(&[kCGImageSourceShouldCacheImmediately], &[CFBoolean::new(true)]);
+            let image = source.image_at_index(0, Some(decode_now.as_ref()))?;
+            let properties = source
+                .properties_at_index(0, None)
+                .map(|p| CFRetained::cast_unchecked::<CFDictionary<CFString, CFType>>(p));
+            (image, properties)
+        };
+        let dpi = |key: &CFString| {
+            let number = properties.as_ref()?.get(key)?.downcast::<CFNumber>().ok()?;
+            number.as_f64().filter(|dpi| *dpi > 0.0)
+        };
+        // SAFETY: ImageIO's property keys are immutable statics.
+        let (dpi_x, dpi_y) = unsafe { (dpi(kCGImagePropertyDPIWidth), dpi(kCGImagePropertyDPIHeight)) };
+        let points = |pixels: usize, dpi: Option<f64>| (pixels as f64 * 72.0 / dpi.unwrap_or(72.0)) as f32;
+        let size = vec2(points(CGImage::width(Some(&image)), dpi_x), points(CGImage::height(Some(&image)), dpi_y));
+        Some(Self { image, size })
+    }
+}
+
+/// A PDF: PDFKit for structure, and the CoreGraphics document it wraps for rendering.
+/// Closing it (dropping) frees CoreGraphics' per-document caches.
+struct Pdf {
     pdf: Retained<PDFDocument>,
     cg: Retained<CGPDFDocument>,
 }
 
-/// One page of an open [`Document`].
-pub struct Page<'a> {
-    doc: &'a Document,
+struct PdfPage<'a> {
+    doc: &'a Pdf,
     index: u32,
     page: CFRetained<CGPDFPage>,
     geometry: PageGeometry,
 }
 
-impl Document {
-    pub fn open(path: &Path) -> Option<Self> {
+impl Pdf {
+    fn open(path: &Path) -> Option<Self> {
         let pdf = open_pdf(path)?;
         // SAFETY: plain PDFKit getter.
         let cg = unsafe { pdf.documentRef() }?;
-        (CGPDFDocument::number_of_pages(Some(&cg)) > 0).then_some(Document { pdf, cg })
+        (CGPDFDocument::number_of_pages(Some(&cg)) > 0).then_some(Self { pdf, cg })
     }
 
-    pub fn page_count(&self) -> u32 {
+    fn page_count(&self) -> u32 {
         CGPDFDocument::number_of_pages(Some(&self.cg)) as u32
     }
 
     /// `index` is zero-based; CoreGraphics numbers pages from 1.
-    pub fn page(&self, index: u32) -> Option<Page<'_>> {
+    fn page(&self, index: u32) -> Option<PdfPage<'_>> {
         let page = CGPDFDocument::page(Some(&self.cg), index as usize + 1)?;
         let geometry = PageGeometry::of(&page);
-        Some(Page { doc: self, index, page, geometry })
+        Some(PdfPage { doc: self, index, page, geometry })
     }
 
-    pub fn outline(&self) -> Vec<OutlineEntry> {
-        fn walk(doc: &Document, node: &PDFOutline, depth: usize, out: &mut Vec<OutlineEntry>) {
+    fn outline(&self) -> Vec<OutlineEntry> {
+        fn walk(doc: &Pdf, node: &PDFOutline, depth: usize, out: &mut Vec<OutlineEntry>) {
             // SAFETY: plain PDFKit getters on objects owned by `doc`.
             for i in 0..unsafe { node.numberOfChildren() } {
                 let Some(child) = (unsafe { node.childAtIndex(i) }) else { continue };
@@ -92,13 +194,8 @@ impl Document {
     }
 }
 
-impl Page<'_> {
-    /// Displayed size in PDF points, after rotation.
-    pub fn size(&self) -> Vec2 {
-        self.geometry.size()
-    }
-
-    pub fn links(&self) -> Vec<Link> {
+impl PdfPage<'_> {
+    fn links(&self) -> Vec<Link> {
         let doc = self.doc;
         // SAFETY: plain PDFKit getters on objects owned by `doc`.
         let Some(pdf_page) = (unsafe { doc.pdf.pageAtIndex(self.index as usize) }) else { return vec![] };
@@ -282,7 +379,7 @@ impl<'a> Bitmap<'a> {
     /// corner at `top_left` (pixels from the bitmap's top-left; CoreGraphics' origin is the
     /// bottom-left).
     pub fn draw(&self, page: &Page, page_px: [f64; 2], top_left: [f64; 2]) {
-        let display = page.geometry.size();
+        let display = page.size();
         let (dw, dh) = (display.x as f64, display.y as f64);
         let c = Some(&*self.ctx);
         CGContext::save_g_state(c);
@@ -292,8 +389,106 @@ impl<'a> Bitmap<'a> {
         CGContext::clip_to_rect(c, bounds);
         CGContext::set_rgb_fill_color(c, 1.0, 1.0, 1.0, 1.0);
         CGContext::fill_rect(c, bounds);
-        CGContext::concat_ctm(c, page.geometry.page_to_display());
-        CGContext::draw_pdf_page(c, Some(&page.page));
+        match &page.0 {
+            PageSource::Pdf(page) => {
+                CGContext::concat_ctm(c, page.geometry.page_to_display());
+                CGContext::draw_pdf_page(c, Some(&page.page));
+            }
+            PageSource::Image(image) => CGContext::draw_image(c, bounds, Some(&image.image)),
+        }
         CGContext::restore_g_state(c);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RED: [u8; 4] = [255, 0, 0, 255];
+    const BLUE: [u8; 4] = [0, 0, 255, 255];
+    const GREEN: [u8; 4] = [0, 255, 0, 255];
+    const CLEAR: [u8; 4] = [0, 0, 0, 0];
+
+    /// Writes a 40x20 PNG: red top-left, blue top-right and green bottom quarters, with the
+    /// green's last column transparent. `dpi` sets its resolution (pHYs), if any.
+    fn quarters_png(name: &str, dpi: Option<f64>) -> std::path::PathBuf {
+        let (w, h) = (40, 20);
+        let pixels: Vec<u8> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .flat_map(|(x, y)| match (x, y) {
+                (_, y) if y >= h / 2 && x == w - 1 => CLEAR,
+                (_, y) if y >= h / 2 => GREEN,
+                (x, _) if x < w / 2 => RED,
+                _ => BLUE,
+            })
+            .collect();
+        let path = std::env::temp_dir().join(format!("lightweight-pdf-engine-{}-{name}.png", std::process::id()));
+        let mut enc = png::Encoder::new(std::fs::File::create(&path).unwrap(), w, h);
+        enc.set_color(png::ColorType::Rgba);
+        if let Some(dpi) = dpi {
+            let ppm = (dpi / 0.0254).round() as u32;
+            enc.set_pixel_dims(Some(png::PixelDimensions { xppu: ppm, yppu: ppm, unit: png::Unit::Meter }));
+        }
+        enc.write_header().unwrap().write_image_data(&pixels).unwrap();
+        path
+    }
+
+    fn assert_near(actual: &[u8], expected: [u8; 4], at: (usize, usize)) {
+        let close = actual.iter().zip(expected).all(|(a, e)| a.abs_diff(e) <= 3);
+        assert!(close, "pixel {at:?} is {actual:?}, expected {expected:?}");
+    }
+
+    #[test]
+    fn png_opens_as_one_page_of_its_pixel_size() {
+        let path = quarters_png("plain", None);
+        let doc = Document::open(&path).expect("open");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(doc.page_count(), 1);
+        assert!(doc.page(1).is_none());
+        let page = doc.page(0).unwrap();
+        assert_eq!(page.size(), vec2(40.0, 20.0));
+        assert!(page.links().is_empty());
+        assert!(doc.outline().is_empty());
+    }
+
+    #[test]
+    fn png_resolution_sets_its_size_in_points() {
+        let path = quarters_png("retina", Some(144.0));
+        let doc = Document::open(&path).expect("open");
+        let _ = std::fs::remove_file(&path);
+        let size = doc.page(0).unwrap().size();
+        assert!((size - vec2(20.0, 10.0)).length() < 0.01, "size {size:?}");
+    }
+
+    #[test]
+    fn png_draws_upright_on_white() {
+        let path = quarters_png("draw", None);
+        let doc = Document::open(&path).expect("open");
+        let _ = std::fs::remove_file(&path);
+        let (w, h) = (40, 20);
+        let mut rgba = vec![0u8; w * h * 4];
+        Bitmap::new(&mut rgba, w as u32, h as u32).unwrap().draw(&doc.page(0).unwrap(), [40.0, 20.0], [0.0, 0.0]);
+        let pixel = |x: usize, y: usize| &rgba[(y * w + x) * 4..][..4];
+        assert_near(pixel(5, 3), RED, (5, 3));
+        assert_near(pixel(35, 3), BLUE, (35, 3));
+        assert_near(pixel(20, 16), GREEN, (20, 16));
+        assert_near(pixel(39, 16), [255, 255, 255, 255], (39, 16));
+    }
+
+    #[test]
+    fn png_has_no_text_to_search() {
+        let path = quarters_png("text", None);
+        let text = TextDocument::open(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(text.is_none());
+    }
+
+    #[test]
+    fn other_files_do_not_open() {
+        let path = std::env::temp_dir().join(format!("lightweight-pdf-engine-{}-notes.txt", std::process::id()));
+        std::fs::write(&path, "not a document").unwrap();
+        let doc = Document::open(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(doc.is_none());
     }
 }

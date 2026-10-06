@@ -21,7 +21,7 @@ cp assets/AppIcon.icns "$APP/Contents/Resources/"
 # LSEnvironment: LaunchServices starts the app with MallocSpaceEfficient=1 already set, so
 # the default memory presets need no relaunch (see src/memory.rs).
 # LSHandlerRank "Alternate" lists the app under "Open With" without taking over as the
-# default PDF viewer; pick it as the default in Finder's Get Info if you want that.
+# default PDF (or PNG) viewer; pick it as the default in Finder's Get Info if you want that.
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -50,6 +50,12 @@ cat > "$APP/Contents/Info.plist" <<EOF
             <key>CFBundleTypeRole</key><string>Viewer</string>
             <key>LSHandlerRank</key><string>Alternate</string>
             <key>LSItemContentTypes</key><array><string>com.adobe.pdf</string></array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key><string>PNG Image</string>
+            <key>CFBundleTypeRole</key><string>Viewer</string>
+            <key>LSHandlerRank</key><string>Alternate</string>
+            <key>LSItemContentTypes</key><array><string>public.png</string></array>
         </dict>
     </array>
 </dict>
