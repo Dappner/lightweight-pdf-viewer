@@ -2,6 +2,12 @@
 //! thread, and reads their text for search. CoreGraphics and PDFKit on macOS; elsewhere a
 //! synthetic stand-in, so everything else can be built, tested and benchmarked on any platform.
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveOutcome {
+    Saved,
+    PreviewMayResize,
+}
+
 #[cfg(target_os = "macos")]
 mod coregraphics;
 #[cfg(any(target_os = "macos", test))]

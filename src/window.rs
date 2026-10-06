@@ -547,8 +547,8 @@ impl Window {
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("The save stopped unexpectedly".into()),
             };
             match result {
-                Ok(()) => {
-                    tab.text_boxes.saving = Some(Saving::Done(ctx.input(|i| i.time)));
+                Ok(outcome) => {
+                    tab.text_boxes.saving = Some(Saving::Done(ctx.input(|i| i.time), outcome));
                     ctx.request_repaint_after(std::time::Duration::from_secs_f64(SAVED_SECONDS));
                     tab.text_boxes.saved();
                     let restore = match &tab.doc {
@@ -741,7 +741,10 @@ impl Window {
             Some(Saving::Running(_)) => "   Saving…".to_string(),
             Some(Saving::Failed(e)) => format!("   Not saved: {e}"),
             _ if tab.text_boxes.unsaved() => "   Edited".to_string(),
-            Some(Saving::Done(at)) if now - at < SAVED_SECONDS => "   Saved".to_string(),
+            Some(Saving::Done(_, engine::SaveOutcome::PreviewMayResize)) => {
+                "   Saved; Preview may resize text when editing".to_string()
+            }
+            Some(Saving::Done(at, engine::SaveOutcome::Saved)) if now - at < SAVED_SECONDS => "   Saved".to_string(),
             _ => String::new(),
         };
         Some(format!("{pages} / {}   {:.0}%{edits}", layout.page_count(), tab.view.zoom * 100.0))

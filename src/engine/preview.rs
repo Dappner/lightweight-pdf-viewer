@@ -3,8 +3,8 @@
 //! PDFKit writes the font in PDF points, but AnnotationKit can multiply that font by its
 //! archived `originalModelBaseScaleFactor` when Preview starts editing (12 becomes 6.77
 //! points on the display used to reproduce this). Normalize only boxes we just styled.
-//! This is an undocumented archive field: an unfamiliar archive aborts the save before
-//! the original file is replaced. We parse the plist as data, never unarchive ObjC classes.
+//! This is an undocumented archive field: an unfamiliar archive leaves PDFKit's output
+//! intact and reports a compatibility warning. We parse data, never unarchive ObjC classes.
 //! An incremental PDF update leaves every appearance stream and untouched object intact.
 
 use std::io::Cursor;
@@ -29,6 +29,17 @@ pub(super) struct EditedBox {
 
 type Result<T> = std::result::Result<T, String>;
 
+/// Best effort: even a failed write of the corrected revision keeps PDFKit's file intact.
+pub(super) fn apply(path: &Path, boxes: &[EditedBox]) -> super::SaveOutcome {
+    match normalize(path, boxes) {
+        Ok(()) => super::SaveOutcome::Saved,
+        Err(error) => {
+            eprintln!("Saved without Preview text compatibility: {error}");
+            super::SaveOutcome::PreviewMayResize
+        }
+    }
+}
+
 fn check<T, E: std::fmt::Display>(result: std::result::Result<T, E>) -> Result<T> {
     result.map_err(|e| e.to_string())
 }
@@ -41,7 +52,9 @@ pub(super) fn normalize(path: &Path, boxes: &[EditedBox]) -> Result<()> {
     let doc = check(Document::load_mem(&bytes))?;
     // PDFKit's writer owns encryption. Never append an unencrypted revision to an
     // encrypted file; unsupported saves leave the original in place.
-    if doc.is_encrypted() {
+    // lopdf automatically decrypts empty-password PDFs while loading. These still need
+    // the fallback: its decrypted dictionaries cannot be appended to encrypted bytes.
+    if doc.is_encrypted() || doc.was_encrypted() {
         return Err("Preview compatibility cannot update an encrypted PDF".into());
     }
     let mut edits = Vec::new();
@@ -76,7 +89,14 @@ pub(super) fn normalize(path: &Path, boxes: &[EditedBox]) -> Result<()> {
             return Err("Preview annotation scale did not survive saving".into());
         }
     }
-    check(std::fs::write(path, output))
+    // Never write over PDFKit's output in place: a partial write must also fall back safely.
+    let name = path.file_name().ok_or("Not a file")?.to_string_lossy();
+    let corrected = path.with_file_name(format!(".{name}.preview"));
+    let result = std::fs::write(&corrected, output).and_then(|()| std::fs::rename(&corrected, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&corrected);
+    }
+    check(result)
 }
 
 fn annotation<'a>(doc: &'a Document, b: &EditedBox) -> Result<(ObjectId, &'a Dictionary)> {
@@ -288,6 +308,100 @@ mod tests {
         selected.bounds[0] = 80.0;
         assert!(normalize(&path, &[selected]).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unsupported_archives_save_pdfkit_output_unchanged() {
+        for missing_scale in [false, true] {
+            let (path, selected) = fixture(if missing_scale { "missing-scale" } else { "unknown-class" });
+            let mut doc = Document::load(&path).unwrap();
+            let (id, _) = annotation(&doc, &selected).unwrap();
+            let (mut value, root) = archive(&blob(0.56424)).unwrap();
+            let objects = value.as_dictionary_mut().unwrap().get_mut("$objects").unwrap().as_array_mut().unwrap();
+            if missing_scale {
+                objects[root].as_dictionary_mut().unwrap().remove(SCALE);
+            } else {
+                objects[2]
+                    .as_dictionary_mut()
+                    .unwrap()
+                    .insert("$classname".into(), Value::String("FutureTextBox".into()));
+            }
+            let mut bytes = Vec::new();
+            value.to_writer_binary(&mut bytes).unwrap();
+            doc.get_object_mut(id)
+                .unwrap()
+                .as_dict_mut()
+                .unwrap()
+                .set(EXTRAS, dictionary! {"AAPL:AKAnnotationObject" => Object::string_literal(STANDARD.encode(bytes))});
+            doc.save(&path).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            assert_eq!(apply(&path, &[selected]), super::super::SaveOutcome::PreviewMayResize);
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn encrypted_output_falls_back_without_changing_encryption() {
+        use lopdf::{EncryptionState, EncryptionVersion, Permissions};
+        let (path, selected) = fixture("encrypted");
+        let mut doc = Document::load(&path).unwrap();
+        doc.trailer.set("ID", vec![Object::string_literal(b"preview-test-id".to_vec()); 2]);
+        let state = EncryptionState::try_from(EncryptionVersion::V1 {
+            document: &doc,
+            owner_password: "owner",
+            user_password: "",
+            permissions: Permissions::all(),
+        })
+        .unwrap();
+        doc.encrypt(&state).unwrap();
+        doc.save(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(apply(&path, &[selected]), super::super::SaveOutcome::PreviewMayResize);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let mut saved = Document::load(&path).unwrap();
+        if saved.is_encrypted() {
+            saved.decrypt("").unwrap();
+        }
+        assert!(annotation(&saved, &EditedBox { page: 0, ordinal: 0, size: 12.0, bounds: [0.0; 4] }).is_ok());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn corrected_output_write_failure_keeps_pdfkit_output() {
+        let (path, selected) = fixture("write-failure");
+        let before = std::fs::read(&path).unwrap();
+        let corrected = path.with_file_name(format!(".{}.preview", path.file_name().unwrap().to_string_lossy()));
+        // A directory makes opening the correction file fail, even when running as root.
+        std::fs::create_dir(&corrected).unwrap();
+        assert_eq!(apply(&path, &[selected]), super::super::SaveOutcome::PreviewMayResize);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_dir(corrected).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pdfkit_save_commits_edits_when_preview_correction_cannot_be_written() {
+        use crate::text_boxes::{PageSave, TextBox};
+        use eframe::egui::{Rect, pos2};
+
+        let (path, _) = fixture("pdfkit-fallback");
+        let corrected =
+            path.with_file_name(format!("..{}.saving.preview", path.file_name().unwrap().to_string_lossy()));
+        std::fs::create_dir(&corrected).unwrap();
+        let b = TextBox::new(pos2(0.1, 0.4), "Saved despite Preview compatibility failure".into());
+        let save =
+            PageSave { page: 0, complete: true, boxes: vec![(b, Rect::from_min_max(pos2(0.1, 0.4), pos2(0.6, 0.44)))] };
+        assert_eq!(
+            crate::engine::save_text_boxes(&path, &[save]).unwrap(),
+            super::super::SaveOutcome::PreviewMayResize
+        );
+        let doc = Document::load(&path).unwrap();
+        let a = annotation(&doc, &EditedBox { page: 0, ordinal: 0, size: 12.0, bounds: [0.0; 4] }).unwrap().1;
+        assert_eq!(a.get(b"Contents").unwrap().as_str().unwrap(), b"Saved despite Preview compatibility failure");
+        std::fs::remove_dir(corrected).unwrap();
         std::fs::remove_file(path).unwrap();
     }
 

@@ -194,10 +194,10 @@ pub struct PageSave {
 
 /// A save under way, or how the last one went.
 pub enum Saving {
-    Running(Receiver<Result<(), String>>),
+    Running(Receiver<Result<crate::engine::SaveOutcome, String>>),
     Failed(String),
     /// Finished at this time (egui's clock), shown as saved for a moment.
-    Done(f64),
+    Done(f64, crate::engine::SaveOutcome),
 }
 
 /// One tab's text boxes.

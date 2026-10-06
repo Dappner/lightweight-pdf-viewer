@@ -81,7 +81,7 @@ impl Page<'_> {
     }
 }
 
-pub fn save_text_boxes(_path: &Path, _pages: &[PageSave]) -> Result<(), String> {
+pub fn save_text_boxes(_path: &Path, _pages: &[PageSave]) -> Result<super::SaveOutcome, String> {
     Err("Saving text boxes needs macOS".into())
 }
 

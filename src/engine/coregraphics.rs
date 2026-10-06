@@ -402,10 +402,11 @@ fn default_appearance(da: &str) -> (f32, [u8; 3]) {
 /// Writes text boxes into the PDF at `path`: changes and removes the file's own as `pages`
 /// says, and adds the new ones. Writes a copy and moves it over the file, so a failed save
 /// leaves the file as it was. PDFKit rewrites the whole document, so this can take seconds.
-pub fn save_text_boxes(path: &Path, pages: &[PageSave]) -> Result<(), String> {
+pub fn save_text_boxes(path: &Path, pages: &[PageSave]) -> Result<super::SaveOutcome, String> {
     autoreleasepool(|| {
         let pdf = open_pdf(path).ok_or("The file couldn't be opened")?;
         let mut edited_boxes = Vec::new();
+        let mut identified = true;
         for save in pages {
             // SAFETY: plain PDFKit calls on objects owned by `pdf`.
             let Some(page) = (unsafe { pdf.pageAtIndex(save.page as usize) }) else { continue };
@@ -465,7 +466,7 @@ pub fn save_text_boxes(path: &Path, pages: &[PageSave]) -> Result<(), String> {
                 }
             }
             if edited_boxes.iter().filter(|b| b.page == save.page).count() != styled.len() {
-                return Err("The edited text boxes couldn't be identified for saving".into());
+                identified = false;
             }
         }
         let name = path.file_name().ok_or("Not a file")?.to_string_lossy();
@@ -476,17 +477,16 @@ pub fn save_text_boxes(path: &Path, pages: &[PageSave]) -> Result<(), String> {
             let _ = std::fs::remove_file(&temp);
             return Err("PDFKit couldn't write the file".into());
         }
-        if let Err(error) = preview::normalize(&temp, &edited_boxes) {
-            let _ = std::fs::remove_file(&temp);
-            return Err(format!("The text edits couldn't be saved for Preview: {error}"));
-        }
+        let outcome =
+            if identified { preview::apply(&temp, &edited_boxes) } else { super::SaveOutcome::PreviewMayResize };
         if let Ok(meta) = std::fs::metadata(path) {
             let _ = std::fs::set_permissions(&temp, meta.permissions());
         }
         std::fs::rename(&temp, path).map_err(|e| {
             let _ = std::fs::remove_file(&temp);
             format!("The file couldn't be replaced: {e}")
-        })
+        })?;
+        Ok(outcome)
     })
 }
 
