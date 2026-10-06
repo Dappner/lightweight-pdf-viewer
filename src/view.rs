@@ -3,6 +3,7 @@
 use eframe::egui::ahash::{HashMap, HashSet};
 use std::time::Duration;
 
+use eframe::egui::scroll_area::ScrollSource;
 use eframe::egui::{
     Color32, CursorIcon, Pos2, Rect, ScrollArea, Sense, Stroke, StrokeKind, TextureHandle, Ui, Vec2, pos2, vec2,
 };
@@ -14,7 +15,9 @@ use crate::history::Place;
 use crate::layout::{DocLayout, MARGIN, PageLayout};
 use crate::renderer::{DocId, Key, Link, SnapshotJob, SnapshotPage, TILE, Target, page_pixels, scale_key};
 use crate::search::Search;
+use crate::selection::Unit;
 use crate::tab::View;
+use crate::text_layers::{MIN_LAYER_HEIGHT, TextLayers};
 
 pub const MIN_ZOOM: f32 = 0.1;
 pub const MAX_ZOOM: f32 = 8.0;
@@ -22,6 +25,10 @@ pub const MAX_ZOOM: f32 = 8.0;
 // TODO(perf): 0.15 s is most of the ~175 ms "zoom to sharp" in the benchmark. Try
 // 0.08-0.1 s: sharper sooner, but more discarded renders during a slow pinch.
 const ZOOM_SETTLE: f64 = 0.15;
+/// Points a second the pages scroll per point a selection is dragged past the top or bottom
+/// edge, up to [`EDGE_SCROLL_MAX`] points past.
+const EDGE_SCROLL: f32 = 30.0;
+const EDGE_SCROLL_MAX: f32 = 60.0;
 
 const UV: Rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
 
@@ -190,6 +197,8 @@ pub struct Canvas<'a> {
     pub links: &'a HashMap<u32, Vec<Link>>,
     /// The find bar's search, whose matches are highlighted.
     pub search: Option<&'a Search>,
+    /// Text layers and the selection, which the pointer selects with.
+    pub text: &'a mut TextLayers,
     /// Width of the sidebar's thumbnails, drawn as placeholders until tiles arrive.
     pub thumb_px: u32,
     /// Screen heights rendered ahead, above and below the visible area.
@@ -207,7 +216,7 @@ pub struct CanvasOutput {
 
 impl Canvas<'_> {
     pub fn show(self, ui: &mut Ui, wants: &mut Wants) -> CanvasOutput {
-        let Canvas { doc, layout, view, snapshot, cache, failed, links, search, thumb_px, prefetch, page_border } =
+        let Canvas { doc, layout, view, snapshot, cache, failed, links, search, text, thumb_px, prefetch, page_border } =
             self;
         let ppp = ui.ctx().pixels_per_point();
         let now = ui.input(|i| i.time);
@@ -237,7 +246,11 @@ impl Canvas<'_> {
         }
 
         let content = layout.content_size(view.zoom, area.width());
-        let mut scroll = ScrollArea::both().id_salt(("doc", doc)).auto_shrink(false);
+        // Dragging selects text rather than scrolling.
+        let mut scroll = ScrollArea::both()
+            .id_salt(("doc", doc))
+            .auto_shrink(false)
+            .scroll_source(ScrollSource { drag: false, ..ScrollSource::ALL });
         let jumped = view.pending_offset.is_some();
         if let Some(offset) = view.pending_offset.take() {
             scroll = scroll.scroll_offset(offset);
@@ -252,6 +265,16 @@ impl Canvas<'_> {
             let painter = ui.painter();
             let screen_viewport = viewport.translate(origin);
             let prefetch = screen_viewport.expand2(vec2(0.0, viewport.height() * prefetch));
+            // Under the links, which take clicks before it; drags are its alone. Clear of the
+            // sidebar's resize handle, which reaches into the canvas and was laid out first.
+            let grab = ui.style().interaction.resize_grab_radius_side;
+            let area = Rect::from_x_y_ranges(
+                screen_viewport.left() + grab..=screen_viewport.right(),
+                screen_viewport.y_range(),
+            );
+            let pointer = ui.interact(area, ui.id().with(("canvas", doc)), Sense::click_and_drag());
+            let mut over_link = false;
+            let mut page_rects: Vec<(u32, Rect)> = Vec::new();
 
             if let Some(texture) = snapshot.as_ref() {
                 let size = Vec2::from(texture.size().map(|v| v as f32)) / snapshot_scale(ppp);
@@ -273,6 +296,7 @@ impl Canvas<'_> {
                 let min = snap_pos(layout.page_rect(page, view.zoom, content.x).min + origin, ppp);
                 let rect = Rect::from_min_size(min, vec2(pw as f32, ph as f32) * points_per_pixel);
                 let visible = rect.intersects(screen_viewport);
+                page_rects.push((page as u32, rect));
 
                 if visible {
                     visible_pages.push((page as u32, rect));
@@ -299,6 +323,7 @@ impl Canvas<'_> {
                                 let response = ui
                                     .interact(area, ui.id().with(("link", doc, page, i)), Sense::click())
                                     .on_hover_cursor(CursorIcon::PointingHand);
+                                over_link |= response.hovered();
                                 if response.clicked() {
                                     clicked_link = Some(link.target.clone());
                                 }
@@ -329,7 +354,28 @@ impl Canvas<'_> {
                 }
             }
 
-            // Over the tiles: every match on screen, the current one stronger.
+            select(ui, &pointer, text, view, &page_rects, over_link, screen_viewport);
+            // Over the tiles: the selection, then every match on screen, the current one stronger.
+            if let Some(selection) = text.selection() {
+                for &(page, rect) in &visible_pages {
+                    if !selection.pages().contains(&page) {
+                        continue;
+                    }
+                    // A page selected whole and too small to read is tinted, its text unread.
+                    let whole = page != selection.start().page && page != selection.end().page;
+                    if whole && rect.height() < MIN_LAYER_HEIGHT {
+                        painter.rect_filled(rect, 0.0, selection_color());
+                        continue;
+                    }
+                    text.want(ui.ctx(), page);
+                    let Some(layer) = text.layer(page) else { continue };
+                    let Some(range) = selection.range_on(page, layer.len()) else { continue };
+                    for area in layer.rects(range) {
+                        painter.rect_filled(find_bar::on_page(rect, area), 0.0, selection_color());
+                    }
+                }
+            }
+
             if let Some(search) = search {
                 let (all, current) = highlight_colors();
                 for &(page, rect) in &visible_pages {
@@ -340,7 +386,12 @@ impl Canvas<'_> {
                 }
             }
 
-            (all_visible_ready, clicked_link, most_visible.1, visible_pages.into_iter().map(|(p, _)| p).collect())
+            (
+                all_visible_ready,
+                clicked_link,
+                most_visible.1,
+                visible_pages.into_iter().map(|(p, _)| p).collect::<Vec<u32>>(),
+            )
         });
         let (all_visible_ready, clicked_link, most_visible, visible_pages) = output.inner;
 
@@ -359,8 +410,83 @@ impl Canvas<'_> {
             // The new scale fully covers the viewport; drop tiles rendered at other scales.
             cache.retain(|k| !matches!(*k, Key::Tile { doc: d, scale: s, .. } if d == doc && s != scale));
         }
+        text.tidy(view.current_page as u32, &visible_pages);
         CanvasOutput { ready: all_visible_ready && view.zoom == view.render_zoom, clicked_link, visible_pages }
     }
+}
+
+/// Takes the pointer's part in selecting text: asks for the layer of a page it moves over,
+/// shows an I-beam over text, and selects by dragging, double and triple clicks, and
+/// shift-clicks. `pages` are the pages laid out this frame, with their screen rects.
+fn select(
+    ui: &Ui,
+    pointer: &eframe::egui::Response,
+    text: &mut TextLayers,
+    view: &mut View,
+    pages: &[(u32, Rect)],
+    over_link: bool,
+    viewport: Rect,
+) {
+    let ctx = ui.ctx();
+    // The page nearest a screen point, and the point as fractions of it.
+    let on_page = |p: Pos2| {
+        pages
+            .iter()
+            .min_by(|a, b| a.1.distance_sq_to_pos(p).total_cmp(&b.1.distance_sq_to_pos(p)))
+            .map(|&(page, rect)| (page, ((p - rect.min) / rect.size()).to_pos2()))
+    };
+    let (hover, moved, shift) = ui.input(|i| (i.pointer.hover_pos(), i.pointer.is_moving(), i.modifiers.shift));
+    let hover = hover.filter(|p| viewport.contains(*p)).and_then(on_page);
+    // Only a pointer moving over a page reads its text; scrolling past doesn't.
+    if let Some((page, _)) = hover
+        && (moved || pointer.is_pointer_button_down_on())
+    {
+        text.want(ctx, page);
+    }
+    let over_text = hover.is_some_and(|(page, p)| text.layer(page).is_some_and(|l| l.is_over_text(p)));
+    if text.dragging() || (over_text && !over_link) {
+        ctx.set_cursor_icon(CursorIcon::Text);
+    }
+
+    let at = pointer.interact_pointer_pos().and_then(on_page);
+    if let Some(at) = at {
+        if pointer.triple_clicked() {
+            text.select(ctx, at, Unit::Line);
+        } else if pointer.double_clicked() {
+            text.select(ctx, at, Unit::Word);
+        } else if pointer.clicked() && shift {
+            text.extend(ctx, at);
+        } else if pointer.clicked() {
+            text.clear_selection();
+        }
+    }
+    if pointer.drag_started()
+        && let Some(anchor) = ui.input(|i| i.pointer.press_origin()).and_then(on_page)
+    {
+        text.begin(ctx, anchor, Unit::Char);
+    }
+    if pointer.dragged()
+        && let Some(pos) = pointer.interact_pointer_pos()
+    {
+        if let Some(focus) = on_page(pos) {
+            text.update(ctx, focus);
+        }
+        // Past the top or bottom edge, the pages scroll, faster the farther out.
+        let past = (pos.y - viewport.bottom()).max(0.0) + (pos.y - viewport.top()).min(0.0);
+        if past != 0.0 {
+            let dt = ui.input(|i| i.stable_dt).min(0.1);
+            view.scroll_by(vec2(0.0, past.clamp(-EDGE_SCROLL_MAX, EDGE_SCROLL_MAX) * EDGE_SCROLL * dt));
+            ctx.request_repaint();
+        }
+    }
+    if pointer.drag_stopped() {
+        text.finish();
+    }
+}
+
+/// Fill color of selected text.
+fn selection_color() -> Color32 {
+    Color32::from_rgba_unmultiplied(64, 140, 255, 80)
 }
 
 /// Fill colors of search matches: all of them, and the current one.

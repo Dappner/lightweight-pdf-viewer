@@ -130,6 +130,10 @@ pub struct Stats {
     pub find_done: bool,
     /// Searches with a worker attached, in every window and tab.
     pub search_workers: usize,
+    /// Bytes of text layers (for selecting) the active tab holds.
+    pub text_bytes: usize,
+    /// Tabs with a text layer worker attached, in every window.
+    pub text_workers: usize,
     /// Tiles and thumbnails rendered so far: each costs the render thread a page draw.
     pub rendered: u64,
     /// Of those, the ones thrown away on arrival: wasted draws.
@@ -451,8 +455,9 @@ impl State {
         }
         for window in &mut self.windows {
             let mut changed = false;
-            for search in window.tabs.iter_mut().filter_map(|t| t.search.as_mut()) {
-                changed |= search.receive();
+            for tab in &mut window.tabs {
+                changed |= tab.search.as_mut().is_some_and(|s| s.receive());
+                changed |= tab.text.receive();
             }
             if changed {
                 ctx.request_repaint_of(window.viewport);
@@ -714,6 +719,8 @@ impl State {
                 .filter_map(|t| t.search.as_ref())
                 .filter(|s| s.stats().worker)
                 .count(),
+            text_bytes: active.map_or(0, |t| t.text.bytes()),
+            text_workers: self.windows.iter().flat_map(|w| &w.tabs).filter(|t| t.text.has_worker()).count(),
             rendered: self.rendered,
             discarded: self.discarded,
         }

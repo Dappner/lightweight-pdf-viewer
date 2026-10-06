@@ -7,6 +7,7 @@ use crate::history::Place;
 use crate::layout::DocLayout;
 use crate::renderer::{DocId, Link, OutlineEntry, Snapshot};
 use crate::search::Search;
+use crate::text_layers::TextLayers;
 
 pub enum DocState {
     Loading,
@@ -33,6 +34,8 @@ pub struct Tab {
     pub restore: Option<Place>,
     /// The find bar's search, while it is open.
     pub search: Option<Search>,
+    /// Page text read for selecting, and the selection.
+    pub text: TextLayers,
 }
 
 /// Scroll and zoom state of a tab. Survives while the tab is in the background.
@@ -64,7 +67,7 @@ impl Tab {
             path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
         Self {
             id,
-            path,
+            path: path.clone(),
             title,
             doc: DocState::Loading,
             view: View::default(),
@@ -75,6 +78,7 @@ impl Tab {
             outline_requested: false,
             restore,
             search: None,
+            text: TextLayers::new(path.clone()),
         }
     }
 }

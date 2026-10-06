@@ -19,10 +19,12 @@ mod quick_open;
 mod renderer;
 pub mod search;
 pub mod search_index;
+mod selection;
 mod sidebar;
 mod tab;
 mod tab_bar;
 mod text;
+mod text_layers;
 mod theme;
 #[cfg(target_os = "macos")]
 pub mod titlebar;

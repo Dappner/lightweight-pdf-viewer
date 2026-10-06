@@ -100,6 +100,10 @@ impl TextPage {
         match self._none {}
     }
 
+    pub fn boxes(&self) -> (Vec<u16>, Vec<Rect>) {
+        match self._none {}
+    }
+
     pub fn char_top(&self, _index: u32) -> Option<f32> {
         match self._none {}
     }

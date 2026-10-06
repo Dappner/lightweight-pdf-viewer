@@ -157,6 +157,7 @@ impl Window {
             }
             old.snapshot_texture = None;
             old.links.clear();
+            old.text.clear();
             if let Some(search) = &mut old.search {
                 search.pause(true);
             }
@@ -505,6 +506,34 @@ impl Window {
         commands
     }
 
+    /// ⌘C copies the active tab's selection, ⌘A selects all its text and Escape clears the
+    /// selection, unless a text field has the keys. Copied text goes on the clipboard here.
+    fn selection_keys(&mut self, ctx: &Context) {
+        let typing = self.quick_open.is_some() || find_bar::focused(ctx, self.serial);
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        if !typing && let DocState::Ready(layout) = &tab.doc {
+            let (copy, all, escape) = ctx.input_mut(|i| {
+                (
+                    i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
+                    i.consume_key(Modifiers::COMMAND, KeyCode::A),
+                    i.consume_key(Modifiers::NONE, KeyCode::Escape),
+                )
+            });
+            if all {
+                tab.text.select_all(layout.page_count() as u32);
+            }
+            if escape {
+                tab.text.clear_selection();
+            }
+            if copy {
+                tab.text.copy(ctx);
+            }
+        }
+        if let Some(text) = tab.text.take_copied() {
+            ctx.copy_text(text);
+        }
+    }
+
     fn view_shortcuts(&mut self, ctx: &Context) {
         let Some(tab) = self.tabs.get_mut(self.active) else { return };
         let DocState::Ready(layout) = &tab.doc else { return };
@@ -596,6 +625,7 @@ impl Window {
         {
             self.tabs[self.active].search = None;
         }
+        self.selection_keys(ctx);
         self.update_find(ctx);
 
         let palette = palette(ctx.style().visuals.dark_mode);
@@ -680,6 +710,7 @@ impl Window {
                             failed: &shared.failed,
                             links: &tab.links,
                             search: tab.search.as_ref(),
+                            text: &mut tab.text,
                             thumb_px: shared.thumb_px,
                             prefetch: shared.prefetch,
                             page_border: palette.page_border,

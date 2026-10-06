@@ -269,6 +269,30 @@ impl TextPage {
         unsafe { self.page.string() }.map(|s| s.to_string())
     }
 
+    /// The page's text as UTF-16 units, each with its box as fractions of the displayed page
+    /// with a top-left origin; [`Rect::NOTHING`] for units without one (spaces and line
+    /// breaks PDFKit inserts).
+    pub fn boxes(&self) -> (Vec<u16>, Vec<Rect>) {
+        // SAFETY: plain PDFKit getter.
+        let Some(text) = (unsafe { self.page.string() }) else { return (vec![], vec![]) };
+        let units: Vec<u16> = text.to_string().encode_utf16().collect();
+        let Some(geometry) = &self.geometry else { return (vec![], vec![]) };
+        let rects = (0..units.len())
+            .map(|i| {
+                // SAFETY: plain PDFKit getter; `i` is within the page's string.
+                let b = unsafe { self.page.characterBoundsAtIndex(i as isize) };
+                if b.size.width <= 0.0 || b.size.height <= 0.0 {
+                    return Rect::NOTHING;
+                }
+                Rect::from_two_pos(
+                    geometry.to_fraction(b.origin.x, b.origin.y),
+                    geometry.to_fraction(b.origin.x + b.size.width, b.origin.y + b.size.height),
+                )
+            })
+            .collect();
+        (units, rects)
+    }
+
     /// The top of character `index`, as a fraction of the displayed page from its top.
     pub fn char_top(&self, index: u32) -> Option<f32> {
         let geometry = self.geometry.as_ref()?;
