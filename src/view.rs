@@ -3,12 +3,13 @@
 use eframe::egui::ahash::{HashMap, HashSet};
 use std::time::Duration;
 
-use eframe::egui::epaint::TextShape;
+use eframe::egui::epaint::{Mesh, Shape, Tessellator, TextShape};
 use eframe::egui::scroll_area::ScrollSource;
 use eframe::egui::{
-    Button, Color32, CursorIcon, Margin, Pos2, Rect, Response, ScrollArea, Sense, Stroke, StrokeKind, TextEdit,
+    Button, Color32, CursorIcon, Galley, Margin, Pos2, Rect, Response, ScrollArea, Sense, Stroke, StrokeKind, TextEdit,
     TextureHandle, Ui, Vec2, pos2, vec2,
 };
+use std::sync::Arc;
 
 use crate::app::Command;
 use crate::cache::TextureCache;
@@ -567,9 +568,8 @@ fn show_text_boxes(
             let galley = b.galley(&ctx, &b.text, glyphs);
             let size = b.size_around(&galley, glyphs) * scale;
             let (anchor, area) = placed(rect, rotation, b.at() + offset, size);
-            let angle = (rotation.degrees() as f32).to_radians();
             let text_at = anchor + turn_vec(vec2(PAD, PAD) * scale, rotation);
-            ui.painter().add(TextShape::new(text_at, galley, b.color32()).with_angle(angle));
+            paint_text(ui, galley, b.color32(), text_at, scale / glyphs, rotation);
 
             let response = ui
                 .interact(area, ui.id().with(("text box", doc, page, index)), Sense::click_and_drag())
@@ -653,6 +653,26 @@ fn show_text_boxes(
             BoxAction::Discard => boxes.discard_editing(),
         }
     }
+}
+
+/// Paints `galley` with its top-left corner at `at`, turned by `rotation`, and scaled by
+/// `stretch`: text laid out at a rounded size while zooming (see [`text_boxes::glyph_scale`])
+/// is stretched to the exact one, so it grows smoothly with the page, as the tiles do.
+fn paint_text(ui: &Ui, galley: Arc<Galley>, color: Color32, at: Pos2, stretch: f32, rotation: Rotation) {
+    if stretch == 1.0 {
+        let angle = (rotation.degrees() as f32).to_radians();
+        ui.painter().add(TextShape::new(at, galley, color).with_angle(angle));
+        return;
+    }
+    let ctx = ui.ctx();
+    let font_size = ctx.fonts(|f| f.font_image_size());
+    let mut tessellator = Tessellator::new(ctx.pixels_per_point(), Default::default(), font_size, Vec::new());
+    let mut mesh = Mesh::default();
+    tessellator.tessellate_text(&TextShape::new(Pos2::ZERO, galley, color), &mut mesh);
+    for vertex in &mut mesh.vertices {
+        vertex.pos = at + turn_vec(vertex.pos.to_vec2() * stretch, rotation);
+    }
+    ui.painter().add(Shape::mesh(mesh));
 }
 
 /// The text field a box's text is typed into, in place of the box. Upright even on a turned

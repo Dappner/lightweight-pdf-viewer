@@ -120,8 +120,8 @@ pub fn family(ctx: &Context) -> FontFamily {
     FontFamily::Proportional
 }
 
-/// Screen points per PDF point to draw box text at: `scale`, or while the zoom is changing,
-/// `scale` rounded to a quarter octave. egui keeps glyph images for every pixel size it draws,
+/// Screen points per PDF point to lay box text out at: `scale`, or while the zoom is changing,
+/// `scale` rounded to a quarter octave, the text then stretched to `scale` as it's drawn. egui keeps glyph images for every pixel size it draws,
 /// so text following a pinch frame by frame would fill its glyph texture (17 MB, and as much
 /// again on the GPU, for a pinch from 50% to 400%) and make it redraw every glyph in the app.
 pub fn glyph_scale(scale: f32, zooming: bool) -> f32 {
@@ -196,6 +196,8 @@ pub struct PageSave {
 pub enum Saving {
     Running(Receiver<Result<(), String>>),
     Failed(String),
+    /// Finished at this time (egui's clock), shown as saved for a moment.
+    Done(f64),
 }
 
 /// One tab's text boxes.

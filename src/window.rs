@@ -31,6 +31,8 @@ use crate::view::{Canvas, Wants, fit_width_zoom};
 const PARK_SECONDS: f64 = 3.0;
 const ZOOM_STEP: f32 = 1.25;
 const LINE_SCROLL: f32 = 48.0;
+/// Seconds the status says a save finished.
+const SAVED_SECONDS: f64 = 2.0;
 
 /// State shared by every window.
 pub struct Shared {
@@ -528,7 +530,8 @@ impl Window {
             };
             match result {
                 Ok(()) => {
-                    tab.text_boxes.saving = None;
+                    tab.text_boxes.saving = Some(Saving::Done(ctx.input(|i| i.time)));
+                    ctx.request_repaint_after(std::time::Duration::from_secs_f64(SAVED_SECONDS));
                     tab.text_boxes.saved();
                     let restore = match &tab.doc {
                         DocState::Ready(layout) if tab.view.zoom > 0.0 => Some(tab.view.place(layout)),
@@ -702,7 +705,8 @@ impl Window {
         });
     }
 
-    fn status(&self) -> Option<String> {
+    /// `now` is egui's clock.
+    fn status(&self, now: f64) -> Option<String> {
         let tab = self.active_tab()?;
         let DocState::Ready(layout) = &tab.doc else { return None };
         let spread = layout.spread(tab.view.current_page);
@@ -713,8 +717,9 @@ impl Window {
         let edits = match &tab.text_boxes.saving {
             Some(Saving::Running(_)) => "   Saving…".to_string(),
             Some(Saving::Failed(e)) => format!("   Not saved: {e}"),
-            None if tab.text_boxes.unsaved() => "   Edited".to_string(),
-            None => String::new(),
+            _ if tab.text_boxes.unsaved() => "   Edited".to_string(),
+            Some(Saving::Done(at)) if now - at < SAVED_SECONDS => "   Saved".to_string(),
+            _ => String::new(),
         };
         Some(format!("{pages} / {}   {:.0}%{edits}", layout.page_count(), tab.view.zoom * 100.0))
     }
@@ -769,7 +774,7 @@ impl Window {
             .frame(Frame::NONE)
             .show_separator_line(false)
             .show(ctx, |ui| {
-                let status = self.status();
+                let status = self.status(ctx.input(|i| i.time));
                 let view_menu =
                     tab_bar::ViewMenu { sidebar: self.sidebar.then_some(self.sidebar_mode), layout: self.layout() };
                 tab_bar::show(ui, &self.tabs, self.active, &mut self.tab_scroll, status, view_menu, &palette)
@@ -778,6 +783,16 @@ impl Window {
         match bar {
             Some(Action::Select(i)) => self.activate(ctx, shared, i),
             Some(Action::Close(i)) => self.close(ctx, shared, i),
+            Some(Action::CloseOthers(keep)) => {
+                for i in (0..self.tabs.len()).rev().filter(|&i| i != keep) {
+                    self.close(ctx, shared, i);
+                }
+            }
+            Some(Action::Reveal(i)) => {
+                if let Some(tab) = self.tabs.get(i) {
+                    let _ = std::process::Command::new("open").arg("-R").arg(&tab.path).spawn();
+                }
+            }
             Some(Action::Move { from, to }) => self.move_tab(from, to),
             Some(Action::Detach { index, pointer }) => {
                 let origin = self.inner_rect.map_or(Pos2::ZERO, |r| r.min);

@@ -4,6 +4,8 @@
 //! Dragging a tab reorders it; dragging it well below the strip, or out of the window,
 //! detaches it: released over another window's strip it joins that window, and anywhere
 //! else it gets a window of its own (a window's only tab just moves its window there).
+//! Right-clicking a tab shows its file in Finder, copies its path or closes tabs. A tab with
+//! unsaved text boxes shows a dot in place of its close button until hovered.
 //! Left of the tabs, a Preview-style button opens a menu of sidebar and page layout options;
 //! at the right end, after the page and zoom status, a button rotates the pages.
 
@@ -43,6 +45,10 @@ pub const NEW_WINDOW_GRAB: Vec2 = vec2(LEADING + VIEW_BUTTON + 40.0, TRAFFIC_LIG
 pub enum Action {
     Select(usize),
     Close(usize),
+    /// Closes every tab but this one.
+    CloseOthers(usize),
+    /// Shows the tab's file in Finder.
+    Reveal(usize),
     Move {
         from: usize,
         to: usize,
@@ -203,6 +209,21 @@ pub fn show(
         } else if response.clicked() {
             action = Some(Action::Select(i));
         }
+        response.context_menu(|ui| {
+            if ui.button("Show in Finder").clicked() {
+                action = Some(Action::Reveal(i));
+            }
+            if ui.button("Copy Path").clicked() {
+                ui.ctx().copy_text(tabs[i].path.display().to_string());
+            }
+            ui.separator();
+            if ui.button("Close Tab").clicked() {
+                action = Some(Action::Close(i));
+            }
+            if ui.add_enabled(tabs.len() > 1, Button::new("Close Other Tabs")).clicked() {
+                action = Some(Action::CloseOthers(i));
+            }
+        });
     }
 
     let plus_center = pos2((area.left() - scroll + total).min(area.right()) + PLUS_WIDTH / 2.0, area.center().y);
@@ -397,7 +418,10 @@ fn paint_tab(
     let galley = painter.layout_job(job);
     painter.galley(pos2(title_rect.left(), rect.center().y - galley.size().y / 2.0), galley, palette.text);
 
-    if is_active || hovered {
+    // Unsaved text boxes: a dot where the close button is, which hovering turns back into it.
+    if tab.text_boxes.unsaved() && !hovered {
+        painter.circle_filled(close.center(), 3.5, palette.text_weak);
+    } else if is_active || hovered {
         if close_hovered {
             painter.rect_filled(close, CornerRadius::same(4), palette.separator);
         }
