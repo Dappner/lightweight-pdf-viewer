@@ -527,7 +527,7 @@ impl Window {
         let (done, result) = std::sync::mpsc::channel();
         let (path, ctx) = (tab.path.clone(), ctx.clone());
         let spawned = std::thread::Builder::new().name("save".into()).spawn(move || {
-            let _ = done.send(engine::save_text_boxes(&path, &job));
+            let _ = done.send(engine::save_annotations(&path, &job));
             ctx.request_repaint();
         });
         boxes.saving = Some(match spawned {

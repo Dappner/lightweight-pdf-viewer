@@ -1,7 +1,8 @@
-//! Text boxes typed onto pages: a PDF's FreeText annotations, which Preview makes with
-//! Tools → Annotate → Text.
+//! Text boxes typed onto pages and highlighted text: a PDF's FreeText and Highlight
+//! annotations, which Preview makes with Tools → Annotate → Text and Highlight.
 //!
-//! A page shows the boxes the file has (read with its links) until it is first edited. From
+//! A page shows the boxes the file has (read with its links) until it is first edited.
+//! Highlights are kept the same way, alongside them. From
 //! then on the tab owns the page's boxes: every change is written to a file of the tab's own
 //! (see [`dir`]), so closing the tab or quitting loses nothing, and ⌘S writes them into the
 //! PDF. The app draws every box itself, those from the file included; the page renderer
@@ -27,6 +28,8 @@ pub const DEFAULT_SIZE: f32 = 12.0;
 pub const COLORS: [(&str, [u8; 3]); 3] = [("Black", [0, 0, 0]), ("Red", [214, 34, 34]), ("Blue", [24, 88, 214])];
 /// Space between a box's edges and its text, in PDF points, as PDFKit draws FreeText.
 pub const PAD: f32 = 2.0;
+/// The colour new highlights are: Preview's yellow.
+pub const HIGHLIGHT_YELLOW: [u8; 3] = [255, 222, 41];
 /// The font text boxes are drawn and saved in: Preview's default for them.
 pub const FONT: &str = "Helvetica";
 const FONT_FILE: &str = "/System/Library/Fonts/Helvetica.ttc";
@@ -128,6 +131,29 @@ pub fn glyph_scale(scale: f32, zooming: bool) -> f32 {
     if zooming { ((scale.log2() * 4.0).round() / 4.0).exp2() } else { scale }
 }
 
+/// Highlighted text: a PDF's Highlight annotation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Highlight {
+    /// A rect per line, `[left, top, right, bottom]` as fractions of the page upright (see
+    /// [`TextBox::at`]).
+    pub rects: Vec<[f32; 4]>,
+    pub color: [u8; 3],
+    /// Which of the page's highlights in the file this is, in the file's order, for one read
+    /// from it.
+    pub origin: Option<u32>,
+}
+
+impl Highlight {
+    pub fn new(rects: impl IntoIterator<Item = Rect>) -> Self {
+        let rects = rects.into_iter().map(|r| [r.min.x, r.min.y, r.max.x, r.max.y]).collect();
+        Self { rects, color: HIGHLIGHT_YELLOW, origin: None }
+    }
+
+    pub fn rects(&self) -> impl Iterator<Item = Rect> + '_ {
+        self.rects.iter().map(|&[x0, y0, x1, y1]| Rect::from_min_max(pos2(x0, y0), pos2(x1, y1)))
+    }
+}
+
 /// The box at `index` on `page`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BoxRef {
@@ -150,11 +176,11 @@ pub struct Editing {
     pub focus: bool,
 }
 
-/// A page's boxes as they were before a change, to undo it.
-struct Undo {
-    page: u32,
-    /// `None` if the page was not yet edited.
-    before: Option<Vec<TextBox>>,
+/// A page's boxes or highlights as they were before a change, to undo it. `None` if the
+/// page's were not yet edited.
+enum Undo {
+    Boxes(u32, Option<Vec<TextBox>>),
+    Highlights(u32, Option<Vec<Highlight>>),
 }
 
 /// Which file, as it is on disk: a save checks the PDF hasn't changed since editing began.
@@ -180,6 +206,11 @@ struct Unsaved {
     pages: BTreeMap<u32, Vec<TextBox>>,
     /// Boxes added to pages not yet edited, on top of the file's own.
     added: BTreeMap<u32, Vec<TextBox>>,
+    /// The same for highlights.
+    #[serde(default)]
+    highlights: BTreeMap<u32, Vec<Highlight>>,
+    #[serde(default)]
+    added_highlights: BTreeMap<u32, Vec<Highlight>>,
 }
 
 /// One page's boxes to write into the PDF.
@@ -190,6 +221,16 @@ pub struct PageSave {
     /// The page's every box: the file's boxes missing from it were deleted. Otherwise only
     /// adds to the file's.
     pub complete: bool,
+    /// Highlights, as `boxes`, `complete` for them.
+    pub highlights: Vec<Highlight>,
+    pub highlights_complete: bool,
+}
+
+impl PageSave {
+    /// `page`'s `boxes`, leaving its highlights as they are.
+    pub fn boxes(page: u32, boxes: Vec<(TextBox, Rect)>, complete: bool) -> Self {
+        Self { page, boxes, complete, highlights: Vec::new(), highlights_complete: false }
+    }
 }
 
 /// A save under way, or how the last one went.
@@ -213,6 +254,10 @@ pub struct TextBoxes {
     /// Boxes added to pages whose own boxes haven't been read: kept from an earlier session
     /// when the PDF changed since, and merged into [`Self::edited`] once the page is read.
     added: BTreeMap<u32, Vec<TextBox>>,
+    /// Highlights, kept as boxes are.
+    file_highlights: HashMap<u32, Vec<Highlight>>,
+    edited_highlights: BTreeMap<u32, Vec<Highlight>>,
+    added_highlights: BTreeMap<u32, Vec<Highlight>>,
     /// The PDF as it was when editing began.
     fingerprint: Option<Fingerprint>,
     undo: Vec<Undo>,
@@ -239,6 +284,9 @@ impl TextBoxes {
             file: HashMap::default(),
             edited: BTreeMap::new(),
             added: BTreeMap::new(),
+            file_highlights: HashMap::default(),
+            edited_highlights: BTreeMap::new(),
+            added_highlights: BTreeMap::new(),
             fingerprint: None,
             undo: Vec::new(),
             selected: None,
@@ -255,8 +303,10 @@ impl TextBoxes {
         if let Some(unsaved) = unsaved {
             let current = Fingerprint::of(pdf);
             this.added = unsaved.added;
+            this.added_highlights = unsaved.added_highlights;
             if unsaved.fingerprint == current {
                 this.edited = unsaved.pages;
+                this.edited_highlights = unsaved.highlights;
             } else {
                 // The PDF changed since (saved from Preview, say), so its boxes may no longer
                 // be the ones the edits changed: only the boxes added here are kept, on top
@@ -266,6 +316,11 @@ impl TextBoxes {
                     this.added.entry(page).or_default().extend(new);
                 }
                 this.added.retain(|_, boxes| !boxes.is_empty());
+                for (page, highlights) in unsaved.highlights {
+                    let new = highlights.into_iter().filter(|h| h.origin.is_none());
+                    this.added_highlights.entry(page).or_default().extend(new);
+                }
+                this.added_highlights.retain(|_, highlights| !highlights.is_empty());
             }
             this.fingerprint = current;
         }
@@ -281,25 +336,45 @@ impl TextBoxes {
         self.page(r.page)?.get(r.index)
     }
 
-    /// The file's boxes of `page`, read with its links.
-    pub fn set_file(&mut self, page: u32, boxes: Vec<TextBox>) {
+    /// The highlights of `page`, or `None` until the file's have been read.
+    pub fn highlights(&self, page: u32) -> Option<&[Highlight]> {
+        self.edited_highlights.get(&page).or_else(|| self.file_highlights.get(&page)).map(Vec::as_slice)
+    }
+
+    /// The file's boxes and highlights of `page`, read with its links.
+    pub fn set_file(&mut self, page: u32, boxes: Vec<TextBox>, highlights: Vec<Highlight>) {
+        let mut merged = false;
         if let Some(added) = self.added.remove(&page) {
             let mut all = boxes.clone();
             all.extend(added);
             self.edited.entry(page).or_insert(all);
+            merged = true;
+        }
+        if let Some(added) = self.added_highlights.remove(&page) {
+            let mut all = highlights.clone();
+            all.extend(added);
+            self.edited_highlights.entry(page).or_insert(all);
+            merged = true;
+        }
+        if merged {
             self.persist();
         }
         self.file.insert(page, boxes);
+        self.file_highlights.insert(page, highlights);
     }
 
-    /// Lets go of the file's boxes, read again when their pages are next shown.
+    /// Lets go of the file's boxes and highlights, read again when their pages are next shown.
     pub fn clear_file(&mut self) {
         self.file.clear();
+        self.file_highlights.clear();
     }
 
     /// Edits not yet written into the PDF.
     pub fn unsaved(&self) -> bool {
-        !self.edited.is_empty() || !self.added.is_empty()
+        !self.edited.is_empty()
+            || !self.added.is_empty()
+            || !self.edited_highlights.is_empty()
+            || !self.added_highlights.is_empty()
     }
 
     /// A box's text is being typed, so the keyboard is the text field's.
@@ -309,16 +384,43 @@ impl TextBoxes {
 
     /// Changes `page`'s boxes, which can be undone, and keeps the change on disk.
     pub fn change<R>(&mut self, page: u32, f: impl FnOnce(&mut Vec<TextBox>) -> R) -> R {
-        if self.edited.is_empty() && self.added.is_empty() {
+        if !self.unsaved() {
             self.fingerprint = Fingerprint::of(&self.pdf);
         }
         let before = self.edited.get(&page).cloned();
         let file = self.file.get(&page).cloned().unwrap_or_default();
         let boxes = self.edited.entry(page).or_insert(file);
         let result = f(boxes);
-        self.undo.push(Undo { page, before });
+        self.undo.push(Undo::Boxes(page, before));
         self.persist();
         result
+    }
+
+    /// Changes `page`'s highlights, as [`Self::change`] does its boxes.
+    fn change_highlights(&mut self, page: u32, f: impl FnOnce(&mut Vec<Highlight>)) {
+        if !self.unsaved() {
+            self.fingerprint = Fingerprint::of(&self.pdf);
+        }
+        let before = self.edited_highlights.get(&page).cloned();
+        let file = self.file_highlights.get(&page).cloned().unwrap_or_default();
+        f(self.edited_highlights.entry(page).or_insert(file));
+        self.undo.push(Undo::Highlights(page, before));
+        self.persist();
+    }
+
+    /// Highlights `rects` (see [`Highlight::rects`]) on `page`.
+    pub fn highlight(&mut self, page: u32, rects: Vec<Rect>) {
+        if !rects.is_empty() {
+            self.change_highlights(page, |highlights| highlights.push(Highlight::new(rects)));
+        }
+    }
+
+    pub fn delete_highlight(&mut self, page: u32, index: usize) {
+        self.change_highlights(page, |highlights| {
+            if index < highlights.len() {
+                highlights.remove(index);
+            }
+        });
     }
 
     /// Changes one box, marking it changed.
@@ -418,11 +520,13 @@ impl TextBoxes {
 
     /// Undoes the last change. `false` if there was none.
     pub fn undo(&mut self) -> bool {
-        let Some(Undo { page, before }) = self.undo.pop() else { return false };
-        match before {
-            Some(boxes) => self.edited.insert(page, boxes),
-            None => self.edited.remove(&page),
-        };
+        match self.undo.pop() {
+            None => return false,
+            Some(Undo::Boxes(page, Some(boxes))) => drop(self.edited.insert(page, boxes)),
+            Some(Undo::Boxes(page, None)) => drop(self.edited.remove(&page)),
+            Some(Undo::Highlights(page, Some(highlights))) => drop(self.edited_highlights.insert(page, highlights)),
+            Some(Undo::Highlights(page, None)) => drop(self.edited_highlights.remove(&page)),
+        }
         self.selected = None;
         self.editing = None;
         self.persist();
@@ -435,19 +539,35 @@ impl TextBoxes {
         if self.fingerprint.is_some() && Fingerprint::of(&self.pdf) != self.fingerprint {
             return Err("The file changed on disk since you started editing it".into());
         }
+        let mut pages: BTreeMap<u32, PageSave> = BTreeMap::new();
+        fn page(pages: &mut BTreeMap<u32, PageSave>, page: u32) -> &mut PageSave {
+            pages.entry(page).or_insert_with(|| PageSave::boxes(page, Vec::new(), false))
+        }
         let with_rects = |page: u32, boxes: &[TextBox]| boxes.iter().map(|b| (b.clone(), rect_of(page, b))).collect();
-        let edited =
-            self.edited.iter().map(|(&page, boxes)| PageSave { page, boxes: with_rects(page, boxes), complete: true });
-        let added =
-            self.added.iter().map(|(&page, boxes)| PageSave { page, boxes: with_rects(page, boxes), complete: false });
-        Ok(edited.chain(added).collect())
+        for (complete, boxes) in [(true, &self.edited), (false, &self.added)] {
+            for (&p, boxes) in boxes {
+                let save = page(&mut pages, p);
+                save.boxes = with_rects(p, boxes);
+                save.complete = complete;
+            }
+        }
+        for (complete, highlights) in [(true, &self.edited_highlights), (false, &self.added_highlights)] {
+            for (&p, highlights) in highlights {
+                let save = page(&mut pages, p);
+                save.highlights = highlights.clone();
+                save.highlights_complete = complete;
+            }
+        }
+        Ok(pages.into_values().collect())
     }
 
     /// The PDF now has every edit: start again from what it has.
     pub fn saved(&mut self) {
-        self.file.clear();
+        self.clear_file();
         self.edited.clear();
         self.added.clear();
+        self.edited_highlights.clear();
+        self.added_highlights.clear();
         self.undo.clear();
         self.selected = None;
         self.fingerprint = None;
@@ -466,6 +586,8 @@ impl TextBoxes {
             fingerprint: self.fingerprint,
             pages: self.edited.clone(),
             added: self.added.clone(),
+            highlights: self.edited_highlights.clone(),
+            added_highlights: self.added_highlights.clone(),
         };
         if let Ok(json) = serde_json::to_vec(&unsaved) {
             crate::config::write_atomically(store, &json);
@@ -597,7 +719,7 @@ mod tests {
     fn a_box_typed_into_is_added_and_an_empty_one_is_not() {
         let dir = temp_dir("add");
         let mut boxes = TextBoxes::load(&pdf(&dir), Some(&dir));
-        boxes.set_file(0, Vec::new());
+        boxes.set_file(0, Vec::new(), Vec::new());
         type_box(&mut boxes, 0, "   ");
         assert!(!boxes.unsaved());
         type_box(&mut boxes, 0, "Hello");
@@ -623,7 +745,7 @@ mod tests {
         let pdf = pdf(&dir);
         let mut boxes = TextBoxes::load(&pdf, Some(&dir));
         let from_file = TextBox { origin: Some(0), changed: false, ..TextBox::new(pos2(0.1, 0.1), "File".into()) };
-        boxes.set_file(0, vec![from_file.clone()]);
+        boxes.set_file(0, vec![from_file.clone()], Vec::new());
         boxes.change_box(BoxRef { page: 0, index: 0 }, |b| b.text = "Edited".into());
         type_box(&mut boxes, 0, "Mine");
 
@@ -631,7 +753,7 @@ mod tests {
         let mut reopened = TextBoxes::load(&pdf, Some(&dir));
         assert!(reopened.page(0).is_none(), "waits for the file's own boxes");
         let theirs = TextBox { text: "Theirs".into(), ..from_file };
-        reopened.set_file(0, vec![theirs]);
+        reopened.set_file(0, vec![theirs], Vec::new());
         let texts: Vec<&str> = reopened.page(0).unwrap().iter().map(|b| b.text.as_str()).collect();
         assert_eq!(texts, ["Theirs", "Mine"]);
     }
@@ -640,7 +762,7 @@ mod tests {
     fn undo_restores_the_page() {
         let dir = temp_dir("undo");
         let mut boxes = TextBoxes::load(&pdf(&dir), Some(&dir));
-        boxes.set_file(0, Vec::new());
+        boxes.set_file(0, Vec::new(), Vec::new());
         type_box(&mut boxes, 0, "One");
         boxes.edit(BoxRef { page: 0, index: 0 });
         let editing = boxes.editing.as_mut().unwrap();
@@ -655,6 +777,34 @@ mod tests {
         assert!(boxes.page(0).unwrap().is_empty(), "back to the file's boxes");
         assert!(!boxes.unsaved());
         assert!(!boxes.undo());
+    }
+
+    #[test]
+    fn highlights_persist_undo_and_save_apart_from_boxes() {
+        let dir = temp_dir("highlights");
+        let pdf = pdf(&dir);
+        let mut boxes = TextBoxes::load(&pdf, Some(&dir));
+        let theirs =
+            Highlight { origin: Some(0), ..Highlight::new([Rect::from_min_max(pos2(0.1, 0.1), pos2(0.5, 0.12))]) };
+        boxes.set_file(0, Vec::new(), vec![theirs]);
+        boxes.highlight(0, vec![Rect::from_min_max(pos2(0.1, 0.2), pos2(0.6, 0.22))]);
+        type_box(&mut boxes, 1, "Note");
+        assert_eq!(boxes.highlights(0).unwrap().len(), 2);
+        assert_eq!(boxes.highlights(0).unwrap()[1].color, HIGHLIGHT_YELLOW);
+
+        let reopened = TextBoxes::load(&pdf, Some(&dir));
+        assert_eq!(reopened.highlights(0).unwrap().len(), 2);
+
+        let job = boxes.save_job(|_, _| Rect::NOTHING).unwrap();
+        assert_eq!(job.len(), 2);
+        assert!(job[0].highlights_complete && job[0].highlights.len() == 2 && job[0].boxes.is_empty());
+        assert!(!job[0].complete, "page 0's boxes are left as they are");
+        assert!(job[1].complete && !job[1].highlights_complete && job[1].highlights.is_empty());
+
+        assert!(boxes.undo(), "the box");
+        assert!(boxes.undo(), "the highlight");
+        assert_eq!(boxes.highlights(0).unwrap().len(), 1);
+        assert!(!boxes.unsaved());
     }
 
     #[test]

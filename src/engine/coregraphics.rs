@@ -1,6 +1,7 @@
 //! The macOS engine: PDF pages are rasterized with CoreGraphics (Preview's engine) and
-//! document structure (outline, links) and text are read with PDFKit. Text boxes are read
-//! from the page's annotations with CoreGraphics and written back with PDFKit. Images open as
+//! document structure (outline, links) and text are read with PDFKit. Text boxes and
+//! highlights are read from the page's annotations with CoreGraphics and written back with
+//! PDFKit. Images open as
 //! a document of one page, decoded with ImageIO and drawn as they are, not wrapped in a PDF.
 
 use std::ffi::{CStr, c_char};
@@ -20,20 +21,20 @@ use objc2_core_graphics::{
     CGInterpolationQuality, CGPDFArray, CGPDFArrayRef, CGPDFBox, CGPDFDictionary, CGPDFDictionaryRef, CGPDFDocument,
     CGPDFPage, CGPDFReal, CGPDFString, CGPDFStringRef, kCGColorSpaceSRGB,
 };
-use objc2_foundation::{NSRange, NSString, NSURL};
+use objc2_foundation::{NSArray, NSPoint, NSRange, NSString, NSURL, NSValue};
 use objc2_image_io::{
     CGImageSource, kCGImagePropertyDPIHeight, kCGImagePropertyDPIWidth, kCGImagePropertyOrientation,
     kCGImageSourceShouldCacheImmediately,
 };
 use objc2_pdf_kit::{
-    PDFActionGoTo, PDFActionURL, PDFAnnotation, PDFAnnotationSubtypeFreeText, PDFDestination, PDFDocument, PDFOutline,
-    PDFPage,
+    PDFActionGoTo, PDFActionURL, PDFAnnotation, PDFAnnotationSubtypeFreeText, PDFAnnotationSubtypeHighlight,
+    PDFDestination, PDFDocument, PDFOutline, PDFPage,
 };
 
 use super::preview::{self, EditedBox};
 use crate::layout::{Rotation, Rotations};
 use crate::renderer::{Link, OutlineEntry, Target};
-use crate::text_boxes::{self, PageSave, TextBox};
+use crate::text_boxes::{self, Highlight, PageSave, TextBox};
 
 /// Runs `f`, releasing what CoreGraphics autoreleased during it.
 pub fn autoreleasepool<R>(f: impl FnOnce() -> R) -> R {
@@ -108,6 +109,13 @@ impl Page<'_> {
     pub fn text_boxes(&self) -> Vec<TextBox> {
         match &self.0 {
             PageSource::Pdf(page) => page.text_boxes(),
+            PageSource::Image(_) => Vec::new(),
+        }
+    }
+
+    pub fn highlights(&self) -> Vec<Highlight> {
+        match &self.0 {
+            PageSource::Pdf(page) => page.highlights(),
             PageSource::Image(_) => Vec::new(),
         }
     }
@@ -269,29 +277,35 @@ impl PdfPage<'_> {
 }
 
 impl PdfPage<'_> {
-    /// The page's FreeText annotations, read from its dictionary: PDFKit doesn't read back
-    /// the font size and colour it writes (it saves them as a name, not a string).
-    fn text_boxes(&self) -> Vec<TextBox> {
-        // Positions are on the page as the file turns it, before the reader's rotation.
-        let geometry = PageGeometry::of(&self.page, Rotation::default());
+    /// The page's annotations of `subtype`, in the file's order: dictionaries owned by the
+    /// page.
+    fn annotations(&self, subtype: &str) -> Vec<CGPDFDictionaryRef> {
         let page = CGPDFPage::dictionary(Some(&self.page));
         let mut annots: CGPDFArrayRef = null_mut();
         // SAFETY: `page` is the page's dictionary or null, and the out-pointers are valid.
         if page.is_null() || !unsafe { CGPDFDictionary::array(page, key(c"Annots"), &mut annots) } {
             return Vec::new();
         }
-        let mut boxes = Vec::new();
-        let mut ordinal = 0;
         // SAFETY: `annots` is a valid array owned by the page, and the out-pointers are valid.
-        for i in 0..unsafe { CGPDFArray::count(annots) } {
-            let mut annot: CGPDFDictionaryRef = null_mut();
-            if !unsafe { CGPDFArray::dictionary(annots, i, &mut annot) }
-                || unsafe { name(annot, c"Subtype") }.as_deref() != Some("FreeText")
-            {
-                continue;
-            }
-            let origin = ordinal;
-            ordinal += 1;
+        (0..unsafe { CGPDFArray::count(annots) })
+            .filter_map(|i| {
+                let mut annot: CGPDFDictionaryRef = null_mut();
+                (unsafe { CGPDFArray::dictionary(annots, i, &mut annot) }
+                    && unsafe { name(annot, c"Subtype") }.as_deref() == Some(subtype))
+                .then_some(annot)
+            })
+            .collect()
+    }
+
+    /// The page's FreeText annotations, read from its dictionary: PDFKit doesn't read back
+    /// the font size and colour it writes (it saves them as a name, not a string).
+    fn text_boxes(&self) -> Vec<TextBox> {
+        // Positions are on the page as the file turns it, before the reader's rotation.
+        let geometry = PageGeometry::of(&self.page, Rotation::default());
+        let mut boxes = Vec::new();
+        for (origin, annot) in self.annotations("FreeText").into_iter().enumerate() {
+            let origin = origin as u32;
+            // SAFETY: `annot` is a valid dictionary owned by the page.
             let Some([x0, y0, x1, y1]) = (unsafe { numbers::<4>(annot, c"Rect") }) else { continue };
             let corners = Rect::from_two_pos(geometry.to_fraction(x0, y0), geometry.to_fraction(x1, y1));
             let contents = unsafe { text(annot, c"Contents") }.unwrap_or_default();
@@ -308,6 +322,33 @@ impl PdfPage<'_> {
             });
         }
         boxes
+    }
+
+    /// The page's Highlight annotations: a rect per quadrilateral, or the annotation's rect
+    /// when it has none.
+    fn highlights(&self) -> Vec<Highlight> {
+        let geometry = PageGeometry::of(&self.page, Rotation::default());
+        let mut highlights = Vec::new();
+        for (origin, annot) in self.annotations("Highlight").into_iter().enumerate() {
+            // SAFETY: `annot` is a valid dictionary owned by the page.
+            let quads = unsafe { all_numbers(annot, c"QuadPoints") }
+                .filter(|q| !q.is_empty() && q.len() % 8 == 0)
+                .or_else(|| {
+                    let [x0, y0, x1, y1] = unsafe { numbers::<4>(annot, c"Rect") }?;
+                    Some(vec![x0, y1, x1, y1, x0, y0, x1, y0])
+                });
+            let Some(quads) = quads else { continue };
+            let rects = quads.chunks(8).map(|q| {
+                let corners: Vec<Pos2> = q.chunks(2).map(|p| geometry.to_fraction(p[0], p[1])).collect();
+                Rect::from_points(&corners)
+            });
+            let color = match unsafe { all_numbers(annot, c"C") }.as_deref() {
+                Some(&[r, g, b]) => [r, g, b].map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8),
+                _ => text_boxes::HIGHLIGHT_YELLOW,
+            };
+            highlights.push(Highlight { color, origin: Some(origin as u32), ..Highlight::new(rects) });
+        }
+        highlights
     }
 }
 
@@ -361,20 +402,25 @@ unsafe fn text(dict: CGPDFDictionaryRef, k: &CStr) -> Option<String> {
 /// # Safety
 /// `dict` must be a valid dictionary.
 unsafe fn numbers<const N: usize>(dict: CGPDFDictionaryRef, k: &CStr) -> Option<[f64; N]> {
+    unsafe { all_numbers(dict, k) }?.try_into().ok()
+}
+
+/// An array of numbers.
+///
+/// # Safety
+/// `dict` must be a valid dictionary.
+unsafe fn all_numbers(dict: CGPDFDictionaryRef, k: &CStr) -> Option<Vec<f64>> {
     let mut array: CGPDFArrayRef = null_mut();
-    // SAFETY: the out-pointers are valid, and `array` is checked to hold `N` entries.
-    if !unsafe { CGPDFDictionary::array(dict, key(k), &mut array) } || unsafe { CGPDFArray::count(array) } != N {
+    // SAFETY: the out-pointers are valid, and only `array`'s entries are read.
+    if !unsafe { CGPDFDictionary::array(dict, key(k), &mut array) } {
         return None;
     }
-    let mut out = [0.0; N];
-    for (i, n) in out.iter_mut().enumerate() {
-        let mut value: CGPDFReal = 0.0;
-        if !unsafe { CGPDFArray::number(array, i, &mut value) } {
-            return None;
-        }
-        *n = value;
-    }
-    Some(out)
+    (0..unsafe { CGPDFArray::count(array) })
+        .map(|i| {
+            let mut value: CGPDFReal = 0.0;
+            unsafe { CGPDFArray::number(array, i, &mut value) }.then_some(value)
+        })
+        .collect()
 }
 
 /// Font size and colour from a FreeText's default appearance string, such as
@@ -399,10 +445,10 @@ fn default_appearance(da: &str) -> (f32, [u8; 3]) {
     (size, color.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8))
 }
 
-/// Writes text boxes into the PDF at `path`: changes and removes the file's own as `pages`
-/// says, and adds the new ones. Writes a copy and moves it over the file, so a failed save
+/// Writes text boxes and highlights into the PDF at `path`: changes and removes the file's
+/// own as `pages` says, and adds the new ones. Writes a copy and moves it over the file, so a failed save
 /// leaves the file as it was. PDFKit rewrites the whole document, so this can take seconds.
-pub fn save_text_boxes(path: &Path, pages: &[PageSave]) -> Result<super::SaveOutcome, String> {
+pub fn save_annotations(path: &Path, pages: &[PageSave]) -> Result<super::SaveOutcome, String> {
     autoreleasepool(|| {
         let pdf = open_pdf(path).ok_or("The file couldn't be opened")?;
         let mut edited_boxes = Vec::new();
@@ -468,6 +514,7 @@ pub fn save_text_boxes(path: &Path, pages: &[PageSave]) -> Result<super::SaveOut
             if edited_boxes.iter().filter(|b| b.page == save.page).count() != styled.len() {
                 identified = false;
             }
+            save_highlights(&page, &geometry, save);
         }
         let name = path.file_name().ok_or("Not a file")?.to_string_lossy();
         let temp = path.with_file_name(format!(".{name}.saving"));
@@ -488,6 +535,54 @@ pub fn save_text_boxes(path: &Path, pages: &[PageSave]) -> Result<super::SaveOut
         })?;
         Ok(outcome)
     })
+}
+
+/// Removes the page's highlights `save` no longer has and adds its new ones.
+fn save_highlights(page: &PDFPage, geometry: &PageGeometry, save: &PageSave) {
+    // SAFETY: plain PDFKit and AppKit calls on objects this thread owns.
+    let theirs: Vec<Retained<PDFAnnotation>> = unsafe { page.annotations() }
+        .iter()
+        .filter(|a| unsafe { a.r#type() }.is_some_and(|t| t.to_string() == "Highlight"))
+        .collect();
+    for (ordinal, annotation) in theirs.iter().enumerate() {
+        if save.highlights_complete && !save.highlights.iter().any(|h| h.origin == Some(ordinal as u32)) {
+            unsafe { page.removeAnnotation(annotation) };
+        }
+    }
+    for h in save.highlights.iter().filter(|h| h.origin.is_none()) {
+        let quads: Vec<CGRect> = h.rects().map(|r| geometry.fraction_rect_to_pdf(r)).collect();
+        let Some(bounds) = quads.iter().copied().reduce(|a, b| {
+            let (x0, y0) = (a.origin.x.min(b.origin.x), a.origin.y.min(b.origin.y));
+            let x1 = (a.origin.x + a.size.width).max(b.origin.x + b.size.width);
+            let y1 = (a.origin.y + a.size.height).max(b.origin.y + b.size.height);
+            CGRect { origin: CGPoint { x: x0, y: y0 }, size: CGSize { width: x1 - x0, height: y1 - y0 } }
+        }) else {
+            continue;
+        };
+        // Each quadrilateral's top-left, top-right, bottom-left and bottom-right corners, from
+        // the bounds' origin, as PDFKit takes them.
+        let points: Vec<Retained<NSValue>> = quads
+            .iter()
+            .flat_map(|q| {
+                let (x0, y0) = (q.origin.x - bounds.origin.x, q.origin.y - bounds.origin.y);
+                let (x1, y1) = (x0 + q.size.width, y0 + q.size.height);
+                [(x0, y1), (x1, y1), (x0, y0), (x1, y0)]
+            })
+            .map(|(x, y)| unsafe { NSValue::valueWithPoint(NSPoint { x, y }) })
+            .collect();
+        let [r, g, b] = h.color.map(|v| v as f64 / 255.0);
+        unsafe {
+            let annotation = PDFAnnotation::initWithBounds_forType_withProperties(
+                PDFAnnotation::alloc(),
+                bounds,
+                PDFAnnotationSubtypeHighlight,
+                None,
+            );
+            annotation.setQuadrilateralPoints(Some(&NSArray::from_retained_slice(&points)));
+            annotation.setColor(&NSColor::colorWithCalibratedRed_green_blue_alpha(r, g, b, 1.0));
+            page.addAnnotation(&annotation);
+        }
+    }
 }
 
 /// Sets a FreeText annotation to show `b` in `bounds` (PDF user space).
@@ -961,8 +1056,8 @@ mod tests {
         let new =
             TextBox { size: 16.0, color: [24, 88, 214], ..TextBox::new(pos2(0.1, 0.2), "Note é\nline two".into()) };
         let rect = Rect::from_min_max(pos2(0.1, 0.2), pos2(0.4, 0.25));
-        let save = PageSave { page: 0, boxes: vec![(new.clone(), rect)], complete: false };
-        save_text_boxes(&path, &[save]).expect("save");
+        let save = PageSave::boxes(0, vec![(new.clone(), rect)], false);
+        save_annotations(&path, &[save]).expect("save");
 
         let boxes = read_boxes(&path, &Rotations::default());
         assert_eq!(boxes.len(), 1);
@@ -981,11 +1076,41 @@ mod tests {
 
         // Changed, then deleted.
         let changed = TextBox { text: "Changed".into(), changed: true, ..read.clone() };
-        let save = PageSave { page: 0, boxes: vec![(changed, rect)], complete: true };
-        save_text_boxes(&path, &[save]).expect("save");
+        let save = PageSave::boxes(0, vec![(changed, rect)], true);
+        save_annotations(&path, &[save]).expect("save");
         assert_eq!(read_boxes(&path, &Rotations::default())[0].text, "Changed");
-        save_text_boxes(&path, &[PageSave { page: 0, boxes: Vec::new(), complete: true }]).expect("save");
+        let delete = PageSave::boxes(0, Vec::new(), true);
+        save_annotations(&path, &[delete]).expect("save");
         assert!(read_boxes(&path, &Rotations::default()).is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn saved_highlights_read_back() {
+        let path = text_pdf("highlight", &[("Alpha", 700), ("Beta", 680)]);
+        let lines =
+            [Rect::from_min_max(pos2(0.1, 0.1), pos2(0.4, 0.12)), Rect::from_min_max(pos2(0.1, 0.13), pos2(0.3, 0.15))];
+        let save = |highlights: Vec<Highlight>, complete: bool| PageSave {
+            highlights,
+            highlights_complete: complete,
+            ..PageSave::boxes(0, Vec::new(), false)
+        };
+        save_annotations(&path, &[save(vec![Highlight::new(lines)], false)]).expect("save");
+
+        let read = Document::open(&path, &Rotations::default()).expect("open").page(0).unwrap().highlights();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].origin, Some(0));
+        let rects: Vec<Rect> = read[0].rects().collect();
+        assert_eq!(rects.len(), 2);
+        for (got, want) in rects.iter().zip(lines) {
+            assert!((got.min - want.min).length() < 1e-3 && (got.max - want.max).length() < 1e-3, "{got:?} {want:?}");
+        }
+        for (got, want) in read[0].color.iter().zip(text_boxes::HIGHLIGHT_YELLOW) {
+            assert!(got.abs_diff(want) <= 3, "colour {:?}", read[0].color);
+        }
+        // Text boxes are left alone, and a page with none of its highlights left has none.
+        save_annotations(&path, &[save(Vec::new(), true)]).expect("save");
+        assert!(Document::open(&path, &Rotations::default()).unwrap().page(0).unwrap().highlights().is_empty());
         let _ = std::fs::remove_file(&path);
     }
 

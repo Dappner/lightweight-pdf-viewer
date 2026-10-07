@@ -392,10 +392,9 @@ mod tests {
             path.with_file_name(format!("..{}.saving.preview", path.file_name().unwrap().to_string_lossy()));
         std::fs::create_dir(&corrected).unwrap();
         let b = TextBox::new(pos2(0.1, 0.4), "Saved despite Preview compatibility failure".into());
-        let save =
-            PageSave { page: 0, complete: true, boxes: vec![(b, Rect::from_min_max(pos2(0.1, 0.4), pos2(0.6, 0.44)))] };
+        let save = PageSave::boxes(0, vec![(b, Rect::from_min_max(pos2(0.1, 0.4), pos2(0.6, 0.44)))], true);
         assert_eq!(
-            crate::engine::save_text_boxes(&path, &[save]).unwrap(),
+            crate::engine::save_annotations(&path, &[save]).unwrap(),
             super::super::SaveOutcome::PreviewMayResize
         );
         let doc = Document::load(&path).unwrap();
@@ -419,8 +418,8 @@ mod tests {
         let rects = [0.2, 0.4, 0.6].map(|y| Rect::from_min_max(pos2(0.1, y), pos2(0.6, y + 0.04)));
         let boxes =
             ["Delete me", "Twelve point box", "Untouched box"].map(|text| TextBox::new(pos2(0.1, 0.2), text.into()));
-        let save = PageSave { page: 0, complete: false, boxes: boxes.into_iter().zip(rects).collect() };
-        crate::engine::save_text_boxes(&path, &[save]).unwrap();
+        let save = PageSave::boxes(0, boxes.into_iter().zip(rects).collect(), false);
+        crate::engine::save_annotations(&path, &[save]).unwrap();
         let doc = Document::load(&path).unwrap();
         for ordinal in 0..3 {
             let b = EditedBox { page: 0, ordinal, size: 12.0, bounds: [0.0; 4] };
@@ -432,8 +431,8 @@ mod tests {
             TextBox { origin: Some(1), size: 16.0, ..TextBox::new(pos2(0.1, 0.4), "Changed to sixteen points".into()) };
         let untouched =
             TextBox { origin: Some(2), changed: false, ..TextBox::new(pos2(0.1, 0.6), "Untouched box".into()) };
-        let save = PageSave { page: 0, complete: true, boxes: vec![(changed, rects[1]), (untouched, rects[2])] };
-        crate::engine::save_text_boxes(&path, &[save]).unwrap();
+        let save = PageSave::boxes(0, vec![(changed, rects[1]), (untouched, rects[2])], true);
+        crate::engine::save_annotations(&path, &[save]).unwrap();
         let doc = Document::load(&path).unwrap();
         let selected = EditedBox { page: 0, ordinal: 0, size: 16.0, bounds: [61.2, 443.52, 367.2, 475.2] };
         let a = annotation(&doc, &selected).unwrap().1;

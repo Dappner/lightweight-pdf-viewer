@@ -378,6 +378,7 @@ impl Canvas<'_> {
                 }
             }
 
+            show_highlights(ui, text_boxes, &visible_pages, rotations);
             select(ui, &pointer, text, view, &page_rects, over_link, screen_viewport);
             let command = page_menu(ui, &pointer, &page_rects, layout.page_count(), text, text_boxes, rotations);
             // Over the tiles: the selection, then every match on screen, the current one stronger.
@@ -444,8 +445,41 @@ impl Canvas<'_> {
     }
 }
 
-/// The right-click menu: copies the selection, and turns the page clicked or all of them (a
-/// document of one page, such as an image, only offers the latter). `pages` are the pages
+/// Draws the highlights of the pages on screen, with their screen rects.
+fn show_highlights(ui: &Ui, boxes: &TextBoxes, pages: &[(u32, Rect)], rotations: &Rotations) {
+    for &(page, rect) in pages {
+        let Some(highlights) = boxes.highlights(page) else { continue };
+        let rotation = rotations.of(page);
+        for h in highlights {
+            let [r, g, b] = h.color;
+            let color = Color32::from_rgba_unmultiplied(r, g, b, 110);
+            for area in h.rects() {
+                let shown = Rect::from_two_pos(turn(area.min, rotation), turn(area.max, rotation));
+                ui.painter().rect_filled(find_bar::on_page(rect, shown), 0.0, color);
+            }
+        }
+    }
+}
+
+/// The selected text's line rects on each page it's on, as fractions of the page upright
+/// (see [`TextBox::at`]); `None` until every one of those pages' text and highlights is read.
+fn selected_lines(text: &TextLayers, boxes: &TextBoxes, rotations: &Rotations) -> Option<Vec<(u32, Vec<Rect>)>> {
+    let selection = text.selection().filter(|s| !s.is_empty())?;
+    let mut pages = Vec::new();
+    for page in selection.pages() {
+        let layer = text.layer(page)?;
+        boxes.highlights(page)?;
+        let Some(range) = selection.range_on(page, layer.len()) else { continue };
+        let rotation = rotations.of(page);
+        let rects = layer.rects(range).map(|r| Rect::from_two_pos(unturn(r.min, rotation), unturn(r.max, rotation)));
+        pages.push((page, rects.collect()));
+    }
+    Some(pages)
+}
+
+/// The right-click menu: highlights the selection or removes the highlight clicked, copies
+/// the selection, and turns the page clicked or all of them (a document of one page, such as
+/// an image, only offers the latter). `pages` are the pages
 /// laid out this frame, with their screen rects.
 fn page_menu(
     ui: &Ui,
@@ -477,6 +511,26 @@ fn page_menu(
             && let Some((page, at)) = can_add
         {
             text_boxes.add(page, unturn(at, rotations.of(page)));
+        }
+        let highlighted = clicked.and_then(|(page, at)| {
+            let at = unturn(at, rotations.of(page));
+            let index = text_boxes.highlights(page)?.iter().position(|h| h.rects().any(|r| r.contains(at)))?;
+            Some((page, index))
+        });
+        if let Some((page, index)) = highlighted {
+            if ui.button("Remove Highlight").clicked() {
+                text_boxes.delete_highlight(page, index);
+            }
+        } else {
+            let lines = selected_lines(text, text_boxes, rotations);
+            if ui.add_enabled(lines.is_some(), Button::new("Highlight")).clicked()
+                && let Some(lines) = lines
+            {
+                for (page, rects) in lines {
+                    text_boxes.highlight(page, rects);
+                }
+                text.clear_selection();
+            }
         }
         ui.separator();
         if ui.add_enabled(text.selection().is_some(), Button::new("Copy").shortcut_text("⌘C")).clicked() {

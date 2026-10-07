@@ -570,13 +570,13 @@ impl State {
                         snapshot.and_then(|snapshot| snapshot_texture(ctx, &snapshot));
                 }
             }
-            Output::Links { doc, page, links, text_boxes } => {
+            Output::Links { doc, page, links, text_boxes, highlights } => {
                 if let Some((w, i)) = self.find_doc(doc)
                     && self.windows[w].active == i
                 {
                     let tab = &mut self.windows[w].tabs[i];
                     tab.links.insert(page, links);
-                    tab.text_boxes.set_file(page, text_boxes);
+                    tab.text_boxes.set_file(page, text_boxes, highlights);
                 }
             }
             Output::Outline { doc, entries } => {
