@@ -138,6 +138,11 @@ impl TextLayers {
         self.dragging
     }
 
+    /// No selection action is waiting for its pages' text.
+    pub fn settled(&self) -> bool {
+        self.action.is_none()
+    }
+
     /// Bytes of layers held.
     pub fn bytes(&self) -> usize {
         self.bytes

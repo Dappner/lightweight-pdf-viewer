@@ -119,6 +119,16 @@ impl TextLayer {
         self.lines.iter().any(|l| l.rect.contains(p))
     }
 
+    /// Whether `p` (fractions of the page) is on a letter: inside a character's box, less
+    /// the room above capitals and below the baseline that fonts leave, which on a large
+    /// heading reaches well into the gap above it.
+    pub fn is_on_letters(&self, p: Pos2) -> bool {
+        self.rects.iter().filter(|r| r.is_positive()).any(|r| {
+            let h = r.height();
+            Rect::from_x_y_ranges(r.x_range(), r.top() + 0.25 * h..=r.bottom() - 0.1 * h).contains(p)
+        })
+    }
+
     /// The text of `range`.
     pub fn text(&self, range: Range<u32>) -> String {
         String::from_utf16_lossy(&self.units[range.start as usize..range.end as usize])
@@ -428,6 +438,9 @@ mod tests {
         assert!(l.is_over_text(at(0, 2.0)));
         assert!(!l.is_over_text(pos2(0.5, 0.5)));
         assert!(!TextLayer::empty().is_over_text(pos2(0.5, 0.5)));
+        assert!(l.is_on_letters(at(0, 2.0)));
+        let above_capitals = at(0, 2.0) - eframe::egui::vec2(0.0, 0.008);
+        assert!(l.is_over_text(above_capitals) && !l.is_on_letters(above_capitals));
     }
 
     #[test]

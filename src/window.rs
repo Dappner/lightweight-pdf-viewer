@@ -5,10 +5,11 @@ use eframe::egui::ahash::HashSet;
 use std::path::PathBuf;
 
 use eframe::egui::{
-    self, Align2, CentralPanel, ColorImage, Context, FontId, Frame, Id, Key as KeyCode, Modifiers, Pos2, Rect,
+    self, Align2, CentralPanel, ColorImage, Context, FontId, Frame, Id, Key as KeyCode, Modifiers, Popup, Pos2, Rect,
     SidePanel, TextureHandle, TextureOptions, TopBottomPanel, ViewportBuilder, ViewportId, vec2,
 };
 
+use crate::annotate::{self, Tool};
 use crate::app::Command;
 use crate::cache::TextureCache;
 use crate::config::Config;
@@ -102,6 +103,8 @@ pub struct Window {
     settings: Option<Settings>,
     sidebar: bool,
     sidebar_mode: SidebarMode,
+    /// The annotate bar's tool, while it's showing.
+    annotate: Option<Tool>,
     pub tab_scroll: f32,
     /// The last tab switched away from, whose tiles are kept until this time.
     pub parked: Option<(DocId, f64)>,
@@ -125,6 +128,7 @@ impl Window {
             settings: None,
             sidebar: true,
             sidebar_mode: SidebarMode::Pages,
+            annotate: None,
             tab_scroll: 0.0,
             parked: None,
             visible_ready: false,
@@ -223,13 +227,15 @@ impl Window {
     }
 
     pub fn close(&mut self, ctx: &Context, shared: &mut Shared, index: usize) {
-        let tab = self.take(ctx, shared, index);
+        let mut tab = self.take(ctx, shared, index);
+        tab.text_boxes.finish_saving();
         shared.forget(&tab);
     }
 
     /// Closes every tab, as when the window closes.
     pub fn close_all(&mut self, shared: &mut Shared) {
-        for tab in self.tabs.drain(..) {
+        for mut tab in self.tabs.drain(..) {
+            tab.text_boxes.finish_saving();
             shared.forget(&tab);
         }
         self.active = 0;
@@ -314,6 +320,12 @@ impl Window {
                 },
             ),
             Command::ShowSidebar(mode) => self.set_sidebar_mode(shared, mode),
+            Command::ToggleAnnotate => {
+                self.annotate = match self.annotate {
+                    Some(_) => None,
+                    None => Some(Tool::Highlight),
+                };
+            }
             Command::SetLayout(mode) => self.set_layout(ctx, mode),
             Command::ZoomIn | Command::ZoomOut | Command::ZoomToFit => self.zoom(ctx, command),
             Command::RotateLeft => self.rotate(ctx, shared, None, false),
@@ -323,6 +335,7 @@ impl Window {
             Command::FindNext => self.find_step(true),
             Command::FindPrevious => self.find_step(false),
             Command::Save => self.save(ctx),
+            Command::Revert => self.revert(self.active),
             _ => {}
         }
     }
@@ -452,6 +465,10 @@ impl Window {
     }
 
     /// The active tab's page layout, once it has loaded.
+    pub fn annotating(&self) -> bool {
+        self.annotate.is_some()
+    }
+
     pub fn layout(&self) -> Option<PageLayout> {
         match &self.active_tab()?.doc {
             DocState::Ready(layout) => Some(layout.mode()),
@@ -536,6 +553,20 @@ impl Window {
         });
     }
 
+    /// Drops tab `index`'s unsaved edits; ⌘Z brings them back. Not while a save is writing
+    /// them.
+    fn revert(&mut self, index: usize) {
+        let Some(tab) = self.tabs.get_mut(index) else { return };
+        if !matches!(tab.text_boxes.saving, Some(Saving::Running(_))) {
+            tab.text_boxes.revert();
+        }
+    }
+
+    /// The active tab has edits not yet saved.
+    pub fn unsaved(&self) -> bool {
+        self.active_tab().is_some_and(|t| t.text_boxes.unsaved())
+    }
+
     /// Takes in finished saves: a saved tab reopens, so its pages and boxes are read from the
     /// file as it now is.
     fn check_saves(&mut self, ctx: &Context, shared: &mut Shared) {
@@ -559,6 +590,23 @@ impl Window {
                 }
                 Err(e) => tab.text_boxes.saving = Some(Saving::Failed(e)),
             }
+        }
+    }
+
+    /// Gives the selected text box the size or colour the annotate bar changed from `old` to
+    /// `new`.
+    fn restyle_selected_box(&mut self, old: &annotate::Style, new: &annotate::Style) {
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        let Some(r) = tab.text_boxes.selected else { return };
+        if new.text_size != old.text_size || new.text_color != old.text_color {
+            tab.text_boxes.change_box(r, |b| {
+                if new.text_size != old.text_size {
+                    b.size = new.text_size;
+                }
+                if new.text_color != old.text_color {
+                    b.color = new.text_color;
+                }
+            });
         }
     }
 
@@ -609,6 +657,7 @@ impl Window {
                 (cmd, KeyCode::K, Command::QuickOpen),
                 (cmd, KeyCode::Comma, Command::Settings),
                 (cmd, KeyCode::W, Command::CloseTab),
+                (cmd | shift, KeyCode::A, Command::ToggleAnnotate),
                 (cmd | alt, KeyCode::B, Command::ToggleOutline),
                 (cmd, KeyCode::B, Command::ToggleSidebar),
                 (cmd, KeyCode::Equals, Command::ZoomIn),
@@ -646,16 +695,18 @@ impl Window {
     }
 
     /// ⌘C copies the active tab's selection, ⌘A selects all its text and Escape clears the
-    /// selection, unless a text field has the keys. Copied text goes on the clipboard here.
+    /// selection, or with none, leaves annotate mode, unless a text field has the keys. Copied text goes on the clipboard here.
     fn selection_keys(&mut self, ctx: &Context) {
         let typing = self.typing(ctx);
         let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        // An open menu takes Escape to close.
+        let menu_open = Popup::is_any_open(ctx);
         if !typing && let DocState::Ready(layout) = &tab.doc {
             let (copy, all, escape, undo, delete) = ctx.input_mut(|i| {
                 (
                     i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
                     i.consume_key(Modifiers::COMMAND, KeyCode::A),
-                    i.consume_key(Modifiers::NONE, KeyCode::Escape),
+                    !menu_open && i.consume_key(Modifiers::NONE, KeyCode::Escape),
                     i.consume_key(Modifiers::COMMAND, KeyCode::Z),
                     tab.text_boxes.selected.is_some()
                         && (i.consume_key(Modifiers::NONE, KeyCode::Backspace)
@@ -666,6 +717,9 @@ impl Window {
                 tab.text.select_all(layout.page_count() as u32);
             }
             if escape {
+                if tab.text.selection().is_none() && tab.text_boxes.selected.is_none() {
+                    self.annotate = None;
+                }
                 tab.text.clear_selection();
                 tab.text_boxes.selected = None;
             }
@@ -786,6 +840,7 @@ impl Window {
         if find_open
             && !self.modal_open()
             && !typing_box
+            && !Popup::is_any_open(ctx)
             && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, KeyCode::Escape))
         {
             self.tabs[self.active].search = None;
@@ -801,8 +856,11 @@ impl Window {
             .show_separator_line(false)
             .show(ctx, |ui| {
                 let status = self.status(ctx.input(|i| i.time));
-                let view_menu =
-                    tab_bar::ViewMenu { sidebar: self.sidebar.then_some(self.sidebar_mode), layout: self.layout() };
+                let view_menu = tab_bar::ViewMenu {
+                    sidebar: self.sidebar.then_some(self.sidebar_mode),
+                    layout: self.layout(),
+                    annotating: self.annotate.is_some(),
+                };
                 tab_bar::show(ui, &self.tabs, self.active, &mut self.tab_scroll, status, view_menu, &palette)
             })
             .inner;
@@ -814,6 +872,7 @@ impl Window {
                     self.close(ctx, shared, i);
                 }
             }
+            Some(Action::Revert(i)) => self.revert(i),
             Some(Action::Reveal(i)) => {
                 if let Some(tab) = self.tabs.get(i) {
                     let _ = std::process::Command::new("open").arg("-R").arg(&tab.path).spawn();
@@ -862,6 +921,27 @@ impl Window {
             }
         }
 
+        // After the sidebar, so the bar spans the pages only.
+        let annotate_bar = self.annotate.filter(|_| !self.tabs.is_empty());
+        if let Some(tool) = annotate_bar {
+            let style = shared.config.annotate;
+            let action = TopBottomPanel::top(Id::new(("annotate", self.serial)))
+                .exact_height(annotate::HEIGHT)
+                .frame(Frame::NONE)
+                .show_separator_line(false)
+                .show(ctx, |ui| annotate::show(ui, tool, &style, &palette))
+                .inner;
+            match action {
+                Some(annotate::Action::Tool(tool)) => self.annotate = Some(tool),
+                Some(annotate::Action::Style(new)) => {
+                    self.restyle_selected_box(&style, &new);
+                    requests.push(Request::Run(Command::SetAnnotateStyle(new)));
+                }
+                Some(annotate::Action::Done) => self.annotate = None,
+                None => {}
+            }
+        }
+
         let (clicked_link, menu_command) = CentralPanel::default()
             .frame(content_frame)
             .show(ctx, |ui| {
@@ -889,6 +969,8 @@ impl Window {
                             text: &mut tab.text,
                             text_boxes: &mut tab.text_boxes,
                             rotations: &tab.rotations,
+                            tool: self.annotate,
+                            style: shared.config.annotate,
                             thumb_px: shared.thumb_px,
                             prefetch: shared.prefetch,
                             page_border: palette.page_border,
@@ -915,7 +997,8 @@ impl Window {
             && let Some(search) = &mut tab.search
         {
             let now = ctx.input(|i| i.time);
-            match find_bar::show(ctx, self.serial, tab_bar::HEIGHT, search, &palette) {
+            let top = tab_bar::HEIGHT + if annotate_bar.is_some() { annotate::HEIGHT } else { 0.0 };
+            match find_bar::show(ctx, self.serial, top, search, &palette) {
                 Some(find_bar::Action::Edited) => search.edited(now),
                 Some(find_bar::Action::Next) => self.find_step(true),
                 Some(find_bar::Action::Previous) => self.find_step(false),

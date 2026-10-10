@@ -1,6 +1,7 @@
 //! Native menu bar. Items queue [`Command`]s that the app runs on its next frame. AppKit
 //! matches the ⌘ shortcuts shown in the menus before key events reach egui. The page layout
-//! items show a checkmark next to the active tab's layout.
+//! items show a checkmark next to the active tab's layout, and Annotate one while it's on.
+//! Revert to Saved is enabled while the active tab has unsaved edits.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -22,6 +23,10 @@ static CONTEXT: OnceLock<egui::Context> = OnceLock::new();
 static COMMANDS: Mutex<Vec<Command>> = Mutex::new(Vec::new());
 /// The active tab's page layout; `None` disables the layout items.
 static LAYOUT: Mutex<Option<PageLayout>> = Mutex::new(None);
+/// The focused window's annotate bar is showing.
+static ANNOTATING: Mutex<bool> = Mutex::new(false);
+/// The focused window's active tab has edits not yet saved, which Revert to Saved drops.
+static UNSAVED: Mutex<bool> = Mutex::new(false);
 
 define_class!(
     // SAFETY: NSObject has no subclassing requirements and MenuTarget does not implement Drop.
@@ -50,13 +55,23 @@ define_class!(
     }
 );
 
-/// Whether `item` is enabled; checks the active layout's item.
+/// Whether `item` is enabled; checks the active layout's item, and Annotate while it's on.
 fn validate(item: &NSMenuItem) -> bool {
     let command = COMMANDS.lock().unwrap().get(item.tag() as usize).copied();
-    let Some(Command::SetLayout(layout)) = command else { return true };
-    let current = *LAYOUT.lock().unwrap();
-    item.setState(if current == Some(layout) { NSControlStateValueOn } else { NSControlStateValueOff });
-    current.is_some()
+    let check = |on: bool| item.setState(if on { NSControlStateValueOn } else { NSControlStateValueOff });
+    match command {
+        Some(Command::SetLayout(layout)) => {
+            let current = *LAYOUT.lock().unwrap();
+            check(current == Some(layout));
+            current.is_some()
+        }
+        Some(Command::ToggleAnnotate) => {
+            check(*ANNOTATING.lock().unwrap());
+            true
+        }
+        Some(Command::Revert) => *UNSAVED.lock().unwrap(),
+        _ => true,
+    }
 }
 
 impl MenuTarget {
@@ -77,6 +92,16 @@ enum Entry {
 /// Tells the menu which layout the active tab uses.
 pub fn set_layout(layout: Option<PageLayout>) {
     *LAYOUT.lock().unwrap() = layout;
+}
+
+/// Tells the menu whether the focused window is annotating.
+pub fn set_annotating(on: bool) {
+    *ANNOTATING.lock().unwrap() = on;
+}
+
+/// Tells the menu whether the active tab has edits to revert.
+pub fn set_unsaved(unsaved: bool) {
+    *UNSAVED.lock().unwrap() = unsaved;
 }
 
 pub fn take() -> Vec<Command> {
@@ -116,6 +141,7 @@ pub fn install(ctx: &egui::Context) {
                 Item("Open Recent…", Command::QuickOpen, "k", cmd),
                 Separator,
                 Item("Save", Command::Save, "s", cmd),
+                Item("Revert to Saved", Command::Revert, "", none),
                 Separator,
                 Item("Close Tab", Command::CloseTab, "w", cmd),
             ],
@@ -146,6 +172,8 @@ pub fn install(ctx: &egui::Context) {
                 Separator,
                 Item("Rotate Left", Command::RotateLeft, "l", cmd),
                 Item("Rotate Right", Command::RotateRight, "r", cmd),
+                Separator,
+                Item("Annotate", Command::ToggleAnnotate, "a", cmd_shift),
             ],
         ),
         (

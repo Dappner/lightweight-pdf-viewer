@@ -1,6 +1,7 @@
 //! A tabbed, memory-lean PDF viewer. The library holds the whole app so the benchmarks
 //! can drive it headless; `main.rs` only opens the window.
 
+pub mod annotate;
 pub mod app;
 mod cache;
 mod case_folding;

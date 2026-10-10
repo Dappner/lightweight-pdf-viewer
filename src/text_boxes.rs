@@ -5,7 +5,8 @@
 //! Highlights are kept the same way, alongside them. From
 //! then on the tab owns the page's boxes: every change is written to a file of the tab's own
 //! (see [`dir`]), so closing the tab or quitting loses nothing, and ⌘S writes them into the
-//! PDF. The app draws every box itself, those from the file included; the page renderer
+//! PDF. Revert to Saved drops them instead. The edits follow the PDF when it's renamed or
+//! moved. The app draws every box itself, those from the file included; the page renderer
 //! draws no annotations, so a box being edited never shows twice.
 
 use std::collections::BTreeMap;
@@ -154,6 +155,90 @@ impl Highlight {
     }
 }
 
+/// How near, as a fraction of the page, highlights on a line must come to touch.
+const TOUCH: f32 = 0.002;
+
+/// Highlights `rects` (one a line) in `color` among a page's `highlights`, which never
+/// overlap: the ones of that colour it overlaps or touches merge with it, and it trims the
+/// others where it covers them. Text already highlighted in that colour is unhighlighted
+/// instead. A highlight from the file that changes becomes a new one.
+pub fn add_highlight(highlights: &mut Vec<Highlight>, rects: Vec<Rect>, color: [u8; 3]) {
+    let same: Vec<Rect> = highlights.iter().filter(|h| h.color == color).flat_map(Highlight::rects).collect();
+    let erase = rects.iter().all(|r| covered(*r, &same));
+    let mut merged = rects.clone();
+    let mut kept = Vec::new();
+    for h in highlights.drain(..) {
+        let old: Vec<Rect> = h.rects().collect();
+        if h.color == color && !erase && old.iter().any(|o| rects.iter().any(|n| touch(*o, *n))) {
+            merged.extend(old);
+            continue;
+        }
+        let left: Vec<Rect> = old
+            .iter()
+            .flat_map(|&o| {
+                rects.iter().fold(vec![o], |pieces, &n| pieces.into_iter().flat_map(|p| cut(p, n)).collect())
+            })
+            .collect();
+        if left == old {
+            kept.push(h);
+        } else if !left.is_empty() {
+            kept.push(Highlight { color: h.color, ..Highlight::new(left) });
+        }
+    }
+    if !erase {
+        kept.push(Highlight { color, ..Highlight::new(merge_lines(merged)) });
+    }
+    *highlights = kept;
+}
+
+/// Whether `a` and `b` are on one line: their heights overlap by over half the smaller.
+fn same_line(a: Rect, b: Rect) -> bool {
+    a.max.y.min(b.max.y) - a.min.y.max(b.min.y) > 0.5 * a.height().min(b.height())
+}
+
+/// Whether `a` and `b` are on one line and overlap or touch on it.
+fn touch(a: Rect, b: Rect) -> bool {
+    same_line(a, b) && a.min.x <= b.max.x + TOUCH && b.min.x <= a.max.x + TOUCH
+}
+
+/// `r` without what `cover` covers of it on its line: none, one or two pieces.
+fn cut(r: Rect, cover: Rect) -> Vec<Rect> {
+    if !same_line(r, cover) || cover.max.x <= r.min.x || cover.min.x >= r.max.x {
+        return vec![r];
+    }
+    let left = Rect::from_x_y_ranges(r.min.x..=cover.min.x, r.y_range());
+    let right = Rect::from_x_y_ranges(cover.max.x..=r.max.x, r.y_range());
+    [left, right].into_iter().filter(|p| p.width() > TOUCH).collect()
+}
+
+/// Whether the rects of `cover` on `r`'s line cover it.
+fn covered(r: Rect, cover: &[Rect]) -> bool {
+    let mut spans: Vec<(f32, f32)> = cover.iter().filter(|c| same_line(r, **c)).map(|c| (c.min.x, c.max.x)).collect();
+    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut x = r.min.x;
+    for (from, to) in spans {
+        if from > x + TOUCH {
+            break;
+        }
+        x = x.max(to);
+    }
+    x >= r.max.x - TOUCH
+}
+
+/// `rects` with those on one line that overlap or touch made one.
+fn merge_lines(mut rects: Vec<Rect>) -> Vec<Rect> {
+    rects.sort_by(|a, b| a.min.x.total_cmp(&b.min.x));
+    let mut lines: Vec<Rect> = Vec::new();
+    for r in rects {
+        match lines.iter_mut().find(|l| touch(**l, r)) {
+            Some(line) => *line = line.union(r),
+            None => lines.push(r),
+        }
+    }
+    lines.sort_by(|a, b| a.min.y.total_cmp(&b.min.y));
+    lines
+}
+
 /// The box at `index` on `page`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BoxRef {
@@ -181,6 +266,18 @@ pub struct Editing {
 enum Undo {
     Boxes(u32, Option<Vec<TextBox>>),
     Highlights(u32, Option<Vec<Highlight>>),
+    /// Every edit, as it was before [`TextBoxes::revert`].
+    Revert(Box<Edits>),
+}
+
+/// The edits not yet saved, all of them.
+#[derive(Default)]
+struct Edits {
+    pages: BTreeMap<u32, Vec<TextBox>>,
+    added: BTreeMap<u32, Vec<TextBox>>,
+    highlights: BTreeMap<u32, Vec<Highlight>>,
+    added_highlights: BTreeMap<u32, Vec<Highlight>>,
+    fingerprint: Option<Fingerprint>,
 }
 
 /// Which file, as it is on disk: a save checks the PDF hasn't changed since editing began.
@@ -278,6 +375,7 @@ impl TextBoxes {
     /// The boxes of the PDF at `pdf`, with any edits left unsaved in `dir`.
     pub fn load(pdf: &Path, dir: Option<&Path>) -> Self {
         let store = dir.map(|d| d.join(format!("{:016x}.json", fnv(pdf.as_os_str().as_encoded_bytes()))));
+        let read = |s: &Path| std::fs::read(s).ok().and_then(|bytes| serde_json::from_slice::<Unsaved>(&bytes).ok());
         let mut this = Self {
             pdf: pdf.to_owned(),
             store,
@@ -294,12 +392,14 @@ impl TextBoxes {
             dragging: None,
             saving: None,
         };
-        let unsaved = this
-            .store
-            .as_ref()
-            .and_then(|s| std::fs::read(s).ok())
-            .and_then(|bytes| serde_json::from_slice::<Unsaved>(&bytes).ok())
-            .filter(|u| u.pdf == pdf);
+        let mut unsaved = this.store.as_deref().and_then(read).filter(|u| u.pdf == pdf);
+        let mut moved = false;
+        if unsaved.is_none()
+            && let Some(dir) = dir
+        {
+            unsaved = moved_here(dir, pdf, read);
+            moved = unsaved.is_some();
+        }
         if let Some(unsaved) = unsaved {
             let current = Fingerprint::of(pdf);
             this.added = unsaved.added;
@@ -323,6 +423,9 @@ impl TextBoxes {
                 this.added_highlights.retain(|_, highlights| !highlights.is_empty());
             }
             this.fingerprint = current;
+            if moved {
+                this.persist();
+            }
         }
         this
     }
@@ -343,24 +446,34 @@ impl TextBoxes {
 
     /// The file's boxes and highlights of `page`, read with its links.
     pub fn set_file(&mut self, page: u32, boxes: Vec<TextBox>, highlights: Vec<Highlight>) {
+        self.file.insert(page, boxes);
+        self.file_highlights.insert(page, highlights);
+        if self.merge_added(page) {
+            self.persist();
+        }
+    }
+
+    /// Puts the boxes and highlights added to `page` on top of the file's, once those have
+    /// been read. Whether there were any.
+    fn merge_added(&mut self, page: u32) -> bool {
         let mut merged = false;
-        if let Some(added) = self.added.remove(&page) {
-            let mut all = boxes.clone();
+        if let Some(file) = self.file.get(&page)
+            && let Some(added) = self.added.remove(&page)
+        {
+            let mut all = file.clone();
             all.extend(added);
             self.edited.entry(page).or_insert(all);
             merged = true;
         }
-        if let Some(added) = self.added_highlights.remove(&page) {
-            let mut all = highlights.clone();
+        if let Some(file) = self.file_highlights.get(&page)
+            && let Some(added) = self.added_highlights.remove(&page)
+        {
+            let mut all = file.clone();
             all.extend(added);
             self.edited_highlights.entry(page).or_insert(all);
             merged = true;
         }
-        if merged {
-            self.persist();
-        }
-        self.file.insert(page, boxes);
-        self.file_highlights.insert(page, highlights);
+        merged
     }
 
     /// Lets go of the file's boxes and highlights, read again when their pages are next shown.
@@ -408,10 +521,11 @@ impl TextBoxes {
         self.persist();
     }
 
-    /// Highlights `rects` (see [`Highlight::rects`]) on `page`.
-    pub fn highlight(&mut self, page: u32, rects: Vec<Rect>) {
+    /// Highlights `rects` (see [`Highlight::rects`]) on `page` in `color`, as
+    /// [`add_highlight`] does.
+    pub fn highlight(&mut self, page: u32, rects: Vec<Rect>, color: [u8; 3]) {
         if !rects.is_empty() {
-            self.change_highlights(page, |highlights| highlights.push(Highlight::new(rects)));
+            self.change_highlights(page, |highlights| add_highlight(highlights, rects, color));
         }
     }
 
@@ -445,19 +559,12 @@ impl TextBoxes {
         }
     }
 
-    /// Starts typing into a new box at `at` (see [`TextBox::at`]) on `page`.
-    pub fn add(&mut self, page: u32, at: Pos2) {
+    /// Starts typing into a new box of `size` and `color` at `at` (see [`TextBox::at`]) on
+    /// `page`.
+    pub fn add(&mut self, page: u32, at: Pos2, size: f32, color: [u8; 3]) {
         self.finish_editing();
         self.selected = None;
-        self.editing = Some(Editing {
-            page,
-            index: None,
-            at,
-            draft: String::new(),
-            size: DEFAULT_SIZE,
-            color: COLORS[0].1,
-            focus: true,
-        });
+        self.editing = Some(Editing { page, index: None, at, draft: String::new(), size, color, focus: true });
     }
 
     /// Starts typing into an existing box.
@@ -526,6 +633,17 @@ impl TextBoxes {
             Some(Undo::Boxes(page, None)) => drop(self.edited.remove(&page)),
             Some(Undo::Highlights(page, Some(highlights))) => drop(self.edited_highlights.insert(page, highlights)),
             Some(Undo::Highlights(page, None)) => drop(self.edited_highlights.remove(&page)),
+            Some(Undo::Revert(edits)) => {
+                let Edits { pages, added, highlights, added_highlights, fingerprint } = *edits;
+                (self.edited, self.added) = (pages, added);
+                (self.edited_highlights, self.added_highlights) = (highlights, added_highlights);
+                self.fingerprint = fingerprint;
+                // Pages read since the revert show the file's own: put the added back on them.
+                let pages: Vec<u32> = self.added.keys().chain(self.added_highlights.keys()).copied().collect();
+                for page in pages {
+                    self.merge_added(page);
+                }
+            }
         }
         self.selected = None;
         self.editing = None;
@@ -572,6 +690,39 @@ impl TextBoxes {
         self.selected = None;
         self.fingerprint = None;
         self.persist();
+    }
+
+    /// Drops every edit not yet saved, back to what the PDF has. Undone as one change.
+    pub fn revert(&mut self) {
+        self.editing = None;
+        if !self.unsaved() {
+            return;
+        }
+        let edits = Edits {
+            pages: std::mem::take(&mut self.edited),
+            added: std::mem::take(&mut self.added),
+            highlights: std::mem::take(&mut self.edited_highlights),
+            added_highlights: std::mem::take(&mut self.added_highlights),
+            fingerprint: self.fingerprint.take(),
+        };
+        self.undo.push(Undo::Revert(Box::new(edits)));
+        self.selected = None;
+        self.dragging = None;
+        self.persist();
+    }
+
+    /// Waits for a save under way to finish, as when the tab closes: once the PDF has the
+    /// edits, the store must go, or they'd be added again on top of the file's own.
+    pub fn finish_saving(&mut self) {
+        let Some(Saving::Running(result)) = &self.saving else { return };
+        match result.recv() {
+            Ok(Ok(_)) => {
+                self.saving = None;
+                self.saved();
+            }
+            Ok(Err(e)) => self.saving = Some(Saving::Failed(e)),
+            Err(_) => self.saving = Some(Saving::Failed("The save stopped unexpectedly".into())),
+        }
     }
 
     /// Writes the unsaved edits to the store, or removes it once there are none.
@@ -623,6 +774,25 @@ pub fn unturn(at: Pos2, rotation: Rotation) -> Pos2 {
     }
 }
 
+/// Edits kept for a PDF that has since been renamed or moved to `pdf`: kept for a file no
+/// longer where it was, and which was last changed when this one was (a rename keeps the
+/// time). Their store is removed; the caller keeps them under `pdf`'s.
+fn moved_here(dir: &Path, pdf: &Path, read: impl Fn(&Path) -> Option<Unsaved>) -> Option<Unsaved> {
+    let here = Fingerprint::of(pdf)?;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let store = entry.path();
+        if store.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let Some(unsaved) = read(&store) else { continue };
+        if unsaved.fingerprint == Some(here) && !unsaved.pdf.exists() {
+            let _ = std::fs::remove_file(&store);
+            return Some(Unsaved { pdf: pdf.to_owned(), ..unsaved });
+        }
+    }
+    None
+}
+
 /// FNV-1a: names the file of unsaved edits, the same across launches and Rust versions.
 fn fnv(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3))
@@ -646,7 +816,7 @@ mod tests {
     }
 
     fn type_box(boxes: &mut TextBoxes, page: u32, text: &str) {
-        boxes.add(page, pos2(0.25, 0.5));
+        boxes.add(page, pos2(0.25, 0.5), DEFAULT_SIZE, COLORS[0].1);
         boxes.editing.as_mut().unwrap().draft = text.into();
         boxes.finish_editing();
     }
@@ -780,6 +950,36 @@ mod tests {
     }
 
     #[test]
+    fn highlights_never_overlap() {
+        let line = |x0: f32, x1: f32| Rect::from_min_max(pos2(x0, 0.1), pos2(x1, 0.12));
+        type Spans = Vec<(Vec<(f32, f32)>, [u8; 3])>;
+        let spans = |hs: &[Highlight]| -> Spans {
+            hs.iter().map(|h| (h.rects().map(|r| (r.min.x, r.max.x)).collect(), h.color)).collect()
+        };
+        let (yellow, green) = (HIGHLIGHT_YELLOW, [110, 214, 96]);
+        let from_file =
+            Highlight { origin: Some(0), ..Highlight::new([Rect::from_min_max(pos2(0.1, 0.5), pos2(0.3, 0.52))]) };
+        let mut hs = vec![from_file.clone()];
+
+        add_highlight(&mut hs, vec![line(0.1, 0.3)], yellow);
+        add_highlight(&mut hs, vec![line(0.25, 0.5)], yellow);
+        assert_eq!(hs[0], from_file, "one elsewhere is left alone");
+        assert_eq!(spans(&hs[1..]), [(vec![(0.1, 0.5)], yellow)], "the same colour merges");
+
+        add_highlight(&mut hs, vec![line(0.2, 0.3)], green);
+        assert_eq!(spans(&hs[1..]), [(vec![(0.1, 0.2), (0.3, 0.5)], yellow), (vec![(0.2, 0.3)], green)]);
+
+        add_highlight(&mut hs, vec![line(0.3, 0.4)], yellow);
+        assert_eq!(spans(&hs[1..]), [(vec![(0.1, 0.2), (0.4, 0.5)], yellow), (vec![(0.2, 0.3)], green)], "erased");
+
+        add_highlight(&mut hs, vec![line(0.0, 0.6)], green);
+        assert_eq!(spans(&hs[1..]), [(vec![(0.0, 0.6)], green)], "covers the others");
+        let mut file = vec![from_file];
+        add_highlight(&mut file, vec![Rect::from_min_max(pos2(0.2, 0.5), pos2(0.3, 0.52))], [0, 0, 255]);
+        assert_eq!(file[0].origin, None, "a trimmed one from the file is saved anew");
+    }
+
+    #[test]
     fn highlights_persist_undo_and_save_apart_from_boxes() {
         let dir = temp_dir("highlights");
         let pdf = pdf(&dir);
@@ -787,7 +987,7 @@ mod tests {
         let theirs =
             Highlight { origin: Some(0), ..Highlight::new([Rect::from_min_max(pos2(0.1, 0.1), pos2(0.5, 0.12))]) };
         boxes.set_file(0, Vec::new(), vec![theirs]);
-        boxes.highlight(0, vec![Rect::from_min_max(pos2(0.1, 0.2), pos2(0.6, 0.22))]);
+        boxes.highlight(0, vec![Rect::from_min_max(pos2(0.1, 0.2), pos2(0.6, 0.22))], HIGHLIGHT_YELLOW);
         type_box(&mut boxes, 1, "Note");
         assert_eq!(boxes.highlights(0).unwrap().len(), 2);
         assert_eq!(boxes.highlights(0).unwrap()[1].color, HIGHLIGHT_YELLOW);
@@ -805,6 +1005,59 @@ mod tests {
         assert!(boxes.undo(), "the highlight");
         assert_eq!(boxes.highlights(0).unwrap().len(), 1);
         assert!(!boxes.unsaved());
+    }
+
+    #[test]
+    fn revert_drops_the_edits_and_undo_brings_them_back() {
+        let dir = temp_dir("revert");
+        let pdf = pdf(&dir);
+        let mut boxes = TextBoxes::load(&pdf, Some(&dir));
+        let from_file = TextBox { origin: Some(0), changed: false, ..TextBox::new(pos2(0.1, 0.1), "File".into()) };
+        boxes.set_file(0, vec![from_file], Vec::new());
+        type_box(&mut boxes, 0, "Mine");
+        boxes.highlight(1, vec![Rect::from_min_max(pos2(0.1, 0.2), pos2(0.6, 0.22))], HIGHLIGHT_YELLOW);
+
+        boxes.revert();
+        assert!(!boxes.unsaved());
+        assert_eq!(boxes.page(0).unwrap().len(), 1, "the file's own box stays");
+        assert!(!TextBoxes::load(&pdf, Some(&dir)).unsaved(), "nothing kept on disk");
+
+        assert!(boxes.undo(), "the revert, as one change");
+        assert_eq!(boxes.page(0).unwrap()[1].text, "Mine");
+        assert_eq!(boxes.highlights(1).unwrap().len(), 1);
+        assert!(TextBoxes::load(&pdf, Some(&dir)).unsaved(), "kept on disk again");
+        assert!(boxes.undo(), "the highlight");
+    }
+
+    #[test]
+    fn edits_follow_a_renamed_pdf() {
+        let dir = temp_dir("renamed");
+        let pdf = pdf(&dir);
+        let mut boxes = TextBoxes::load(&pdf, Some(&dir));
+        type_box(&mut boxes, 0, "Note");
+        let renamed = dir.join("renamed.pdf");
+        std::fs::rename(&pdf, &renamed).unwrap();
+
+        assert_eq!(TextBoxes::load(&renamed, Some(&dir)).page(0).unwrap()[0].text, "Note");
+        assert_eq!(TextBoxes::load(&renamed, Some(&dir)).page(0).unwrap()[0].text, "Note", "now kept under its name");
+        std::fs::write(&pdf, b"%PDF-1.4").unwrap();
+        assert!(!TextBoxes::load(&pdf, Some(&dir)).unsaved(), "not under the old one");
+    }
+
+    #[test]
+    fn closing_during_a_save_waits_for_it_and_drops_what_it_saved() {
+        let dir = temp_dir("closing");
+        let pdf = pdf(&dir);
+        let mut boxes = TextBoxes::load(&pdf, Some(&dir));
+        type_box(&mut boxes, 0, "Note");
+        let (done, result) = std::sync::mpsc::channel();
+        boxes.saving = Some(Saving::Running(result));
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let _ = done.send(Ok(crate::engine::SaveOutcome::Saved));
+        });
+        boxes.finish_saving();
+        assert!(!TextBoxes::load(&pdf, Some(&dir)).unsaved(), "not added again on top of the file's");
     }
 
     #[test]

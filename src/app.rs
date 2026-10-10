@@ -14,6 +14,7 @@ use eframe::egui::{
     ColorImage, Context, IconData, Pos2, TextureOptions, Vec2, ViewportBuilder, ViewportCommand, ViewportId, vec2,
 };
 
+use crate::annotate;
 use crate::cache::TextureCache;
 use crate::config::{Config, SavedWindow};
 use crate::finder;
@@ -82,6 +83,8 @@ pub enum Command {
     Open,
     /// Writes the active tab's text boxes into its PDF.
     Save,
+    /// Drops the active tab's edits not yet saved.
+    Revert,
     /// Shows or hides the recent-files palette.
     QuickOpen,
     NewWindow,
@@ -121,6 +124,10 @@ pub enum Command {
     SetMemory(Memory),
     SetRestoreTabs(bool),
     SetSearchCache(Limits),
+    /// Shows or hides the annotate bar.
+    ToggleAnnotate,
+    /// Sets what new highlights and text boxes look like.
+    SetAnnotateStyle(annotate::Style),
     Quit,
 }
 
@@ -233,7 +240,8 @@ impl eframe::App for App {
 
     fn on_exit(&mut self) {
         let state = &mut *self.state();
-        for tab in state.windows.iter().flat_map(|w| &w.tabs) {
+        for tab in state.windows.iter_mut().flat_map(|w| &mut w.tabs) {
+            tab.text_boxes.finish_saving();
             state.shared.remember(tab);
         }
         state.save_session(true);
@@ -687,6 +695,10 @@ impl State {
                 self.shared.config.search_cache = limits;
                 self.shared.config.save();
             }
+            Command::SetAnnotateStyle(style) => {
+                self.shared.config.annotate = style;
+                self.shared.config.save();
+            }
             Command::Quit => {
                 self.quitting = true;
                 ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::Close);
@@ -821,6 +833,8 @@ impl State {
             self.focused = w;
         }
         menu::set_layout(self.windows[self.focused].layout());
+        menu::set_annotating(self.windows[self.focused].annotating());
+        menu::set_unsaved(self.windows[self.focused].unsaved());
 
         let changed = external || close || !requests.is_empty();
         for request in requests {

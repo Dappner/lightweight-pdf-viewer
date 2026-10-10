@@ -11,6 +11,7 @@ use eframe::egui::{
 };
 use std::sync::Arc;
 
+use crate::annotate::{Style, Tool};
 use crate::app::Command;
 use crate::cache::TextureCache;
 use crate::find_bar;
@@ -34,6 +35,8 @@ const ZOOM_SETTLE: f64 = 0.15;
 /// edge, up to [`EDGE_SCROLL_MAX`] points past.
 const EDGE_SCROLL: f32 = 30.0;
 const EDGE_SCROLL_MAX: f32 = 60.0;
+/// Opacity highlights are drawn with over the page.
+const HIGHLIGHT_ALPHA: u8 = 110;
 
 const UV: Rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
 
@@ -207,6 +210,10 @@ pub struct Canvas<'a> {
     pub text_boxes: &'a mut TextBoxes,
     /// How the reader has turned the pages, which the text boxes turn with.
     pub rotations: &'a Rotations,
+    /// Annotate mode's tool, while it's on.
+    pub tool: Option<Tool>,
+    /// What new highlights and text boxes look like.
+    pub style: Style,
     /// Width of the sidebar's thumbnails, drawn as placeholders until tiles arrive.
     pub thumb_px: u32,
     /// Screen heights rendered ahead, above and below the visible area.
@@ -238,6 +245,8 @@ impl Canvas<'_> {
             text,
             text_boxes,
             rotations,
+            tool,
+            style,
             thumb_px,
             prefetch,
             page_border,
@@ -378,9 +387,18 @@ impl Canvas<'_> {
                 }
             }
 
-            show_highlights(ui, text_boxes, &visible_pages, rotations);
+            let scales = [Some(scale), prev_scale];
+            show_highlights(ui, text_boxes, &visible_pages, rotations, layout, cache, doc, scales);
             select(ui, &pointer, text, view, &page_rects, over_link, screen_viewport);
-            let command = page_menu(ui, &pointer, &page_rects, layout.page_count(), text, text_boxes, rotations);
+            let command = page_menu(ui, &pointer, &page_rects, layout, text, text_boxes, rotations, &style);
+            // Text selected to highlight shows in the highlight's colour.
+            let tint = match tool {
+                Some(Tool::Highlight) => {
+                    let [r, g, b] = style.highlight;
+                    Color32::from_rgba_unmultiplied(r, g, b, HIGHLIGHT_ALPHA)
+                }
+                _ => selection_color(),
+            };
             // Over the tiles: the selection, then every match on screen, the current one stronger.
             if let Some(selection) = text.selection() {
                 for &(page, rect) in &visible_pages {
@@ -390,14 +408,14 @@ impl Canvas<'_> {
                     // A page selected whole and too small to read is tinted, its text unread.
                     let whole = page != selection.start().page && page != selection.end().page;
                     if whole && rect.height() < MIN_LAYER_HEIGHT {
-                        painter.rect_filled(rect, 0.0, selection_color());
+                        painter.rect_filled(rect, 0.0, tint);
                         continue;
                     }
                     text.want(ui.ctx(), page);
                     let Some(layer) = text.layer(page) else { continue };
                     let Some(range) = selection.range_on(page, layer.len()) else { continue };
                     for area in layer.rects(range) {
-                        painter.rect_filled(find_bar::on_page(rect, area), 0.0, selection_color());
+                        painter.rect_filled(find_bar::on_page(rect, area), 0.0, tint);
                     }
                 }
             }
@@ -414,6 +432,10 @@ impl Canvas<'_> {
 
             let zooming = view.zoom != view.render_zoom;
             show_text_boxes(ui, &pointer, text_boxes, &visible_pages, layout, rotations, doc, zooming);
+            // After the boxes, whose part in a click would end typing into a box it adds.
+            if let Some(tool) = tool {
+                annotate(ui, &pointer, text, text_boxes, &page_rects, layout, tool, &style, rotations);
+            }
 
             (
                 all_visible_ready,
@@ -445,17 +467,57 @@ impl Canvas<'_> {
     }
 }
 
-/// Draws the highlights of the pages on screen, with their screen rects.
-fn show_highlights(ui: &Ui, boxes: &TextBoxes, pages: &[(u32, Rect)], rotations: &Rotations) {
+/// Draws the highlights of the pages on screen, with their screen rects. As Preview does,
+/// their colour multiplies the page's, so text under them stays dark: the tiles under them
+/// are drawn again, tinted. Tiles at the first of `scales` there is one at are used; where
+/// there's none yet, the colour goes over the page, translucent.
+#[allow(clippy::too_many_arguments)]
+fn show_highlights(
+    ui: &Ui,
+    boxes: &TextBoxes,
+    pages: &[(u32, Rect)],
+    rotations: &Rotations,
+    layout: &DocLayout,
+    cache: &TextureCache,
+    doc: DocId,
+    scales: [Option<u32>; 2],
+) {
+    let painter = ui.painter();
     for &(page, rect) in pages {
         let Some(highlights) = boxes.highlights(page) else { continue };
         let rotation = rotations.of(page);
+        let size = layout.page_size(page as usize);
         for h in highlights {
             let [r, g, b] = h.color;
-            let color = Color32::from_rgba_unmultiplied(r, g, b, 110);
+            let tint = Color32::from_rgb(r, g, b);
             for area in h.rects() {
                 let shown = Rect::from_two_pos(turn(area.min, rotation), turn(area.max, rotation));
-                ui.painter().rect_filled(find_bar::on_page(rect, shown), 0.0, color);
+                let mut missing = vec![find_bar::on_page(rect, shown)];
+                for scale in scales.into_iter().flatten() {
+                    missing = missing
+                        .into_iter()
+                        .flat_map(|part| {
+                            let mut left = Vec::new();
+                            for (key, tile) in tiles(doc, page as usize, size, scale, rect, part) {
+                                let piece = tile.intersect(part);
+                                match cache.peek(&key) {
+                                    Some(image) => {
+                                        let uv = Rect::from_min_max(
+                                            ((piece.min - tile.min) / tile.size()).to_pos2(),
+                                            ((piece.max - tile.min) / tile.size()).to_pos2(),
+                                        );
+                                        grey::paint_part(painter, image, piece, uv, tint);
+                                    }
+                                    None => left.push(piece),
+                                }
+                            }
+                            left
+                        })
+                        .collect();
+                }
+                for part in missing {
+                    painter.rect_filled(part, 0.0, tint.gamma_multiply_u8(HIGHLIGHT_ALPHA));
+                }
             }
         }
     }
@@ -477,18 +539,113 @@ fn selected_lines(text: &TextLayers, boxes: &TextBoxes, rotations: &Rotations) -
     Some(pages)
 }
 
-/// The right-click menu: highlights the selection or removes the highlight clicked, copies
-/// the selection, and turns the page clicked or all of them (a document of one page, such as
-/// an image, only offers the latter). `pages` are the pages
-/// laid out this frame, with their screen rects.
+/// What the pointer does in annotate mode: double-clicking a page away from its text adds a
+/// text box there, and with the highlight tool, the text a drag, double or triple click
+/// selects is highlighted once it's selected. A triple click's line replaces the word its
+/// double click highlighted. `pages` are the pages laid out this frame, with their screen
+/// rects.
+#[allow(clippy::too_many_arguments)]
+fn annotate(
+    ui: &Ui,
+    pointer: &Response,
+    text: &mut TextLayers,
+    boxes: &mut TextBoxes,
+    pages: &[(u32, Rect)],
+    layout: &DocLayout,
+    tool: Tool,
+    style: &Style,
+    rotations: &Rotations,
+) {
+    /// Kept between frames: a highlight waiting for its selection (`Some(true)` for a
+    /// double click's), and whether the last one was a double click's word.
+    #[derive(Clone, Copy, Default)]
+    struct State {
+        waiting: Option<bool>,
+        word: bool,
+    }
+    let key = pointer.id.with("annotate");
+    let mut state = ui.data(|d| d.get_temp::<State>(key)).unwrap_or_default();
+    let (double, triple) = (pointer.double_clicked(), pointer.triple_clicked());
+    if pointer.drag_started() || (pointer.clicked() && !double && !triple) {
+        state = State::default();
+    }
+    let at = pointer.interact_pointer_pos().and_then(|p| {
+        let &(page, rect) = pages.iter().find(|(_, rect)| rect.contains(p))?;
+        Some((page, ((p - rect.min) / rect.size()).to_pos2()))
+    });
+    let blank = at.filter(|&(page, p)| {
+        boxes.page(page).is_some() && text.layer(page).is_some_and(|layer| !layer.is_on_letters(p))
+    });
+    if double
+        && !triple
+        && let Some((page, p)) = blank
+    {
+        text.clear_selection();
+        let at = centred_box(ui.ctx(), p, layout.page_size(page as usize), rotations.of(page), style);
+        boxes.add(page, at, style.text_size, style.text_color);
+        state = State::default();
+    } else if tool == Tool::Highlight {
+        if triple {
+            if state.word {
+                boxes.undo();
+            }
+            state = State { waiting: Some(false), word: false };
+        } else if double {
+            state.waiting = Some(true);
+        } else if pointer.drag_stopped() {
+            state.waiting = Some(false);
+        }
+    }
+    if let Some(double) = state.waiting
+        && text.settled()
+        && !text.dragging()
+    {
+        match selected_lines(text, boxes, rotations) {
+            Some(lines) => {
+                for (page, rects) in lines {
+                    boxes.highlight(page, rects, style.highlight);
+                }
+                text.clear_selection();
+                state = State { waiting: None, word: double };
+            }
+            // Nothing was selected.
+            None if text.selection().is_none_or(|s| s.is_empty()) => state.waiting = None,
+            // Waits for the text of the pages selected.
+            None => {
+                for page in text.selection().into_iter().flat_map(|s| s.pages()) {
+                    text.want(ui.ctx(), page);
+                }
+            }
+        }
+    }
+    ui.data_mut(|d| d.insert_temp(key, state));
+}
+
+/// Where a new box goes for a click at `p` (fractions of a page shown `shown` points big
+/// and turned by `rotation`): with its empty field centred on the click, as fractions of the
+/// page upright (see [`TextBox::at`]).
+fn centred_box(ctx: &eframe::egui::Context, p: Pos2, shown: Vec2, rotation: Rotation, style: &Style) -> Pos2 {
+    let b = TextBox { size: style.text_size, ..TextBox::new(Pos2::ZERO, String::new()) };
+    let galley = b.galley(ctx, "", 1.0);
+    // In points, as the field is first drawn: upright, with room for the first letter.
+    let field = b.size_around(&galley, 1.0) + vec2(b.size, 0.0);
+    unturn((p - field / 2.0 / shown).clamp(Pos2::ZERO, pos2(1.0, 1.0)), rotation)
+}
+
+/// The right-click menu: adds a text box, highlights the selection or removes the highlight
+/// clicked, copies the selection, and turns the page clicked or all of them (a document of
+/// one page, such as an image, only offers the latter). `pages` are the pages laid out this
+/// frame, with their screen rects. New boxes and highlights look as `style` says.
+#[allow(clippy::too_many_arguments)]
 fn page_menu(
     ui: &Ui,
     pointer: &Response,
     pages: &[(u32, Rect)],
-    page_count: usize,
+    layout: &DocLayout,
     text: &mut TextLayers,
     text_boxes: &mut TextBoxes,
     rotations: &Rotations,
+    style: &Style,
 ) -> Option<Command> {
     // The page clicked and where on it (fractions of the page as shown), kept while its menu
     // is open.
@@ -510,7 +667,8 @@ fn page_menu(
         if ui.add_enabled(can_add.is_some(), Button::new("Add Text")).clicked()
             && let Some((page, at)) = can_add
         {
-            text_boxes.add(page, unturn(at, rotations.of(page)));
+            let at = centred_box(ui.ctx(), at, layout.page_size(page as usize), rotations.of(page), style);
+            text_boxes.add(page, at, style.text_size, style.text_color);
         }
         let highlighted = clicked.and_then(|(page, at)| {
             let at = unturn(at, rotations.of(page));
@@ -527,7 +685,7 @@ fn page_menu(
                 && let Some(lines) = lines
             {
                 for (page, rects) in lines {
-                    text_boxes.highlight(page, rects);
+                    text_boxes.highlight(page, rects, style.highlight);
                 }
                 text.clear_selection();
             }
@@ -542,7 +700,7 @@ fn page_menu(
                 command = Some(chosen);
             }
         };
-        match clicked.map(|(page, _)| page).filter(|_| page_count > 1) {
+        match clicked.map(|(page, _)| page).filter(|_| layout.page_count() > 1) {
             Some(page) => {
                 let page = page as usize;
                 item(ui, "Rotate This Page Left", "", Command::RotatePage { page, clockwise: false });

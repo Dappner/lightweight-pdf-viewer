@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::annotate;
 use crate::memory::Memory;
 use crate::search_index::{self, Limits, Store};
 use crate::sidebar;
@@ -21,6 +22,8 @@ pub struct Config {
     pub memory: Memory,
     /// How much searched text to keep on disk, so searching a document again is fast.
     pub search_cache: Limits,
+    /// What annotate mode's new highlights and text boxes look like.
+    pub annotate: annotate::Style,
     /// Where searched text is saved; `None` doesn't save it (tests, benchmarks).
     #[serde(skip)]
     pub search_cache_dir: Option<PathBuf>,
@@ -41,6 +44,7 @@ impl Default for Config {
             windows: Vec::new(),
             memory: Memory::default(),
             search_cache: Limits::default(),
+            annotate: annotate::Style::default(),
             search_cache_dir: None,
             text_boxes_dir: None,
             path: None,

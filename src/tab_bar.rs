@@ -4,10 +4,11 @@
 //! Dragging a tab reorders it; dragging it well below the strip, or out of the window,
 //! detaches it: released over another window's strip it joins that window, and anywhere
 //! else it gets a window of its own (a window's only tab just moves its window there).
-//! Right-clicking a tab shows its file in Finder, copies its path or closes tabs. A tab with
-//! unsaved text boxes shows a dot in place of its close button until hovered.
+//! Right-clicking a tab shows its file in Finder, copies its path, reverts its unsaved edits
+//! or closes tabs. A tab with unsaved text boxes shows a dot in place of its close button until hovered.
 //! Left of the tabs, a Preview-style button opens a menu of sidebar and page layout options;
-//! at the right end, after the page and zoom status, a button rotates the pages.
+//! at the right end, after the page and zoom status, buttons show the annotate bar and
+//! rotate the pages.
 
 use eframe::egui::{
     Align2, Button, CornerRadius, CursorIcon, FontId, LayerId, Order, Painter, Popup, Pos2, Rect, Response, Sense,
@@ -34,8 +35,8 @@ const MIN_TAB: f32 = 110.0;
 const MAX_TAB: f32 = 220.0;
 const PLUS_WIDTH: f32 = 36.0;
 const STATUS_WIDTH: f32 = 150.0;
-/// The rotate button at the right end of the strip.
-const ROTATE_WIDTH: f32 = 32.0;
+/// The annotate and rotate buttons at the right end of the strip.
+const BUTTONS_WIDTH: f32 = 60.0;
 /// How far below the strip a dragged tab must go to detach.
 const DETACH_DISTANCE: f32 = 60.0;
 /// Where a detached tab's new window goes relative to the pointer: the pointer ends up
@@ -49,6 +50,8 @@ pub enum Action {
     CloseOthers(usize),
     /// Shows the tab's file in Finder.
     Reveal(usize),
+    /// Drops the tab's edits not yet saved.
+    Revert(usize),
     Move {
         from: usize,
         to: usize,
@@ -68,6 +71,8 @@ pub struct ViewMenu {
     pub sidebar: Option<SidebarMode>,
     /// `None` until the active tab has loaded.
     pub layout: Option<PageLayout>,
+    /// The annotate bar is showing, for its button.
+    pub annotating: bool,
 }
 
 /// `scroll` is the strip's horizontal scroll offset, kept by the caller between frames.
@@ -216,6 +221,9 @@ pub fn show(
             if ui.button("Copy Path").clicked() {
                 ui.ctx().copy_text(tabs[i].path.display().to_string());
             }
+            if ui.add_enabled(tabs[i].text_boxes.unsaved(), Button::new("Revert to Saved")).clicked() {
+                action = Some(Action::Revert(i));
+            }
             ui.separator();
             if ui.button("Close Tab").clicked() {
                 action = Some(Action::Close(i));
@@ -246,9 +254,13 @@ pub fn show(
         if let Some(command) = rotate_button(ui, rotate, palette) {
             action = Some(Action::Run(command));
         }
+        let annotate = rotate.translate(vec2(-28.0, 0.0));
+        if annotate_button(ui, annotate, view_menu.annotating, palette) {
+            action = Some(Action::Run(Command::ToggleAnnotate));
+        }
         let painter = ui.painter();
         painter.text(
-            pos2(rotate.left() - 6.0, plus_center.y),
+            pos2(annotate.left() - 6.0, plus_center.y),
             Align2::RIGHT_CENTER,
             status,
             FontId::proportional(12.0),
@@ -264,7 +276,7 @@ fn strip(bar: Rect, n: usize) -> (Rect, f32) {
     let leading = LEADING + VIEW_BUTTON;
     let area = Rect::from_min_max(
         pos2(bar.left() + leading, bar.top() + TAB_TOP),
-        pos2((bar.right() - STATUS_WIDTH - ROTATE_WIDTH - PLUS_WIDTH).max(bar.left() + leading), bar.bottom()),
+        pos2((bar.right() - STATUS_WIDTH - BUTTONS_WIDTH - PLUS_WIDTH).max(bar.left() + leading), bar.bottom()),
     );
     let tab_width = if n == 0 { 0.0 } else { (area.width() / n as f32).clamp(MIN_TAB, MAX_TAB) };
     (area, tab_width)
@@ -348,6 +360,33 @@ fn view_button(ui: &mut Ui, rect: Rect, menu: &ViewMenu, palette: &Palette) -> O
         }
     });
     chosen
+}
+
+/// A pen that shows or hides the annotate bar, shaded while it's showing.
+fn annotate_button(ui: &mut Ui, rect: Rect, on: bool, palette: &Palette) -> bool {
+    let response = ui
+        .interact(rect, ui.id().with("annotate"), Sense::click())
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text(if on { "Hide Annotate Bar (⌘⇧A)" } else { "Annotate (⌘⇧A)" });
+    let painter = ui.painter();
+    if on || response.hovered() {
+        painter.rect_filled(rect, CornerRadius::same(6), if on { palette.separator } else { palette.hover });
+    }
+    // A pen slanting up to the right, its tip at the bottom left.
+    let stroke = Stroke::new(1.3, if on { palette.text } else { palette.text_weak });
+    let c = rect.center();
+    let (tip, base, end) = (c + vec2(-5.5, 5.5), c + vec2(-3.0, 3.0), c + vec2(4.5, -4.5));
+    let side = vec2(1.6, 1.6);
+    for [a, b] in [
+        [base + side, end + side],
+        [base - side, end - side],
+        [end + side, end - side],
+        [base + side, tip],
+        [base - side, tip],
+    ] {
+        painter.line_segment([a, b], stroke);
+    }
+    response.clicked()
 }
 
 /// Rotates left, as Preview's toolbar button does; with ⌥ held, right.

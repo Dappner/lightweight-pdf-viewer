@@ -24,6 +24,10 @@ pub mod menu {
 
     pub fn set_layout(_layout: Option<PageLayout>) {}
 
+    pub fn set_annotating(_on: bool) {}
+
+    pub fn set_unsaved(_unsaved: bool) {}
+
     pub fn take() -> Vec<Command> {
         Vec::new()
     }

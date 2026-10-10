@@ -58,10 +58,16 @@ pub enum Image {
 
 /// Paints `image` stretched over `rect`, as `Painter::image` with a white tint does.
 pub fn paint(painter: &Painter, image: Image, rect: Rect) {
+    paint_part(painter, image, rect, UV, Color32::WHITE);
+}
+
+/// Paints the `uv` part of `image` over `rect`, its pixels multiplied by `tint`, as
+/// `Painter::image` does.
+pub fn paint_part(painter: &Painter, image: Image, rect: Rect, uv: Rect, tint: Color32) {
     match image {
-        Image::Egui(id) => painter.image(id, rect, UV, Color32::WHITE),
+        Image::Egui(id) => painter.image(id, rect, uv, tint),
         Image::Grey(texture) => {
-            let tile = Tile { texture, rect, slot: AtomicU32::new(0) };
+            let tile = Tile { texture, rect, uv, tint, slot: AtomicU32::new(0) };
             painter.add(egui_wgpu::Callback::new_paint_callback(rect, tile))
         }
     };
@@ -274,10 +280,12 @@ fn vertex_buffer(device: &wgpu::Device, vertices: usize) -> wgpu::Buffer {
     })
 }
 
-/// One grey tile painted this frame.
+/// One grey tile, or part of one, painted this frame.
 struct Tile {
     texture: Arc<GreyTexture>,
     rect: Rect,
+    uv: Rect,
+    tint: Color32,
     /// Where its vertices start in this frame's vertex buffer, set in `prepare`.
     slot: AtomicU32,
 }
@@ -308,7 +316,7 @@ impl CallbackTrait for Tile {
         self.slot.store(r.vertices.len() as u32, Ordering::Relaxed);
         // egui's own quad for an image, unindexed.
         let mut mesh = Mesh::default();
-        mesh.add_rect_with_uv(self.rect, UV, Color32::WHITE);
+        mesh.add_rect_with_uv(self.rect, self.uv, self.tint);
         r.vertices.extend(mesh.indices.iter().map(|&i| mesh.vertices[i as usize]));
         Vec::new()
     }
