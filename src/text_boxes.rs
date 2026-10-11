@@ -6,8 +6,9 @@
 //! then on the tab owns the page's boxes: every change is written to a file of the tab's own
 //! (see [`dir`]), so closing the tab or quitting loses nothing, and ⌘S writes them into the
 //! PDF. Revert to Saved drops them instead. The edits follow the PDF when it's renamed or
-//! moved. The app draws every box itself, those from the file included; the page renderer
-//! draws no annotations, so a box being edited never shows twice.
+//! moved on the same filesystem. The app draws every box itself, those from the file
+//! included; the page renderer excludes FreeText and Highlight annotations, so edited
+//! annotations never show twice.
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::MetadataExt;
@@ -285,12 +286,26 @@ struct Edits {
 struct Fingerprint {
     size: u64,
     mtime: (i64, i64),
+    /// Renames on the same filesystem preserve this identity. Old stores omitted it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_id: Option<[u64; 2]>,
 }
 
 impl Fingerprint {
     fn of(path: &Path) -> Option<Self> {
         let meta = std::fs::metadata(path).ok()?;
-        Some(Self { size: meta.size(), mtime: (meta.mtime(), meta.mtime_nsec()) })
+        Some(Self {
+            size: meta.size(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            file_id: Some([meta.dev(), meta.ino()]),
+        })
+    }
+
+    /// Old stores can still be restored at their original path, but cannot identify a move.
+    fn matches(&self, current: &Self) -> bool {
+        self.size == current.size
+            && self.mtime == current.mtime
+            && self.file_id.is_none_or(|id| Some(id) == current.file_id)
     }
 }
 
@@ -343,8 +358,8 @@ pub struct TextBoxes {
     pdf: PathBuf,
     /// Where unsaved edits are kept; `None` keeps them in memory only.
     store: Option<PathBuf>,
-    /// Boxes the file has, by page, read as pages come into view. Let go with the links when
-    /// the tab goes to the background.
+    /// Boxes the file has, by page, read as pages come into view. Only visible pages are
+    /// kept beside the snapshot when the tab goes to the background.
     file: HashMap<u32, Vec<TextBox>>,
     /// Every box of each page edited since the last save.
     edited: BTreeMap<u32, Vec<TextBox>>,
@@ -393,18 +408,20 @@ impl TextBoxes {
             saving: None,
         };
         let mut unsaved = this.store.as_deref().and_then(read).filter(|u| u.pdf == pdf);
-        let mut moved = false;
+        let mut moved_from = None;
         if unsaved.is_none()
             && let Some(dir) = dir
         {
-            unsaved = moved_here(dir, pdf, read);
-            moved = unsaved.is_some();
+            if let Some((edits, source)) = moved_here(dir, pdf, read) {
+                unsaved = Some(edits);
+                moved_from = Some(source);
+            }
         }
         if let Some(unsaved) = unsaved {
             let current = Fingerprint::of(pdf);
             this.added = unsaved.added;
             this.added_highlights = unsaved.added_highlights;
-            if unsaved.fingerprint == current {
+            if unsaved.fingerprint.zip(current).is_some_and(|(old, new)| old.matches(&new)) {
                 this.edited = unsaved.pages;
                 this.edited_highlights = unsaved.highlights;
             } else {
@@ -423,8 +440,10 @@ impl TextBoxes {
                 this.added_highlights.retain(|_, highlights| !highlights.is_empty());
             }
             this.fingerprint = current;
-            if moved {
-                this.persist();
+            if let Some(source) = moved_from
+                && this.persist()
+            {
+                let _ = std::fs::remove_file(source);
             }
         }
         this
@@ -480,6 +499,12 @@ impl TextBoxes {
     pub fn clear_file(&mut self) {
         self.file.clear();
         self.file_highlights.clear();
+    }
+
+    /// Keeps only the visible pages' saved annotations beside a background snapshot.
+    pub fn retain_file_pages(&mut self, pages: &[u32]) {
+        self.file.retain(|page, _| pages.contains(page));
+        self.file_highlights.retain(|page, _| pages.contains(page));
     }
 
     /// Edits not yet written into the PDF.
@@ -753,11 +778,10 @@ impl TextBoxes {
     }
 
     /// Writes the unsaved edits to the store, or removes it once there are none.
-    fn persist(&self) {
-        let Some(store) = &self.store else { return };
+    fn persist(&self) -> bool {
+        let Some(store) = &self.store else { return true };
         if !self.unsaved() {
-            let _ = std::fs::remove_file(store);
-            return;
+            return std::fs::remove_file(store).is_ok() || !store.exists();
         }
         let unsaved = Unsaved {
             pdf: self.pdf.clone(),
@@ -767,9 +791,7 @@ impl TextBoxes {
             highlights: self.edited_highlights.clone(),
             added_highlights: self.added_highlights.clone(),
         };
-        if let Ok(json) = serde_json::to_vec(&unsaved) {
-            crate::config::write_atomically(store, &json);
-        }
+        serde_json::to_vec(&unsaved).is_ok_and(|json| crate::config::write_atomically(store, &json))
     }
 }
 
@@ -802,9 +824,9 @@ pub fn unturn(at: Pos2, rotation: Rotation) -> Pos2 {
 }
 
 /// Edits kept for a PDF that has since been renamed or moved to `pdf`: kept for a file no
-/// longer where it was, and which was last changed when this one was (a rename keeps the
-/// time). Their store is removed; the caller keeps them under `pdf`'s.
-fn moved_here(dir: &Path, pdf: &Path, read: impl Fn(&Path) -> Option<Unsaved>) -> Option<Unsaved> {
+/// longer where it was, with the same filesystem identity and metadata. The caller keeps
+/// the old store until its replacement has been written successfully.
+fn moved_here(dir: &Path, pdf: &Path, read: impl Fn(&Path) -> Option<Unsaved>) -> Option<(Unsaved, PathBuf)> {
     let here = Fingerprint::of(pdf)?;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let store = entry.path();
@@ -812,9 +834,8 @@ fn moved_here(dir: &Path, pdf: &Path, read: impl Fn(&Path) -> Option<Unsaved>) -
             continue;
         }
         let Some(unsaved) = read(&store) else { continue };
-        if unsaved.fingerprint == Some(here) && !unsaved.pdf.exists() {
-            let _ = std::fs::remove_file(&store);
-            return Some(Unsaved { pdf: pdf.to_owned(), ..unsaved });
+        if here.file_id.is_some() && unsaved.fingerprint == Some(here) && !unsaved.pdf.exists() {
+            return Some((Unsaved { pdf: pdf.to_owned(), ..unsaved }, store));
         }
     }
     None
@@ -1069,6 +1090,77 @@ mod tests {
         assert_eq!(TextBoxes::load(&renamed, Some(&dir)).page(0).unwrap()[0].text, "Note", "now kept under its name");
         std::fs::write(&pdf, b"%PDF-1.4").unwrap();
         assert!(!TextBoxes::load(&pdf, Some(&dir)).unsaved(), "not under the old one");
+    }
+
+    #[test]
+    fn matching_metadata_does_not_move_edits_to_a_different_file() {
+        let dir = temp_dir("different-file");
+        let original = pdf(&dir);
+        let mut boxes = TextBoxes::load(&original, Some(&dir));
+        type_box(&mut boxes, 0, "Private note");
+        let source_store = boxes.store.clone().unwrap();
+        let other = dir.join("other.pdf");
+        std::fs::write(&other, b"%PDF-1.5").unwrap();
+        let modified = std::fs::metadata(&original).unwrap().modified().unwrap();
+        std::fs::File::open(&other).unwrap().set_modified(modified).unwrap();
+        std::fs::remove_file(&original).unwrap();
+
+        assert!(!TextBoxes::load(&other, Some(&dir)).unsaved());
+        assert!(source_store.exists(), "unrelated opening must retain the original notes");
+    }
+
+    #[test]
+    fn a_failed_migration_keeps_the_original_store_for_retry() {
+        let dir = temp_dir("migration-failure");
+        let original = pdf(&dir);
+        let mut boxes = TextBoxes::load(&original, Some(&dir));
+        type_box(&mut boxes, 0, "Note");
+        let source_store = boxes.store.clone().unwrap();
+        let renamed = dir.join("renamed.pdf");
+        std::fs::rename(&original, &renamed).unwrap();
+        let target_store = dir.join(format!("{:016x}.json", fnv(renamed.as_os_str().as_encoded_bytes())));
+        std::fs::create_dir(&target_store).unwrap();
+
+        assert_eq!(TextBoxes::load(&renamed, Some(&dir)).page(0).unwrap()[0].text, "Note");
+        assert!(source_store.exists(), "failed replacement must not delete the source");
+        std::fs::remove_dir(&target_store).unwrap();
+        assert_eq!(TextBoxes::load(&renamed, Some(&dir)).page(0).unwrap()[0].text, "Note");
+        assert!(!source_store.exists(), "successful replacement finishes the migration");
+        assert!(target_store.is_file());
+    }
+
+    #[test]
+    fn legacy_stores_restore_edits_at_the_original_path() {
+        let dir = temp_dir("legacy-identity");
+        let pdf = pdf(&dir);
+        let mut boxes = TextBoxes::load(&pdf, Some(&dir));
+        let b = TextBox { origin: Some(0), changed: false, ..TextBox::new(pos2(0.1, 0.1), "File".into()) };
+        boxes.set_file(0, vec![b], Vec::new());
+        boxes.change_box(BoxRef { page: 0, index: 0 }, |b| b.text = "Edited".into());
+        let store = boxes.store.clone().unwrap();
+        let mut json: serde_json::Value = serde_json::from_slice(&std::fs::read(&store).unwrap()).unwrap();
+        json["fingerprint"].as_object_mut().unwrap().remove("file_id");
+        std::fs::write(store, serde_json::to_vec(&json).unwrap()).unwrap();
+
+        assert_eq!(TextBoxes::load(&pdf, Some(&dir)).page(0).unwrap()[0].text, "Edited");
+    }
+
+    #[test]
+    fn snapshot_keeps_only_visible_file_annotations() {
+        let dir = temp_dir("snapshot-annotations");
+        let mut boxes = TextBoxes::load(&pdf(&dir), None);
+        for page in 0..3 {
+            boxes.set_file(
+                page,
+                vec![TextBox::new(pos2(0.1, 0.1), "File".into())],
+                vec![Highlight::new([Rect::from_min_max(pos2(0.1, 0.2), pos2(0.4, 0.3))])],
+            );
+        }
+        boxes.retain_file_pages(&[1]);
+        assert!(boxes.page(0).is_none() && boxes.highlights(0).is_none());
+        assert_eq!(boxes.page(1).unwrap()[0].text, "File");
+        assert_eq!(boxes.highlights(1).unwrap().len(), 1);
+        assert!(boxes.page(2).is_none() && boxes.highlights(2).is_none());
     }
 
     #[test]

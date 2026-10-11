@@ -169,13 +169,23 @@ impl PageText {
 
     /// Calls `f` with each match of `query`, in folded bytes, left to right.
     pub fn find(&self, query: &Query, mut f: impl FnMut(Range<usize>)) {
+        self.find_while(query, |m| {
+            f(m);
+            true
+        });
+    }
+
+    /// Stops as soon as the caller has enough matches.
+    fn find_while(&self, query: &Query, mut f: impl FnMut(Range<usize>) -> bool) {
         let q = query.0.as_str();
         let mut from = 0;
         while let Some(i) = self.text[from..].find(q) {
             let start = from + i;
             let end = start + q.len();
             if self.is_boundary(start) && self.is_boundary(end) {
-                f(start..end);
+                if !f(start..end) {
+                    break;
+                }
                 from = end;
             } else {
                 from = start + self.text[start..].chars().next().map_or(1, char::len_utf8);
@@ -224,6 +234,9 @@ impl PageText {
                 Some(next) => (next.at as usize, next.source()),
                 None => (text.len(), source_len),
             };
+            if end > text.len() {
+                return None;
+            }
             let len = end.checked_sub(run.at as usize).filter(|&n| n > 0)?;
             // A plain run maps each byte to one unit; an atomic one takes at least one unit.
             let units = if run.atomic() { 1 } else { len as u32 };
@@ -246,13 +259,17 @@ impl PageText {
     /// Source ranges (UTF-16 start and length) of matches `range` of `query`, in order.
     pub fn source_ranges(&self, query: &Query, range: Range<u32>) -> Vec<(u32, u32)> {
         let mut out = Vec::new();
+        if range.is_empty() {
+            return out;
+        }
         let mut i = 0;
-        self.find(query, |m| {
+        self.find_while(query, |m| {
             if range.contains(&i) {
                 let start = self.to_source(m.start);
                 out.push((start, self.to_source(m.end) - start));
             }
             i += 1;
+            i < range.end
         });
         out
     }
@@ -381,6 +398,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn requested_match_ranges_keep_source_offsets() {
+        let page = PageText::new("a ß a ß a");
+        let query = Query::new("a").unwrap();
+        assert_eq!(page.source_ranges(&query, 0..1), vec![(0, 1)]);
+        assert_eq!(page.source_ranges(&query, 1..3), vec![(4, 1), (8, 1)]);
+        assert!(page.source_ranges(&query, 1..1).is_empty());
+        assert!(page.source_ranges(&query, 3..5).is_empty());
+        let mut visits = 0;
+        page.find_while(&query, |_| {
+            visits += 1;
+            false
+        });
+        assert_eq!(visits, 1);
+    }
+
+    #[test]
+    fn rejects_a_run_past_the_text_end_without_panicking() {
+        let mut bytes = Vec::new();
+        for n in [100u32, 1, 2] {
+            bytes.extend(n.to_le_bytes());
+        }
+        bytes.push(b'a');
+        for n in [0u32, 0, 100, 100] {
+            bytes.extend(n.to_le_bytes());
+        }
+        assert!(PageText::decode(&bytes).is_none());
     }
 
     #[test]

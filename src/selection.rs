@@ -10,14 +10,18 @@ use std::ops::Range;
 
 use eframe::egui::{Pos2, Rect};
 
+use crate::layout::Rotation;
+use crate::text_boxes::{turn, unturn};
+
 /// A page's text and where each of its UTF-16 units is, for hit-testing and highlighting.
 pub struct TextLayer {
     units: Vec<u16>,
-    /// One per unit, as fractions of the displayed page with a top-left origin;
+    /// One per unit, as fractions of the unrotated page with a top-left origin;
     /// [`Rect::NOTHING`] for units PDFKit has no box for (the spaces and line breaks it
     /// inserts itself).
     rects: Vec<Rect>,
     lines: Vec<Line>,
+    rotation: Rotation,
 }
 
 /// A run of units laid out along one line, in text order.
@@ -92,9 +96,20 @@ impl TextLayer {
     /// `units` is the page's text; `rects` holds one rectangle per unit, as for
     /// [`TextLayer::rects`].
     pub fn new(units: Vec<u16>, rects: Vec<Rect>) -> Self {
+        Self::with_rotation(units, rects, Rotation::default())
+    }
+
+    /// Builds the layer in unrotated coordinates, while its public geometry follows the
+    /// displayed page. `rotation` includes both the PDF's and the reader's turns.
+    pub fn with_rotation(units: Vec<u16>, mut rects: Vec<Rect>, rotation: Rotation) -> Self {
         assert_eq!(units.len(), rects.len());
+        for rect in &mut rects {
+            if rect.is_positive() {
+                *rect = Rect::from_two_pos(unturn(rect.min, rotation), unturn(rect.max, rotation));
+            }
+        }
         let lines = lines(&units, &rects);
-        Self { units, rects, lines }
+        Self { units, rects, lines, rotation }
     }
 
     pub fn empty() -> Self {
@@ -116,6 +131,7 @@ impl TextLayer {
     /// Whether `p` (fractions of the page) is over a line of text: where the pointer shows
     /// an I-beam.
     pub fn is_over_text(&self, p: Pos2) -> bool {
+        let p = unturn(p, self.rotation);
         self.lines.iter().any(|l| l.rect.contains(p))
     }
 
@@ -123,6 +139,7 @@ impl TextLayer {
     /// the room above capitals and below the baseline that fonts leave, which on a large
     /// heading reaches well into the gap above it.
     pub fn is_on_letters(&self, p: Pos2) -> bool {
+        let p = unturn(p, self.rotation);
         self.rects.iter().filter(|r| r.is_positive()).any(|r| {
             let h = r.height();
             Rect::from_x_y_ranges(r.x_range(), r.top() + 0.25 * h..=r.bottom() - 0.1 * h).contains(p)
@@ -137,6 +154,7 @@ impl TextLayer {
     /// The units around point `p` that a press selects by `unit`: an empty range at the
     /// nearest caret for [`Unit::Char`], else the word or line nearest `p`.
     pub fn range_at(&self, p: Pos2, unit: Unit) -> Range<u32> {
+        let p = unturn(p, self.rotation);
         let Some(line) = self.line_near(p) else { return 0..0 };
         match unit {
             Unit::Char => {
@@ -155,7 +173,10 @@ impl TextLayer {
             let to = line.range.end.min(range.end);
             let rect = (from..to).fold(Rect::NOTHING, |r, i| r.union(self.rects[i as usize]));
             // Full line height, so a line's highlight is even whatever its letters are.
-            rect.is_positive().then(|| Rect::from_x_y_ranges(rect.x_range(), line.rect.y_range()))
+            rect.is_positive().then(|| {
+                let upright = Rect::from_x_y_ranges(rect.x_range(), line.rect.y_range());
+                Rect::from_two_pos(turn(upright.min, self.rotation), turn(upright.max, self.rotation))
+            })
         })
     }
 
@@ -360,6 +381,38 @@ mod tests {
         units.push(b'c' as u16);
         rects.push(Rect::from_min_size(pos2(0.1, 0.1), eframe::egui::vec2(0.01, 0.02)));
         assert_eq!(TextLayer::new(units, rects).lines.len(), 2);
+    }
+
+    #[test]
+    fn selection_and_highlights_follow_all_page_turns() {
+        let mut rotation = Rotation::default();
+        for _ in 0..4 {
+            let upright = layer(&["hello world", "next"]);
+            let boxes = upright
+                .rects
+                .iter()
+                .map(|r| {
+                    if r.is_positive() { Rect::from_two_pos(turn(r.min, rotation), turn(r.max, rotation)) } else { *r }
+                })
+                .collect();
+            let shown = TextLayer::with_rotation(upright.units.clone(), boxes, rotation);
+            let p = turn(at(0, 2.9), rotation);
+            assert_eq!(shown.range_at(p, Unit::Char), 3..3);
+            assert_eq!(shown.text(shown.range_at(p, Unit::Word)), "hello");
+            assert_eq!(shown.text(shown.range_at(p, Unit::Line)), "hello world\n");
+            assert!(shown.is_over_text(p) && shown.is_on_letters(p));
+            let got: Vec<_> = shown.rects(3..14).collect();
+            let expected: Vec<_> = upright
+                .rects(3..14)
+                .map(|r| Rect::from_two_pos(turn(r.min, rotation), turn(r.max, rotation)))
+                .collect();
+            assert_eq!(got.len(), expected.len());
+            for (got, expected) in got.iter().zip(expected) {
+                assert!((got.min - expected.min).length() < 1e-6);
+                assert!((got.max - expected.max).length() < 1e-6);
+            }
+            rotation = rotation.clockwise();
+        }
     }
 
     #[test]

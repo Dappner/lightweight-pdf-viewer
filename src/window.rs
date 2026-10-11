@@ -167,15 +167,20 @@ impl Window {
         if index != self.active
             && let Some(old) = self.tabs.get_mut(self.active)
         {
+            old.text_boxes.finish_editing();
             shared.remember(old);
             if let DocState::Ready(layout) = &old.doc
                 && old.view.zoom > 0.0
             {
-                shared.renderer.snapshot(old.view.snapshot_job(layout, old.id, ctx.pixels_per_point()));
+                let snapshot = old.view.snapshot_job(layout, old.id, ctx.pixels_per_point());
+                let pages: Vec<u32> = snapshot.pages.iter().map(|p| p.page).collect();
+                old.text_boxes.retain_file_pages(&pages);
+                shared.renderer.snapshot(snapshot);
+            } else {
+                old.text_boxes.clear_file();
             }
             old.snapshot_texture = None;
             old.links.clear();
-            old.text_boxes.clear_file();
             old.text.clear();
             if let Some(search) = &mut old.search {
                 search.pause(true);
@@ -208,14 +213,20 @@ impl Window {
     }
 
     pub fn expire_parked(&mut self, ctx: &Context, shared: &mut Shared) {
-        let Some((doc, until)) = self.parked else { return };
+        let Some((_, until)) = self.parked else { return };
         let now = ctx.input(|i| i.time);
         if now >= until {
-            shared.cache.evict_doc(doc);
-            self.parked = None;
-            self.suspend_search(doc);
+            self.release_parked(shared);
         } else {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(until - now));
+        }
+    }
+
+    /// Ends the grace period, including when texture pressure evicts its pages early.
+    pub fn release_parked(&mut self, shared: &mut Shared) {
+        if let Some((doc, _)) = self.parked.take() {
+            shared.cache.evict_doc(doc);
+            self.suspend_search(doc);
         }
     }
 
@@ -228,6 +239,7 @@ impl Window {
 
     pub fn close(&mut self, ctx: &Context, shared: &mut Shared, index: usize) {
         let mut tab = self.take(ctx, shared, index);
+        tab.text_boxes.finish_editing();
         tab.text_boxes.finish_saving();
         shared.forget(&tab);
     }
@@ -235,6 +247,7 @@ impl Window {
     /// Closes every tab, as when the window closes.
     pub fn close_all(&mut self, shared: &mut Shared) {
         for mut tab in self.tabs.drain(..) {
+            tab.text_boxes.finish_editing();
             tab.text_boxes.finish_saving();
             shared.forget(&tab);
         }
@@ -244,6 +257,7 @@ impl Window {
 
     /// Removes tab `index` without closing it, to move it to another window.
     pub fn take(&mut self, ctx: &Context, shared: &mut Shared, index: usize) -> Tab {
+        self.tabs[index].text_boxes.finish_editing();
         let tab = self.tabs.remove(index);
         if self.parked.is_some_and(|(doc, _)| doc == tab.id) {
             self.parked = None;
@@ -268,7 +282,8 @@ impl Window {
         tab.view.sidebar_page = None;
         self.tabs.insert(index, tab);
         if self.tabs.len() == 1 {
-            self.active = 0;
+            self.active = usize::MAX;
+            self.activate(ctx, shared, 0);
         } else {
             if index <= self.active {
                 self.active += 1;
@@ -277,11 +292,12 @@ impl Window {
         }
     }
 
-    fn move_tab(&mut self, from: usize, to: usize) {
+    fn move_tab(&mut self, ctx: &Context, shared: &mut Shared, from: usize, to: usize) {
         let active_id = self.tabs[self.active].id;
         let tab = self.tabs.remove(from);
         self.tabs.insert(to, tab);
         self.active = self.tabs.iter().position(|t| t.id == active_id).unwrap_or(0);
+        self.activate(ctx, shared, to);
     }
 
     /// Runs a command that only concerns this window.
@@ -876,7 +892,7 @@ impl Window {
                     let _ = std::process::Command::new("open").arg("-R").arg(&tab.path).spawn();
                 }
             }
-            Some(Action::Move { from, to }) => self.move_tab(from, to),
+            Some(Action::Move { from, to }) => self.move_tab(ctx, shared, from, to),
             Some(Action::Detach { index, pointer }) => {
                 let origin = self.inner_rect.map_or(Pos2::ZERO, |r| r.min);
                 requests.push(Request::Detach { index, pointer: origin + pointer.to_vec2() });

@@ -398,6 +398,15 @@ fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context, pages_per_open:
                     Document::open(&path, &rotations).map(|doc| OpenDoc { id: doc_id, doc, pages: HashSet::new() })
                 }
             };
+            // Opening a one-page document touches only page zero. Keep it for the first
+            // render: images decode eagerly, so dropping it here would decode them twice.
+            let pages = if matches!(&work, Work::Control(Control::Open(_)))
+                && current.as_ref().is_some_and(|o| o.doc.page_count() == 1)
+            {
+                Some(vec![0])
+            } else {
+                pages
+            };
             match (&current, work) {
                 (Some(o), work) => run(&o.doc, doc_id, work, &out),
                 (None, Work::Control(Control::Open(doc))) => {
@@ -596,6 +605,32 @@ mod tests {
             })
             .collect();
         assert_eq!(queued, ["open", "snapshot 1", "snapshot 2", "outline"]);
+    }
+
+    /// An already opened image supplies its first render without reopening its file.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn opened_image_is_kept_for_its_first_render() {
+        let path = std::env::temp_dir().join(format!("lightweight-pdf-kept-image-{}.png", std::process::id()));
+        write_png(path.to_str().unwrap(), &[255, 0, 0, 255].repeat(16 * 16), 16, 16);
+        let renderer = Renderer::spawn(egui::Context::default(), 1, 32);
+        renderer.open(1, path.clone(), Rotations::default());
+        let wait = |renderer: &Renderer| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let outputs = renderer.take_done();
+                if !outputs.is_empty() {
+                    return outputs;
+                }
+                assert!(std::time::Instant::now() < deadline, "render worker timed out");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        assert!(matches!(&wait(&renderer)[0], Output::Opened { result: Ok(_), .. }));
+        // The decode is now independent of the original file. Reopening would fail.
+        std::fs::remove_file(path).unwrap();
+        renderer.set_wanted(vec![Key::Tile { doc: 1, page: 0, scale: 256, tx: 0, ty: 0 }]);
+        assert!(matches!(&wait(&renderer)[0], Output::Image { .. }));
     }
 
     /// Headless render check: `RENDER_TEST_PDF=<pdf> RENDER_TEST_OUT=<dir> cargo test`.

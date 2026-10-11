@@ -85,6 +85,16 @@ fn dragging_a_tab_does_not_move_the_window() {
 }
 
 #[test]
+fn a_fast_drag_selects_the_tab_it_reorders() {
+    let mut h = Harness::new();
+    assert_eq!(h.app.stats().active, 1);
+    h.button(FIRST_TAB, true);
+    h.frame(vec![Event::PointerMoved(SECOND_TAB)]);
+    h.button(SECOND_TAB, false);
+    assert_eq!(h.app.stats().active, 1, "the dragged first tab now occupies the second slot");
+}
+
+#[test]
 fn dragging_empty_strip_moves_the_window() {
     let mut h = Harness::new();
     let commands = h.drag(EMPTY_STRIP, EMPTY_STRIP + vec2(50.0, 0.0));

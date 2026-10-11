@@ -64,6 +64,8 @@ pub struct View {
     pub landed_page: Option<usize>,
     /// Page the sidebar last scrolled to.
     pub sidebar_page: Option<usize>,
+    /// Cached thumbnail geometry, checked against the document id and sidebar width.
+    pub(crate) thumbnail_layout: Option<crate::sidebar::ThumbnailLayout>,
 }
 
 impl Tab {
@@ -110,6 +112,7 @@ impl Default for View {
             current_page: 0,
             landed_page: None,
             sidebar_page: None,
+            thumbnail_layout: None,
         }
     }
 }

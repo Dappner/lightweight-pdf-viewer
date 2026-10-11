@@ -1,9 +1,10 @@
 //! The macOS engine: PDF pages are rasterized with CoreGraphics (Preview's engine) and
-//! document structure (outline, links) and text are read with PDFKit. Text boxes and
+//! document structure (outline, links), text and other annotation appearances use PDFKit. Text boxes and
 //! highlights are read from the page's annotations with CoreGraphics and written back with
 //! PDFKit. Images open as
 //! a document of one page, decoded with ImageIO and drawn as they are, not wrapped in a PDF.
 
+use std::cell::OnceCell;
 use std::ffi::{CStr, c_char};
 use std::marker::PhantomData;
 use std::path::Path;
@@ -28,7 +29,7 @@ use objc2_image_io::{
 };
 use objc2_pdf_kit::{
     PDFActionGoTo, PDFActionURL, PDFAnnotation, PDFAnnotationSubtypeFreeText, PDFAnnotationSubtypeHighlight,
-    PDFDestination, PDFDocument, PDFOutline, PDFPage,
+    PDFDestination, PDFDisplayBox, PDFDocument, PDFOutline, PDFPage,
 };
 
 use super::preview::{self, EditedBox};
@@ -187,6 +188,7 @@ struct PdfPage<'a> {
     index: u32,
     page: CFRetained<CGPDFPage>,
     geometry: PageGeometry,
+    drawn_annotations: OnceCell<Vec<Retained<PDFAnnotation>>>,
 }
 
 impl Pdf {
@@ -205,7 +207,7 @@ impl Pdf {
     fn page(&self, index: u32) -> Option<PdfPage<'_>> {
         let page = CGPDFDocument::page(Some(&self.cg), index as usize + 1)?;
         let geometry = PageGeometry::of(&page, self.rotations.of(index));
-        Some(PdfPage { doc: self, index, page, geometry })
+        Some(PdfPage { doc: self, index, page, geometry, drawn_annotations: OnceCell::new() })
     }
 
     fn outline(&self) -> Vec<OutlineEntry> {
@@ -245,6 +247,67 @@ impl Pdf {
 }
 
 impl PdfPage<'_> {
+    /// CoreGraphics draws page content only. PDFKit draws the remaining annotation
+    /// appearances; FreeText and Highlight are drawn by editable UI overlays instead.
+    fn draw_annotations(&self, ctx: &CGContext) {
+        let annotations = self.drawn_annotations.get_or_init(|| {
+            let mut raw = null_mut();
+            let dict = CGPDFPage::dictionary(Some(&self.page));
+            // SAFETY: dictionaries and arrays are owned by this page; out-pointers are valid.
+            let has_raw = !dict.is_null() && unsafe { CGPDFDictionary::array(dict, key(c"Annots"), &mut raw) };
+            if !has_raw {
+                return Vec::new();
+            }
+            // SAFETY: PDFKit getters on the document owned by this worker. Pages without
+            // annotations stay entirely on the CoreGraphics rendering path.
+            let Some(page) = (unsafe { self.doc.pdf.pageAtIndex(self.index as usize) }) else {
+                return Vec::new();
+            };
+            unsafe { page.annotations() }
+                .iter()
+                .enumerate()
+                .filter(|(i, a)| {
+                    let mut annotation = null_mut();
+                    let mut flags = 0;
+                    if has_raw && unsafe { CGPDFArray::dictionary(raw, *i, &mut annotation) } {
+                        unsafe { CGPDFDictionary::integer(annotation, key(c"F"), &mut flags) };
+                    }
+                    // Invisible, Hidden and NoView flags must also be respected: PDFKit's
+                    // shouldDisplay getter alone does not exclude every hidden appearance.
+                    flags & (1 | 2 | 32) == 0
+                        && (unsafe { a.shouldDisplay() })
+                        && !unsafe { a.r#type() }
+                            .is_some_and(|t| matches!(t.to_string().as_str(), "FreeText" | "Highlight"))
+                })
+                .map(|(_, a)| a)
+                .collect()
+        });
+        if annotations.is_empty() {
+            return;
+        }
+        // PDFKit already applies the page's crop and intrinsic rotation. Remove the
+        // PDF user-space transform and apply only the reader's additional rotation.
+        let own = PageGeometry::of(&self.page, Rotation::default());
+        let size = own.size();
+        let reader = PageGeometry {
+            crop: CGRect {
+                origin: CGPoint { x: 0.0, y: 0.0 },
+                size: CGSize { width: size.x as f64, height: size.y as f64 },
+            },
+            rotation: (self.geometry.rotation - own.rotation).rem_euclid(360),
+        };
+        CGContext::save_g_state(Some(ctx));
+        CGContext::concat_ctm(Some(ctx), CGAffineTransformInvert(self.geometry.page_to_display()));
+        CGContext::concat_ctm(Some(ctx), reader.page_to_display());
+        for annotation in annotations {
+            CGContext::save_g_state(Some(ctx));
+            // SAFETY: the annotation and context belong to this render job.
+            unsafe { annotation.drawWithBox_inContext(PDFDisplayBox::CropBox, ctx) };
+            CGContext::restore_g_state(Some(ctx));
+        }
+        CGContext::restore_g_state(Some(ctx));
+    }
+
     fn links(&self) -> Vec<Link> {
         let doc = self.doc;
         // SAFETY: plain PDFKit getters on objects owned by `doc`.
@@ -641,6 +704,12 @@ impl TextDocument {
 }
 
 impl TextPage {
+    /// Total displayed rotation, including the page's intrinsic PDF rotation.
+    pub fn rotation(&self) -> Rotation {
+        let degrees = self.geometry.as_ref().map_or(0, |g| g.rotation);
+        (0..degrees / 90).fold(Rotation::default(), |r, _| r.clockwise())
+    }
+
     /// The page's text, indexed in UTF-16 code units as the other methods take it.
     pub fn text(&self) -> Option<String> {
         // SAFETY: plain PDFKit getter.
@@ -840,6 +909,7 @@ impl<'a> Bitmap<'a> {
             PageSource::Pdf(page) => {
                 CGContext::concat_ctm(c, page.geometry.page_to_display());
                 CGContext::draw_pdf_page(c, Some(&page.page));
+                page.draw_annotations(&self.ctx);
             }
             PageSource::Image(image) => {
                 CGContext::concat_ctm(c, image.geometry.page_to_display());
@@ -932,6 +1002,79 @@ mod tests {
     }
 
     const TURNED: [(usize, usize); 3] = [(15, 5), (15, 35), (4, 20)];
+
+    #[test]
+    fn annotation_appearances_follow_crop_rotation_and_tile_clip() {
+        use lopdf::{Document as PdfFile, Object, Stream, dictionary};
+
+        let path = text_pdf("annotation-appearances", &[]);
+        let mut pdf = PdfFile::load(&path).unwrap();
+        let page_id = pdf.get_pages()[&1];
+        let mut annotations = Vec::new();
+        for (kind, x, rgb, flags) in [
+            ("Ink", 50, "1 0 0", 0),
+            ("Stamp", 100, "1 0 0", 0),
+            ("FreeText", 50, "0 1 0", 0),
+            ("Highlight", 100, "0 0 1", 0),
+            ("Stamp", 150, "1 0 0", 2),
+        ] {
+            let y = if matches!(kind, "FreeText" | "Highlight") { 120 } else { 60 };
+            let appearance = pdf.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject", "Subtype" => "Form",
+                    "BBox" => vec![0.into(), 0.into(), 30.into(), 30.into()],
+                    "Resources" => dictionary! {},
+                },
+                format!("{rgb} rg 0 0 30 30 re f").into_bytes(),
+            ));
+            let annotation = pdf.add_object(dictionary! {
+                "Type" => "Annot", "Subtype" => kind,
+                "Rect" => vec![x.into(), y.into(), (x + 30).into(), (y + 30).into()],
+                "AP" => dictionary! { "N" => appearance }, "F" => flags,
+                "InkList" => vec![Object::Array(vec![x.into(), y.into(), (x+30).into(), (y+30).into()])],
+            });
+            annotations.push(annotation.into());
+        }
+        let page = pdf.get_object_mut(page_id).unwrap().as_dict_mut().unwrap();
+        page.set("MediaBox", vec![10.into(), 20.into(), 210.into(), 220.into()]);
+        page.set("CropBox", vec![30.into(), 40.into(), 190.into(), 200.into()]);
+        page.set("Rotate", 90);
+        page.set("Annots", annotations);
+        pdf.save(&path).unwrap();
+
+        for turns in 0..4 {
+            let mut rotation = Rotations::default();
+            for _ in 0..turns {
+                rotation.turn_all(true);
+            }
+            let document = Document::open(&path, &rotation).unwrap();
+            let page = document.page(0).unwrap();
+            let PageSource::Pdf(native) = &page.0 else { panic!("PDF") };
+            let text = TextDocument::open(&path, &rotation).unwrap();
+            assert_eq!(text.page(0).unwrap().rotation().degrees(), native.geometry.rotation);
+            let [w, h] = [page.size().x as u32, page.size().y as u32];
+            let mut rgba = vec![0; (w * h * 4) as usize];
+            Bitmap::new(&mut rgba, w, h).unwrap().draw(&page, [w as f64, h as f64], [0.0, 0.0]);
+            for (x, y, expected) in [
+                (65.0, 75.0, RED),
+                (115.0, 75.0, RED),
+                (65.0, 135.0, [255; 4]),
+                (115.0, 135.0, [255; 4]),
+                (165.0, 75.0, [255; 4]),
+            ] {
+                let at = native.geometry.to_fraction(x, y);
+                let (px, py) = ((at.x * w as f32) as usize, (at.y * h as f32) as usize);
+                assert_near(&rgba[(py * w as usize + px) * 4..][..4], expected, (px, py));
+                if expected == RED {
+                    let origin = [px as f64 - 8.0, py as f64 - 8.0];
+                    let mut tile = vec![0; 16 * 16 * 4];
+                    Bitmap::new(&mut tile, 16, 16).unwrap().draw(&page, [w as f64, h as f64], [-origin[0], -origin[1]]);
+                    assert_near(&tile[(8 * 16 + 8) * 4..][..4], RED, (8, 8));
+                }
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn exif_orientation_turns_the_image() {

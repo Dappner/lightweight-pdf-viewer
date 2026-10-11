@@ -112,6 +112,10 @@ impl TextDocument {
 }
 
 impl TextPage {
+    pub fn rotation(&self) -> Rotation {
+        match self._none {}
+    }
+
     pub fn text(&self) -> Option<String> {
         match self._none {}
     }

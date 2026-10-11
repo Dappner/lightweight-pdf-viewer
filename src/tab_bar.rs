@@ -167,7 +167,8 @@ pub fn show(
         if response.drag_started()
             && let Some(x) = pointer_x
         {
-            ui.data_mut(|d| d.insert_temp(grab_key, x - slot(i).left()));
+            let pressed_x = ui.input(|input| input.pointer.press_origin()).map_or(x, |p| p.x);
+            ui.data_mut(|d| d.insert_temp(grab_key, pressed_x - slot(i).left()));
             // Like browsers, dragging a tab also selects it.
             if i != active {
                 action = Some(Action::Select(i));
@@ -195,6 +196,9 @@ pub fn show(
     let painter = ui.painter_at(area);
     for (i, tab) in tabs.iter().enumerate() {
         if dragged.is_some_and(|(d, _)| d == i) || detached.is_some_and(|(d, _)| d == i) {
+            continue;
+        }
+        if !slot(i).intersect(area).is_positive() {
             continue;
         }
         let hovered = responses[i].hovered() || closes[i].hovered();

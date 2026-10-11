@@ -57,9 +57,10 @@ pub(super) fn normalize(path: &Path, boxes: &[EditedBox]) -> Result<()> {
     if doc.is_encrypted() || doc.was_encrypted() {
         return Err("Preview compatibility cannot update an encrypted PDF".into());
     }
+    let page_ids = doc.get_pages();
     let mut edits = Vec::new();
     for b in boxes {
-        let (id, annotation) = annotation(&doc, b)?;
+        let (id, annotation) = annotation_on_pages(&doc, &page_ids, b)?;
         verify(annotation, b)?;
         let extras = check(doc.dereference(check(annotation.get(EXTRAS))?))?.1;
         let mut extras = check(extras.as_dict())?.clone();
@@ -78,8 +79,9 @@ pub(super) fn normalize(path: &Path, boxes: &[EditedBox]) -> Result<()> {
     check(update.save_to(&mut output))?;
     // Verify the revision the reader will actually see, including the geometry and font.
     let written = check(Document::load_mem(&output))?;
+    let written_pages = written.get_pages();
     for b in boxes {
-        let (_, a) = annotation(&written, b)?;
+        let (_, a) = annotation_on_pages(&written, &written_pages, b)?;
         verify(a, b)?;
         let extras = check(written.dereference(check(a.get(EXTRAS))?))?.1;
         let blob = check(check(extras.as_dict())?.get(ARCHIVE))?;
@@ -99,8 +101,17 @@ pub(super) fn normalize(path: &Path, boxes: &[EditedBox]) -> Result<()> {
     check(result)
 }
 
+#[cfg(test)]
 fn annotation<'a>(doc: &'a Document, b: &EditedBox) -> Result<(ObjectId, &'a Dictionary)> {
-    let page_id = doc.get_pages().get(&(b.page + 1)).copied().ok_or("Saved page is missing")?;
+    annotation_on_pages(doc, &doc.get_pages(), b)
+}
+
+fn annotation_on_pages<'a>(
+    doc: &'a Document,
+    pages: &std::collections::BTreeMap<u32, ObjectId>,
+    b: &EditedBox,
+) -> Result<(ObjectId, &'a Dictionary)> {
+    let page_id = pages.get(&(b.page + 1)).copied().ok_or("Saved page is missing")?;
     let page = check(check(doc.get_object(page_id))?.as_dict())?;
     let annots = check(doc.dereference(check(page.get(b"Annots"))?))?.1;
     let mut ordinal = 0;

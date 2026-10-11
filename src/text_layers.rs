@@ -505,8 +505,9 @@ impl Worker {
 
     fn layer(&mut self, page: u32) -> TextLayer {
         let Some(page) = self.doc().and_then(|d| d.page(page)) else { return TextLayer::empty() };
+        let rotation = page.rotation();
         let (units, rects) = page.boxes();
-        TextLayer::new(units, rects)
+        TextLayer::with_rotation(units, rects, rotation)
     }
 
     /// The selected text of `page`.

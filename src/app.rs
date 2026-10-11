@@ -241,6 +241,7 @@ impl eframe::App for App {
     fn on_exit(&mut self) {
         let state = &mut *self.state();
         for tab in state.windows.iter_mut().flat_map(|w| &mut w.tabs) {
+            tab.text_boxes.finish_editing();
             tab.text_boxes.finish_saving();
             state.shared.remember(tab);
         }
@@ -881,8 +882,7 @@ impl State {
             if let Some((parked, _)) = window.parked
                 && evicted.contains(&parked)
             {
-                self.shared.cache.evict_doc(parked);
-                window.parked = None;
+                window.release_parked(&mut self.shared);
             }
         }
     }
@@ -937,6 +937,91 @@ mod tests {
 
     fn tile(doc: DocId) -> Key {
         Key::Tile { doc, page: 0, scale: 100, tx: 0, ty: 0 }
+    }
+
+    #[test]
+    fn closing_or_quitting_commits_annotation_drafts() {
+        use crate::text_boxes::{BoxRef, TextBox, TextBoxes};
+        for action in ["tab", "window", "quit", "switch"] {
+            let dir = std::env::temp_dir().join(format!("lightweight-pdf-draft-{}-{action}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let pdf = dir.join("a.pdf");
+            std::fs::write(&pdf, b"%PDF-1.4").unwrap();
+            let pdf = pdf.canonicalize().unwrap();
+            let ctx = Context::default();
+            let mut config = Config::default();
+            config.text_boxes_dir = Some(dir.clone());
+            let mut app = App::new(&ctx, config, History::default(), vec![pdf.clone()]);
+            {
+                let mut state = app.state();
+                let boxes = &mut state.windows[0].tabs[0].text_boxes;
+                let existing = TextBox {
+                    origin: Some(0),
+                    changed: false,
+                    ..TextBox::new(Pos2::new(0.25, 0.5), "Original".into())
+                };
+                boxes.set_file(0, vec![existing], Vec::new());
+                boxes.edit(BoxRef { page: 0, index: 0 });
+                boxes.editing.as_mut().unwrap().draft = "Edited draft".into();
+                match action {
+                    "tab" => state.run(&ctx, 0, Command::CloseTab),
+                    "window" => {
+                        state.add_window(&ctx, window_builder());
+                        state.close_window(&ctx, 0);
+                    }
+                    "switch" => state.open(&ctx, dir.join("b.pdf")),
+                    _ => {}
+                }
+            }
+            if action == "quit" {
+                eframe::App::on_exit(&mut app);
+            }
+            let restored = TextBoxes::load(&pdf, Some(&dir));
+            assert_eq!(restored.page(0).unwrap()[0].text, "Edited draft", "{action} lost the draft");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn texture_eviction_stops_the_parked_search() {
+        let (ctx, mut state, doc) = app();
+        let tab = &mut state.windows[0].tabs[0];
+        tab.search = Some(crate::search::Search::new(&ctx, tab.path.clone(), tab.rotations.clone(), 1, 0, None));
+        let worker = tab.search.as_ref().unwrap().probe();
+        state.open(&ctx, "/nonexistent/b.pdf".into());
+        assert_eq!(state.windows[0].parked.map(|p| p.0), Some(doc));
+        assert_eq!(state.stats().search_workers, 1);
+        state.texture_budget = 0;
+        state.request_renders();
+        assert!(state.windows[0].parked.is_none());
+        assert_eq!(state.stats().search_workers, 0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while worker.running() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(!worker.running(), "the detached search thread did not exit");
+    }
+
+    #[test]
+    fn a_background_search_resumes_in_its_new_window() {
+        let (ctx, mut state, _) = app();
+        let tab = &mut state.windows[0].tabs[0];
+        tab.search = Some(crate::search::Search::new(&ctx, tab.path.clone(), tab.rotations.clone(), 1, 0, None));
+        state.open(&ctx, "/nonexistent/b.pdf".into());
+        state.detach(&ctx, 0, 0, None);
+        assert_eq!(state.windows.len(), 2);
+        let search = state.windows[1].tabs[0].search.as_mut().unwrap();
+        search.query = "needle".into();
+        search.edited(0.0);
+        let _ = ctx.run(eframe::egui::RawInput { time: Some(1.0), ..Default::default() }, |ctx| {
+            search.update(ctx, (0, 0.0), 0);
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !search.done() && std::time::Instant::now() < deadline {
+            search.receive();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(search.done(), "adoption left the search paused");
     }
 
     #[test]

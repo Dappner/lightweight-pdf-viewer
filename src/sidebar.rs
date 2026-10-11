@@ -2,6 +2,7 @@
 //! menu in the tab bar.
 
 use eframe::egui::ahash::HashSet;
+use std::sync::Arc;
 
 use eframe::egui::{
     Align2, Color32, CornerRadius, CursorIcon, FontId, Rect, ScrollArea, Sense, Stroke, StrokeKind, Ui, pos2,
@@ -26,6 +27,27 @@ const LABEL_HEIGHT: f32 = 22.0;
 const SPACING: f32 = 12.0;
 const PADDING: f32 = 12.0;
 const OUTLINE_ROW: f32 = 24.0;
+
+/// Thumbnail positions reused until this document or the sidebar width changes.
+#[derive(Clone)]
+pub(crate) struct ThumbnailLayout {
+    doc: DocId,
+    width: f32,
+    tops: Arc<[f32]>,
+    height: f32,
+}
+
+impl ThumbnailLayout {
+    fn new(doc: DocId, width: f32, layout: &DocLayout) -> Self {
+        let mut tops = Vec::with_capacity(layout.page_count());
+        let mut y = PADDING;
+        for page in 0..layout.page_count() {
+            tops.push(y);
+            y += thumb_height(width, layout.page_size(page)) + LABEL_HEIGHT + SPACING;
+        }
+        Self { doc, width, tops: tops.into(), height: y + PADDING }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -164,13 +186,12 @@ fn thumbnails(
     palette: &Palette,
 ) -> Option<usize> {
     let tw = thumb_width(ui.available_width());
-    let mut tops = Vec::with_capacity(layout.page_count() + 1);
-    let mut y = PADDING;
-    for page in 0..layout.page_count() {
-        tops.push(y);
-        y += thumb_height(tw, layout.page_size(page)) + LABEL_HEIGHT + SPACING;
+    if view.thumbnail_layout.as_ref().is_none_or(|cached| cached.doc != doc || cached.width != tw) {
+        view.thumbnail_layout = Some(ThumbnailLayout::new(doc, tw, layout));
     }
-    let content_height = y + PADDING;
+    let cached = view.thumbnail_layout.as_ref().unwrap().clone();
+    let tops = cached.tops;
+    let content_height = cached.height;
     let follow = view.sidebar_page != Some(view.current_page);
     view.sidebar_page = Some(view.current_page);
 

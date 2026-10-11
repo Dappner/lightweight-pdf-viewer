@@ -117,12 +117,22 @@ impl View {
         }
     }
 
-    /// Where the reader is: the first page of the top row, and how far down it the top of the
-    /// viewport is. A row scrolled to with [`Self::go_to_page`] counts as the top one even
+    /// Where the reader is: a page of the top row, and how far down it the top of the
+    /// viewport is. Use the tallest page to cover rows with unequal page heights, keeping
+    /// an explicitly navigated page when it also covers this position.
+    /// A row scrolled to with [`Self::go_to_page`] counts as the top one even
     /// though the margin above it is showing. Only meaningful once the zoom is set.
     pub fn place(&self, layout: &DocLayout) -> Place {
         let y = self.pending_offset.unwrap_or(self.offset).y + MARGIN;
-        let page = layout.page_at(y, self.zoom);
+        let first = layout.page_at(y, self.zoom);
+        let spread = layout.spread(first);
+        let width = self.content_width(layout, self.zoom);
+        let page = self
+            .landed_page
+            .filter(|p| spread.contains(p) && layout.page_rect(*p, self.zoom, width).y_range().contains(y))
+            .unwrap_or_else(|| {
+                spread.reduce(|a, b| if layout.page_size(b).y > layout.page_size(a).y { b } else { a }).unwrap_or(first)
+            });
         let rect = layout.page_rect(page, self.zoom, self.content_width(layout, self.zoom));
         Place { layout: layout.mode(), page, y: ((y - rect.top()) / rect.height()).clamp(0.0, 1.0), zoom: self.zoom }
     }
@@ -1140,5 +1150,28 @@ mod tests {
         let mut view = View { zoom: 0.8, ..View::default() };
         view.go_to_page(&layout, 3);
         assert_eq!(view.place(&layout).page, 3);
+    }
+
+    #[test]
+    fn unequal_spread_heights_preserve_scroll_position() {
+        for sizes in [vec![vec2(612.0, 100.0), vec2(612.0, 792.0)], vec![vec2(612.0, 792.0), vec2(612.0, 100.0)]] {
+            let layout = DocLayout::new(sizes, PageLayout::TwoPages);
+            for offset in [0.0, 100.0, 346.0, 500.0] {
+                let mut view = View { zoom: 1.0, offset: vec2(0.0, offset), ..View::default() };
+                let place = view.place(&layout);
+                view.go_to_place(&layout, place.page, place.y);
+                assert!((view.pending_offset.unwrap().y - offset).abs() < 0.01, "offset {offset}");
+            }
+        }
+    }
+
+    #[test]
+    fn changing_layout_keeps_a_navigated_right_page() {
+        let mut layout = DocLayout::new(vec![vec2(612.0, 792.0); 6], PageLayout::TwoPages);
+        let mut view =
+            View { zoom: 1.0, viewport: Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 800.0)), ..View::default() };
+        view.go_to_page(&layout, 3);
+        view.set_layout(&mut layout, PageLayout::Single, 0.0);
+        assert_eq!(view.landed_page, Some(3));
     }
 }
