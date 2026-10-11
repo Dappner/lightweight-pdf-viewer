@@ -490,6 +490,12 @@ impl TextBoxes {
             || !self.added_highlights.is_empty()
     }
 
+    /// A save is writing the edits into the PDF. Nothing can be changed until it's done: the
+    /// save ends by starting again from the file, which would drop a change made meanwhile.
+    pub fn saving(&self) -> bool {
+        matches!(self.saving, Some(Saving::Running(_)))
+    }
+
     /// A box's text is being typed, so the keyboard is the text field's.
     pub fn typing(&self) -> bool {
         self.editing.is_some()
@@ -524,12 +530,15 @@ impl TextBoxes {
     /// Highlights `rects` (see [`Highlight::rects`]) on `page` in `color`, as
     /// [`add_highlight`] does.
     pub fn highlight(&mut self, page: u32, rects: Vec<Rect>, color: [u8; 3]) {
-        if !rects.is_empty() {
+        if !rects.is_empty() && !self.saving() {
             self.change_highlights(page, |highlights| add_highlight(highlights, rects, color));
         }
     }
 
     pub fn delete_highlight(&mut self, page: u32, index: usize) {
+        if self.saving() {
+            return;
+        }
         self.change_highlights(page, |highlights| {
             if index < highlights.len() {
                 highlights.remove(index);
@@ -539,6 +548,9 @@ impl TextBoxes {
 
     /// Changes one box, marking it changed.
     pub fn change_box(&mut self, r: BoxRef, f: impl FnOnce(&mut TextBox)) {
+        if self.saving() {
+            return;
+        }
         self.change(r.page, |boxes| {
             if let Some(b) = boxes.get_mut(r.index) {
                 f(b);
@@ -548,6 +560,9 @@ impl TextBoxes {
     }
 
     pub fn delete(&mut self, r: BoxRef) {
+        if self.saving() {
+            return;
+        }
         self.change(r.page, |boxes| {
             if r.index < boxes.len() {
                 boxes.remove(r.index);
@@ -562,6 +577,9 @@ impl TextBoxes {
     /// Starts typing into a new box of `size` and `color` at `at` (see [`TextBox::at`]) on
     /// `page`.
     pub fn add(&mut self, page: u32, at: Pos2, size: f32, color: [u8; 3]) {
+        if self.saving() {
+            return;
+        }
         self.finish_editing();
         self.selected = None;
         self.editing = Some(Editing { page, index: None, at, draft: String::new(), size, color, focus: true });
@@ -569,6 +587,9 @@ impl TextBoxes {
 
     /// Starts typing into an existing box.
     pub fn edit(&mut self, r: BoxRef) {
+        if self.saving() {
+            return;
+        }
         self.finish_editing();
         let Some(b) = self.get(r) else { return };
         self.editing = Some(Editing {
@@ -627,6 +648,9 @@ impl TextBoxes {
 
     /// Undoes the last change. `false` if there was none.
     pub fn undo(&mut self) -> bool {
+        if self.saving() {
+            return false;
+        }
         match self.undo.pop() {
             None => return false,
             Some(Undo::Boxes(page, Some(boxes))) => drop(self.edited.insert(page, boxes)),
@@ -694,6 +718,9 @@ impl TextBoxes {
 
     /// Drops every edit not yet saved, back to what the PDF has. Undone as one change.
     pub fn revert(&mut self) {
+        if self.saving() {
+            return;
+        }
         self.editing = None;
         if !self.unsaved() {
             return;
@@ -1058,6 +1085,32 @@ mod tests {
         });
         boxes.finish_saving();
         assert!(!TextBoxes::load(&pdf, Some(&dir)).unsaved(), "not added again on top of the file's");
+    }
+
+    #[test]
+    fn nothing_changes_while_a_save_runs() {
+        let dir = temp_dir("locked");
+        let pdf = pdf(&dir);
+        let mut boxes = TextBoxes::load(&pdf, Some(&dir));
+        boxes.set_file(0, Vec::new(), Vec::new());
+        type_box(&mut boxes, 0, "Saving");
+        let (done, result) = std::sync::mpsc::channel();
+        boxes.saving = Some(Saving::Running(result));
+
+        let r = BoxRef { page: 0, index: 0 };
+        boxes.add(0, pos2(0.5, 0.5), DEFAULT_SIZE, COLORS[0].1);
+        assert!(boxes.editing.is_none());
+        boxes.change_box(r, |b| b.text = "Changed".into());
+        boxes.highlight(0, vec![Rect::from_min_max(pos2(0.1, 0.2), pos2(0.6, 0.22))], HIGHLIGHT_YELLOW);
+        boxes.delete(r);
+        assert!(!boxes.undo());
+        boxes.revert();
+        assert_eq!(boxes.page(0).unwrap()[0].text, "Saving");
+        assert!(boxes.highlights(0).unwrap().is_empty());
+
+        done.send(Ok(crate::engine::SaveOutcome::Saved)).unwrap();
+        boxes.finish_saving();
+        assert!(!boxes.unsaved());
     }
 
     #[test]

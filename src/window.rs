@@ -525,7 +525,7 @@ impl Window {
         let DocState::Ready(layout) = &tab.doc else { return };
         let boxes = &mut tab.text_boxes;
         boxes.finish_editing();
-        if !boxes.unsaved() || matches!(boxes.saving, Some(Saving::Running(_))) {
+        if !boxes.unsaved() || boxes.saving() {
             return;
         }
         let rotations = &tab.rotations;
@@ -553,11 +553,9 @@ impl Window {
         });
     }
 
-    /// Drops tab `index`'s unsaved edits; ⌘Z brings them back. Not while a save is writing
-    /// them.
+    /// Drops tab `index`'s unsaved edits; ⌘Z brings them back.
     fn revert(&mut self, index: usize) {
-        let Some(tab) = self.tabs.get_mut(index) else { return };
-        if !matches!(tab.text_boxes.saving, Some(Saving::Running(_))) {
+        if let Some(tab) = self.tabs.get_mut(index) {
             tab.text_boxes.revert();
         }
     }

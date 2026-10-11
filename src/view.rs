@@ -844,6 +844,8 @@ fn show_text_boxes(
                 boxes.selected = Some(r);
             }
             BoxAction::Edit(r) => boxes.edit(r),
+            // A box can't move while a save runs: it would snap back on release.
+            BoxAction::Drag(_, _) if boxes.saving() => {}
             BoxAction::Drag(r, delta) => {
                 let so_far = boxes.dragging.filter(|(d, _)| *d == r).map_or(Vec2::ZERO, |(_, o)| o);
                 boxes.dragging = Some((r, so_far + delta));
