@@ -36,7 +36,7 @@ cargo run --release -- some.pdf another.pdf
 
 Open PDFs with ⌘O, by dragging them onto the window, or from Finder. Drag the sidebar's edge to resize it.
 
-The app reopens the tabs you had open last time. Settings live in `~/Library/Application Support/Lightweight PDF/config.json`; set `"restore_tabs": false` there to start empty instead.
+The app reopens the windows and tabs you had open last time, including whether each window's sidebar was open or collapsed. Settings live in `~/Library/Application Support/Lightweight PDF/config.json`; set `"restore_tabs": false` there to start empty instead.
 
 `"memory"` trades memory for speed. It takes effect the next time the app starts:
 

@@ -52,14 +52,22 @@ impl Default for Config {
     }
 }
 
-/// A window's tabs, which one was active, and where the window was.
-#[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
+/// A window's tabs, active tab, sidebar visibility, and position.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SavedWindow {
     pub tabs: Vec<PathBuf>,
     pub active: usize,
+    /// Whether the sidebar is expanded in this window.
+    pub sidebar: bool,
     /// Screen position of the window's top-left corner and the size of its content, in points.
     pub frame: Option<[f32; 4]>,
+}
+
+impl Default for SavedWindow {
+    fn default() -> Self {
+        Self { tabs: Vec::new(), active: 0, sidebar: true, frame: None }
+    }
 }
 
 impl Config {

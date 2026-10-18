@@ -168,6 +168,16 @@ impl Pixels {
 }
 
 impl Output {
+    fn doc(&self) -> DocId {
+        match self {
+            Self::Opened { doc, .. }
+            | Self::Snapshot { doc, .. }
+            | Self::Links { doc, .. }
+            | Self::Outline { doc, .. } => *doc,
+            Self::Image { key, .. } | Self::Failed(key) => key.doc(),
+        }
+    }
+
     /// The queued key this output answers, if any.
     fn key(&self) -> Option<Key> {
         match *self {
@@ -219,6 +229,8 @@ impl Work {
 
 #[derive(Default)]
 struct Queue {
+    /// The current window of each document, including work already in flight.
+    viewports: HashMap<DocId, egui::ViewportId>,
     control: VecDeque<Control>,
     /// What to render next: what the UI wants, less what is in flight or done.
     wanted: Vec<Key>,
@@ -274,8 +286,9 @@ impl Renderer {
         cvar.notify_all();
     }
 
-    pub fn open(&self, doc: DocId, path: PathBuf, rotations: Rotations) {
+    pub fn open(&self, doc: DocId, path: PathBuf, rotations: Rotations, viewport: egui::ViewportId) {
         self.with_queue(|q| {
+            q.viewports.insert(doc, viewport);
             q.paths.insert(doc, (path, rotations));
             q.control.push_back(Control::Open(doc));
         });
@@ -284,10 +297,15 @@ impl Renderer {
     /// Drops the document; the worker closes it if it is open.
     pub fn forget(&self, doc: DocId) {
         self.with_queue(|q| {
+            q.viewports.remove(&doc);
             q.paths.remove(&doc);
             q.wanted.retain(|k| k.doc() != doc);
             q.current.retain(|k| k.doc() != doc);
         });
+    }
+
+    pub fn set_viewport(&self, doc: DocId, viewport: egui::ViewportId) {
+        self.shared.0.lock().unwrap().viewports.insert(doc, viewport);
     }
 
     /// Lets `limit` documents stay open at once, one for each window.
@@ -440,12 +458,15 @@ struct Delivery<'a> {
 impl Delivery<'_> {
     fn send(&self, output: Output) {
         let mut q = self.shared.0.lock().unwrap();
+        let viewport = q.viewports.get(&output.doc()).copied();
         if let Some(key) = output.key() {
             q.busy.retain(|k| *k != key);
         }
         q.done.push(output);
         drop(q);
-        self.ctx.request_repaint();
+        if let Some(viewport) = viewport {
+            self.ctx.request_repaint_of(viewport);
+        }
     }
 
     /// Whether the UI still wants `key`; a batch skips it otherwise.
@@ -570,6 +591,27 @@ fn render_snapshot(doc: &Document, job: &SnapshotJob) -> Option<Snapshot> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn in_flight_results_wake_only_the_documents_current_window() {
+        let ctx = egui::Context::default();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        ctx.set_request_repaint_callback(move |info| captured.lock().unwrap().push(info.viewport_id));
+        let renderer = Renderer { shared: Arc::new((Mutex::new(Queue::default()), Condvar::new())) };
+        let first = egui::ViewportId::from_hash_of("first");
+        let second = egui::ViewportId::from_hash_of("second");
+        renderer.open(1, "unused.pdf".into(), Rotations::default(), first);
+        let delivery = Delivery { shared: &renderer.shared, ctx: &ctx };
+        let result = || Output::Failed(Key::Thumb { doc: 1, page: 0, width: 100 });
+        delivery.send(result());
+        // A job started in the first window finishes after its tab was detached.
+        renderer.set_viewport(1, second);
+        delivery.send(result());
+        renderer.forget(1);
+        delivery.send(result());
+        assert_eq!(*requests.lock().unwrap(), [first, second]);
+    }
+
     fn rgba(pixels: Pixels) -> Vec<Color32> {
         match pixels {
             Pixels::Rgba(p) => p,
@@ -614,7 +656,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("lightweight-pdf-kept-image-{}.png", std::process::id()));
         write_png(path.to_str().unwrap(), &[255, 0, 0, 255].repeat(16 * 16), 16, 16);
         let renderer = Renderer::spawn(egui::Context::default(), 1, 32);
-        renderer.open(1, path.clone(), Rotations::default());
+        renderer.open(1, path.clone(), Rotations::default(), egui::ViewportId::ROOT);
         let wait = |renderer: &Renderer| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {

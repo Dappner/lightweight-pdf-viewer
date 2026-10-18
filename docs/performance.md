@@ -72,6 +72,19 @@ When upgrading egui-wgpu, diff `grey.wgsl` against the new `egui.wgsl` and the c
 
 ## Open
 
+- Native two-window presentation: an October 18 live sample found 2,451 of 3,491
+  main-thread samples in `CAMetalLayer nextDrawable`, while the PDF render worker
+  was waiting for work in 3,489 samples. This identifies presentation waiting,
+  but does not by itself prove the two-drawable limit is wrong: vsync also waits
+  there normally. Keep that limit while fixing unnecessary cross-window wakeups.
+  Render results now wake the document's owning viewport explicitly; search and
+  text workers share a repaint destination that follows a moved tab. Closing the
+  main window and handing another window over to it also reroutes those workers.
+  Idle windows keep their last native frame and cached visible tiles; focusing
+  and scrolling runs the selected window's deferred callback and prioritizes its
+  render queue. The user confirmed that this fixed the slowdown after rebuilding
+  and reopening. Native before/after timings remain unmeasured: the headless
+  benchmark cannot measure drawable acquisition or input stalls.
 - Thread QoS on battery power is unmeasured; see the TODO on `Renderer::spawn`.
 - Zooming waits a fixed 150 ms (`ZOOM_SETTLE` in `src/view.rs`) of the ~250 ms zoom-to-sharp on `balanced`. Shortening it throws away more renders during a slow pinch.
 - The snapshot's QOI encode runs on the render thread (TODO on `render_snapshot`).

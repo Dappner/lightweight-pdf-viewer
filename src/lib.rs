@@ -18,6 +18,7 @@ pub mod memory;
 pub mod menu;
 mod quick_open;
 mod renderer;
+mod repaint;
 pub mod search;
 pub mod search_index;
 mod selection;

@@ -228,7 +228,7 @@ struct PageHighlights {
 pub struct Search {
     /// The find field's text.
     pub query: String,
-    ctx: egui::Context,
+    repaint: crate::repaint::Repaint,
     path: PathBuf,
     /// How the document's pages are turned, which highlights follow.
     rotations: Rotations,
@@ -272,6 +272,10 @@ pub struct Search {
 }
 
 impl Search {
+    pub(crate) fn set_viewport(&self, viewport: egui::ViewportId) {
+        self.repaint.set_viewport(viewport);
+    }
+
     /// Starts reading the document at `path`, its pages turned by `rotations`, from page
     /// `start`, saving its text in `store`.
     pub fn new(
@@ -297,7 +301,7 @@ impl Search {
     ) -> Self {
         let mut search = Self {
             query: String::new(),
-            ctx: ctx.clone(),
+            repaint: crate::repaint::Repaint::new(ctx),
             path,
             rotations,
             budget,
@@ -353,7 +357,7 @@ impl Search {
         let seed = Seed {
             path: self.path.clone(),
             rotations: self.rotations.clone(),
-            ctx: self.ctx.clone(),
+            repaint: self.repaint.clone(),
             budget: self.budget,
             store: self.store.clone(),
             start: self.shown,
@@ -752,7 +756,7 @@ impl Drop for Search {
 struct Seed {
     path: PathBuf,
     rotations: Rotations,
-    ctx: egui::Context,
+    repaint: crate::repaint::Repaint,
     budget: usize,
     store: Option<Store>,
     /// The page shown, read first.
@@ -825,7 +829,7 @@ impl TextCache {
 struct Worker {
     path: PathBuf,
     rotations: Rotations,
-    ctx: egui::Context,
+    repaint: crate::repaint::Repaint,
     channel: Channel,
     /// Pages in reading order: from the start page on, wrapping.
     order: Vec<u32>,
@@ -865,7 +869,7 @@ impl Worker {
         Self {
             path: seed.path,
             rotations: seed.rotations,
-            ctx: seed.ctx,
+            repaint: seed.repaint,
             channel,
             order: (start..page_count).chain(0..start).map(|p| p as u32).collect(),
             cursor: 0,
@@ -950,9 +954,9 @@ impl Worker {
             drop(inbox);
             // Progress while reading needn't redraw at the rate pages are read.
             if urgent {
-                self.ctx.request_repaint();
+                self.repaint.request();
             } else {
-                self.ctx.request_repaint_after(Duration::from_millis(50));
+                self.repaint.after(Duration::from_millis(50));
             }
         }
         self.close_doc();

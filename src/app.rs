@@ -300,6 +300,7 @@ impl State {
                     }
                 }
                 let window = &mut app.windows[w];
+                window.sidebar = saved.sidebar;
                 if let Some(i) = active.and_then(|path| window.tabs.iter().position(|t| t.path == path)) {
                     window.activate(ctx, &mut app.shared, i);
                 }
@@ -473,6 +474,7 @@ impl State {
             // The main window can't close without quitting, so it takes over the next window.
             let mut next = self.windows.remove(1);
             next.viewport = ViewportId::ROOT;
+            next.route_repaints(&self.shared);
             if let (Some(outer), Some(inner)) = (next.outer_rect, next.inner_rect) {
                 ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::OuterPosition(outer.min));
                 ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::InnerSize(inner.size()));
@@ -731,12 +733,15 @@ impl State {
                     (Some(outer), Some(inner)) => Some([outer.min.x, outer.min.y, inner.width(), inner.height()]),
                     _ => None,
                 };
-                Some(SavedWindow { tabs, active, frame })
+                Some(SavedWindow { tabs, active, sidebar: window.sidebar, frame })
             })
             .collect();
         let saved = &self.shared.config.windows;
         let changed = windows.len() != saved.len()
-            || windows.iter().zip(saved).any(|(a, b)| a.tabs != b.tabs || a.active != b.active);
+            || windows
+                .iter()
+                .zip(saved)
+                .any(|(a, b)| a.tabs != b.tabs || a.active != b.active || a.sidebar != b.sidebar);
         if always || changed {
             self.shared.config.windows = windows;
             self.shared.config.save();
@@ -939,6 +944,39 @@ mod tests {
 
     fn tile(doc: DocId) -> Key {
         Key::Tile { doc, page: 0, scale: 100, tx: 0, ty: 0 }
+    }
+
+    #[test]
+    fn sidebar_visibility_is_saved_and_restored_per_window() {
+        let dir = std::env::temp_dir().join(format!("lightweight-pdf-window-sidebar-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = [dir.join("a.pdf"), dir.join("b.pdf")];
+        for path in &paths {
+            std::fs::write(path, b"%PDF-1.4").unwrap();
+        }
+        let config_path = dir.join("config.json");
+        // Existing sessions without a sidebar field retain the previous expanded default.
+        let legacy: SavedWindow = serde_json::from_str(r#"{"tabs":[],"active":0}"#).unwrap();
+        assert!(legacy.sidebar);
+
+        let ctx = Context::default();
+        let mut state = State::new(&ctx, Config::load_from(config_path.clone()), History::default(), paths.into());
+        state.run(&ctx, 0, Command::MoveTabToNewWindow);
+        state.save_session(false);
+        // Only visibility changes: saving must detect it even when the tabs stay put.
+        state.run(&ctx, 0, Command::ToggleSidebar);
+        state.save_session(false);
+        let config = Config::load_from(config_path.clone());
+        assert_eq!(config.windows.iter().map(|w| w.sidebar).collect::<Vec<_>>(), [false, true]);
+
+        let mut restored = State::new(&ctx, config, History::default(), Vec::new());
+        assert_eq!(restored.windows.iter().map(|w| w.sidebar).collect::<Vec<_>>(), [false, true]);
+        restored.run(&ctx, 0, Command::ToggleSidebar);
+        restored.run(&ctx, 1, Command::ToggleSidebar);
+        restored.save_session(false);
+        let config = Config::load_from(config_path);
+        assert_eq!(config.windows.iter().map(|w| w.sidebar).collect::<Vec<_>>(), [true, false]);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

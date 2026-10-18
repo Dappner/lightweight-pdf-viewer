@@ -103,7 +103,7 @@ pub struct Window {
     quick_open: Option<QuickOpen>,
     /// The ⌘, settings, while they are open.
     settings: Option<Settings>,
-    sidebar: bool,
+    pub(crate) sidebar: bool,
     sidebar_mode: SidebarMode,
     /// The annotate bar's tool, while it's showing.
     annotate: Option<Tool>,
@@ -155,7 +155,7 @@ impl Window {
         let id = shared.next_id;
         shared.next_id += 1;
         let rotations = shared.history.rotations(&path);
-        shared.renderer.open(id, path.clone(), rotations.clone());
+        shared.renderer.open(id, path.clone(), rotations.clone(), self.viewport);
         let restore = shared.history.place(&path);
         self.tabs.push(Tab::new(id, path, rotations, restore, shared.config.text_boxes_dir.as_deref()));
         self.activate(ctx, shared, self.tabs.len() - 1);
@@ -286,6 +286,7 @@ impl Window {
         tab.view.pending_offset.get_or_insert(tab.view.offset);
         tab.view.sidebar_page = None;
         self.tabs.insert(index, tab);
+        self.route_repaints(shared);
         if self.tabs.len() == 1 {
             self.active = usize::MAX;
             self.activate(ctx, shared, 0);
@@ -294,6 +295,17 @@ impl Window {
                 self.active += 1;
             }
             self.activate(ctx, shared, index);
+        }
+    }
+
+    /// Rebind running workers as well as future results when tabs change native windows.
+    pub fn route_repaints(&self, shared: &Shared) {
+        for tab in &self.tabs {
+            shared.renderer.set_viewport(tab.id, self.viewport);
+            tab.text.set_viewport(self.viewport);
+            if let Some(search) = &tab.search {
+                search.set_viewport(self.viewport);
+            }
         }
     }
 
@@ -378,6 +390,7 @@ impl Window {
             )
         });
         search.focus = true;
+        search.set_viewport(self.viewport);
         search.wake();
     }
 
@@ -537,7 +550,7 @@ impl Window {
             None => tab.rotations.turn_all(clockwise),
         }
         shared.history.set_rotations(&tab.path, &tab.rotations, history::now());
-        reopen(ctx, shared, tab, restore);
+        reopen(ctx, shared, tab, restore, self.viewport);
     }
 
     /// Writes the active tab's text boxes into its PDF, on a thread of its own as PDFKit
@@ -614,7 +627,7 @@ impl Window {
                         DocState::Ready(layout) if tab.view.zoom > 0.0 => Some(tab.view.place(layout)),
                         _ => tab.restore,
                     };
-                    reopen(ctx, shared, tab, restore);
+                    reopen(ctx, shared, tab, restore, self.viewport);
                 }
                 Err(e) => tab.text_boxes.saving = Some(Saving::Failed(e)),
             }
@@ -1104,13 +1117,13 @@ fn save_job(
     })
 }
 
-fn reopen(ctx: &Context, shared: &mut Shared, tab: &mut Tab, restore: Option<history::Place>) {
+fn reopen(ctx: &Context, shared: &mut Shared, tab: &mut Tab, restore: Option<history::Place>, viewport: ViewportId) {
     shared.renderer.forget(tab.id);
     shared.cache.evict_doc(tab.id);
     shared.failed.retain(|k| k.doc() != tab.id);
     tab.id = shared.next_id;
     shared.next_id += 1;
-    shared.renderer.open(tab.id, tab.path.clone(), tab.rotations.clone());
+    shared.renderer.open(tab.id, tab.path.clone(), tab.rotations.clone(), viewport);
     tab.doc = DocState::Loading;
     tab.restore = restore;
     tab.snapshot = None;
@@ -1124,6 +1137,7 @@ fn reopen(ctx: &Context, shared: &mut Shared, tab: &mut Tab, restore: Option<his
         let start = restore.map_or(0, |p| p.page);
         let store = shared.config.search_store();
         let mut search = Search::new(ctx, tab.path.clone(), tab.rotations.clone(), old.page_count(), start, store);
+        search.set_viewport(viewport);
         search.query = old.query.clone();
         search.focus = false;
         search.edited(ctx.input(|i| i.time));

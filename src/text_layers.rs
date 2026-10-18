@@ -89,6 +89,7 @@ impl Action {
 }
 
 pub struct TextLayers {
+    repaint: Option<crate::repaint::Repaint>,
     path: PathBuf,
     rotations: Rotations,
     layers: HashMap<u32, TextLayer>,
@@ -109,10 +110,17 @@ pub struct TextLayers {
 }
 
 impl TextLayers {
+    pub fn set_viewport(&self, viewport: egui::ViewportId) {
+        if let Some(repaint) = &self.repaint {
+            repaint.set_viewport(viewport);
+        }
+    }
+
     pub fn new(path: PathBuf, rotations: Rotations) -> Self {
         Self {
             path,
             rotations,
+            repaint: None,
             layers: HashMap::default(),
             bytes: 0,
             requested: HashSet::default(),
@@ -365,10 +373,13 @@ impl TextLayers {
         let mut inbox = Inbox::default();
         f(&mut inbox);
         let channel: Channel = Arc::new((Mutex::new(inbox), Condvar::new()));
-        let (worker, path, rotations, ctx) = (channel.clone(), self.path.clone(), self.rotations.clone(), ctx.clone());
+        let repaint = self.repaint.get_or_insert_with(|| crate::repaint::Repaint::new(ctx)).clone();
+        let (worker, path, rotations) = (channel.clone(), self.path.clone(), self.rotations.clone());
         std::thread::Builder::new()
             .name("pdf-text".into())
-            .spawn(move || Worker { path, rotations, ctx, channel: worker, doc: None, read: 0, copying: None }.run())
+            .spawn(move || {
+                Worker { path, rotations, repaint, channel: worker, doc: None, read: 0, copying: None }.run()
+            })
             .expect("spawn text thread");
         self.channel = Some(channel);
     }
@@ -412,7 +423,7 @@ enum Job {
 struct Worker {
     path: PathBuf,
     rotations: Rotations,
-    ctx: egui::Context,
+    repaint: crate::repaint::Repaint,
     channel: Channel,
     doc: Option<TextDocument>,
     /// Pages read since the document was (re)opened.
@@ -461,7 +472,7 @@ impl Worker {
                     // Each page in its own pool, so what PDFKit autoreleases goes with it.
                     let layer = autoreleasepool(|| self.layer(page));
                     channel.0.lock().unwrap().read.push((page, layer));
-                    self.ctx.request_repaint();
+                    self.repaint.request();
                 }
                 Job::CopyPage => {
                     let mut copying = self.copying.take().unwrap();
@@ -477,7 +488,7 @@ impl Worker {
                         inbox.copy = None;
                         inbox.copied = Some((copying.id, copying.text));
                         drop(inbox);
-                        self.ctx.request_repaint();
+                        self.repaint.request();
                     }
                 }
             }
