@@ -143,6 +143,8 @@ pub fn install(ctx: &egui::Context) {
                 Item("Save", Command::Save, "s", cmd),
                 Item("Revert to Saved", Command::Revert, "", none),
                 Separator,
+                Item("Print…", Command::Print, "p", cmd),
+                Separator,
                 Item("Close Tab", Command::CloseTab, "w", cmd),
             ],
         ),

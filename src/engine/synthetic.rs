@@ -89,6 +89,10 @@ pub fn save_annotations(_path: &Path, _pages: &[PageSave]) -> Result<super::Save
     Err("Saving annotations needs macOS".into())
 }
 
+pub fn print(_path: &Path, _rotations: &Rotations, _pages: &[PageSave]) -> Result<(), String> {
+    Err("Printing needs macOS".into())
+}
+
 pub struct TextDocument {
     _none: Infallible,
 }

@@ -26,7 +26,7 @@ serde_json = "1.0.151"
 libc = "0.2.189"
 block2 = { version = "0.6.2", default-features = false, features = ["std"] }
 objc2 = { version = "0.6.4", default-features = false, features = ["std"] }
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSCell", "NSMenu", "NSMenuItem", "NSApplication", "NSResponder", "NSEvent", "NSFont", "NSColor", "objc2-core-foundation"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSCell", "NSMenu", "NSMenuItem", "NSApplication", "NSResponder", "NSEvent", "NSFont", "NSColor", "NSPrintInfo", "NSPrintOperation", "NSView", "NSWindow", "objc2-core-foundation"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFURL", "CFCGTypes", "CFDictionary", "CFNumber", "CFString"] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGPDFDocument", "CGPDFPage", "CGContext", "CGBitmapContext", "CGColorSpace", "CGImage", "CGAffineTransform", "CGPDFDictionary", "CGPDFArray", "CGPDFObject", "CGPDFString"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSNotification", "NSOperation", "NSString", "NSArray", "NSURL", "NSObject", "NSValue", "NSGeometry", "objc2-core-foundation"] }

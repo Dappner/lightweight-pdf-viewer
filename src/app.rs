@@ -85,6 +85,8 @@ pub enum Command {
     Save,
     /// Drops the active tab's edits not yet saved.
     Revert,
+    /// Shows the print sheet for the active tab, edits not yet saved included.
+    Print,
     /// Shows or hides the recent-files palette.
     QuickOpen,
     NewWindow,

@@ -12,8 +12,9 @@ use std::ptr::{NonNull, null, null_mut};
 
 use eframe::egui::{Pos2, Rect, Vec2, pos2, vec2};
 use objc2::AnyThread;
+use objc2::MainThreadMarker;
 use objc2::rc::Retained;
-use objc2_app_kit::{NSColor, NSFont};
+use objc2_app_kit::{NSApplication, NSColor, NSFont, NSPrintInfo};
 use objc2_core_foundation::{
     CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType, CFURL, CGAffineTransform, CGPoint, CGRect, CGSize,
 };
@@ -29,7 +30,7 @@ use objc2_image_io::{
 };
 use objc2_pdf_kit::{
     PDFActionGoTo, PDFActionURL, PDFAnnotation, PDFAnnotationSubtypeFreeText, PDFAnnotationSubtypeHighlight,
-    PDFDestination, PDFDisplayBox, PDFDocument, PDFOutline, PDFPage,
+    PDFDestination, PDFDisplayBox, PDFDocument, PDFOutline, PDFPage, PDFPrintScalingMode,
 };
 
 use super::preview::{self, EditedBox};
@@ -514,71 +515,7 @@ fn default_appearance(da: &str) -> (f32, [u8; 3]) {
 pub fn save_annotations(path: &Path, pages: &[PageSave]) -> Result<super::SaveOutcome, String> {
     autoreleasepool(|| {
         let pdf = open_pdf(path).ok_or("The file couldn't be opened")?;
-        let mut edited_boxes = Vec::new();
-        let mut identified = true;
-        for save in pages {
-            // SAFETY: plain PDFKit calls on objects owned by `pdf`.
-            let Some(page) = (unsafe { pdf.pageAtIndex(save.page as usize) }) else { continue };
-            let Some(cg) = (unsafe { page.pageRef() }) else { continue };
-            let geometry = PageGeometry::of(&cg, Rotation::default());
-            let mut styled = Vec::new();
-            let theirs: Vec<Retained<PDFAnnotation>> = unsafe { page.annotations() }
-                .iter()
-                .filter(|a| unsafe { a.r#type() }.is_some_and(|t| t.to_string() == "FreeText"))
-                .collect();
-            for (ordinal, annotation) in theirs.iter().enumerate() {
-                match save.boxes.iter().find(|(b, _)| b.origin == Some(ordinal as u32)) {
-                    Some((b, rect)) if b.changed => {
-                        let bounds = geometry.fraction_rect_to_pdf(*rect);
-                        style(annotation, b, bounds);
-                        styled.push((annotation.clone(), b.size, bounds));
-                    }
-                    Some(_) => {}
-                    None if save.complete => unsafe { page.removeAnnotation(annotation) },
-                    None => {}
-                }
-            }
-            for (b, rect) in save.boxes.iter().filter(|(b, _)| b.origin.is_none()) {
-                let bounds = geometry.fraction_rect_to_pdf(*rect);
-                // SAFETY: a new FreeText annotation, added to a page of `pdf`.
-                let annotation = unsafe {
-                    PDFAnnotation::initWithBounds_forType_withProperties(
-                        PDFAnnotation::alloc(),
-                        bounds,
-                        PDFAnnotationSubtypeFreeText,
-                        None,
-                    )
-                };
-                style(&annotation, b, bounds);
-                unsafe { page.addAnnotation(&annotation) };
-                styled.push((annotation, b.size, bounds));
-            }
-            // Deletions shift ordinals, so record identity after all page edits, in the
-            // same FreeText order the saved file exposes. Duplicate text is harmless.
-            for (ordinal, annotation) in unsafe { page.annotations() }
-                .iter()
-                .filter(|a| unsafe { a.r#type() }.is_some_and(|t| t.to_string() == "FreeText"))
-                .enumerate()
-            {
-                if let Some((_, size, bounds)) = styled.iter().find(|(a, _, _)| std::ptr::eq(&**a, &*annotation)) {
-                    edited_boxes.push(EditedBox {
-                        page: save.page,
-                        ordinal,
-                        size: *size,
-                        bounds: [
-                            bounds.origin.x,
-                            bounds.origin.y,
-                            bounds.origin.x + bounds.size.width,
-                            bounds.origin.y + bounds.size.height,
-                        ],
-                    });
-                }
-            }
-            if edited_boxes.iter().filter(|b| b.page == save.page).count() != styled.len() {
-                identified = false;
-            }
-            save_highlights(&page, &geometry, save);
-        }
+        let (edited_boxes, identified) = apply_edits(&pdf, pages);
         let name = path.file_name().ok_or("Not a file")?.to_string_lossy();
         let temp = path.with_file_name(format!(".{name}.saving"));
         let url = NSURL::from_file_path(&temp).ok_or("Bad file name")?;
@@ -598,6 +535,116 @@ pub fn save_annotations(path: &Path, pages: &[PageSave]) -> Result<super::SaveOu
         })?;
         Ok(outcome)
     })
+}
+
+/// Shows the print sheet on the key window for the PDF at `path` as its tab shows it: pages
+/// turned by `rotations`, with the edits in `pages` not yet saved. The sheet runs on its own;
+/// the print operation keeps the document alive until it's done.
+pub fn print(path: &Path, rotations: &Rotations, pages: &[PageSave]) -> Result<(), String> {
+    let mtm = MainThreadMarker::new().ok_or("Printing needs the main thread")?;
+    let window = NSApplication::sharedApplication(mtm).keyWindow().ok_or("No window to print from")?;
+    autoreleasepool(|| {
+        let pdf = open_pdf(path).ok_or("Only PDFs can be printed")?;
+        apply_edits(&pdf, pages);
+        // SAFETY: plain PDFKit calls on objects owned by `pdf`.
+        for i in 0..unsafe { pdf.pageCount() } {
+            let turn = rotations.of(i as u32).degrees() as isize;
+            if turn != 0
+                && let Some(page) = unsafe { pdf.pageAtIndex(i) }
+            {
+                unsafe { page.setRotation((page.rotation() + turn).rem_euclid(360)) };
+            }
+        }
+        let info = NSPrintInfo::sharedPrintInfo();
+        // SAFETY: plain PDFKit and AppKit calls on the main thread.
+        let operation = unsafe {
+            pdf.printOperationForPrintInfo_scalingMode_autoRotate(
+                Some(&info),
+                PDFPrintScalingMode::PageScaleDownToFit,
+                true,
+                mtm,
+            )
+        }
+        .ok_or("PDFKit couldn't print the file")?;
+        let title = path.file_stem().map(|n| NSString::from_str(&n.to_string_lossy()));
+        operation.setJobTitle(title.as_deref());
+        // SAFETY: no delegate, so no selector or context.
+        unsafe {
+            operation.runOperationModalForWindow_delegate_didRunSelector_contextInfo(&window, None, None, null_mut())
+        };
+        Ok(())
+    })
+}
+
+/// Writes the edits in `pages` into `pdf`, in memory. Returns the boxes it styled, and whether
+/// each could be told apart in the file's FreeText order (see [`preview::apply`]).
+fn apply_edits(pdf: &PDFDocument, pages: &[PageSave]) -> (Vec<EditedBox>, bool) {
+    let mut edited_boxes = Vec::new();
+    let mut identified = true;
+    for save in pages {
+        // SAFETY: plain PDFKit calls on objects owned by `pdf`.
+        let Some(page) = (unsafe { pdf.pageAtIndex(save.page as usize) }) else { continue };
+        let Some(cg) = (unsafe { page.pageRef() }) else { continue };
+        let geometry = PageGeometry::of(&cg, Rotation::default());
+        let mut styled = Vec::new();
+        let theirs: Vec<Retained<PDFAnnotation>> = unsafe { page.annotations() }
+            .iter()
+            .filter(|a| unsafe { a.r#type() }.is_some_and(|t| t.to_string() == "FreeText"))
+            .collect();
+        for (ordinal, annotation) in theirs.iter().enumerate() {
+            match save.boxes.iter().find(|(b, _)| b.origin == Some(ordinal as u32)) {
+                Some((b, rect)) if b.changed => {
+                    let bounds = geometry.fraction_rect_to_pdf(*rect);
+                    style(annotation, b, bounds);
+                    styled.push((annotation.clone(), b.size, bounds));
+                }
+                Some(_) => {}
+                None if save.complete => unsafe { page.removeAnnotation(annotation) },
+                None => {}
+            }
+        }
+        for (b, rect) in save.boxes.iter().filter(|(b, _)| b.origin.is_none()) {
+            let bounds = geometry.fraction_rect_to_pdf(*rect);
+            // SAFETY: a new FreeText annotation, added to a page of `pdf`.
+            let annotation = unsafe {
+                PDFAnnotation::initWithBounds_forType_withProperties(
+                    PDFAnnotation::alloc(),
+                    bounds,
+                    PDFAnnotationSubtypeFreeText,
+                    None,
+                )
+            };
+            style(&annotation, b, bounds);
+            unsafe { page.addAnnotation(&annotation) };
+            styled.push((annotation, b.size, bounds));
+        }
+        // Deletions shift ordinals, so record identity after all page edits, in the
+        // same FreeText order the saved file exposes. Duplicate text is harmless.
+        for (ordinal, annotation) in unsafe { page.annotations() }
+            .iter()
+            .filter(|a| unsafe { a.r#type() }.is_some_and(|t| t.to_string() == "FreeText"))
+            .enumerate()
+        {
+            if let Some((_, size, bounds)) = styled.iter().find(|(a, _, _)| std::ptr::eq(&**a, &*annotation)) {
+                edited_boxes.push(EditedBox {
+                    page: save.page,
+                    ordinal,
+                    size: *size,
+                    bounds: [
+                        bounds.origin.x,
+                        bounds.origin.y,
+                        bounds.origin.x + bounds.size.width,
+                        bounds.origin.y + bounds.size.height,
+                    ],
+                });
+            }
+        }
+        if edited_boxes.iter().filter(|b| b.page == save.page).count() != styled.len() {
+            identified = false;
+        }
+        save_highlights(&page, &geometry, save);
+    }
+    (edited_boxes, identified)
 }
 
 /// Removes the page's highlights `save` no longer has and adds its new ones.
@@ -643,6 +690,7 @@ fn save_highlights(page: &PDFPage, geometry: &PageGeometry, save: &PageSave) {
             );
             annotation.setQuadrilateralPoints(Some(&NSArray::from_retained_slice(&points)));
             annotation.setColor(&NSColor::colorWithCalibratedRed_green_blue_alpha(r, g, b, 1.0));
+            annotation.setShouldPrint(true);
             page.addAnnotation(&annotation);
         }
     }
@@ -662,6 +710,7 @@ fn style(annotation: &PDFAnnotation, b: &TextBox, bounds: CGRect) {
         annotation.setFontColor(Some(&NSColor::colorWithCalibratedRed_green_blue_alpha(r, g, bl, 1.0)));
         // Without this PDFKit fills the box yellow.
         annotation.setColor(&NSColor::clearColor());
+        annotation.setShouldPrint(true);
     }
 }
 

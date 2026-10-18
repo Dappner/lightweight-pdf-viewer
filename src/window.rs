@@ -16,7 +16,7 @@ use crate::config::Config;
 use crate::engine;
 use crate::find_bar;
 use crate::history::{self, History};
-use crate::layout::PageLayout;
+use crate::layout::{DocLayout, PageLayout, Rotations};
 use crate::quick_open::{Outcome, QuickOpen};
 use crate::renderer::{DocId, Key, Renderer, Snapshot, Target};
 use crate::search::{Anchor, Search};
@@ -24,7 +24,7 @@ use crate::settings::{self, Settings};
 use crate::sidebar::{self, Mode as SidebarMode};
 use crate::tab::{DocState, Tab};
 use crate::tab_bar::{self, Action};
-use crate::text_boxes::{self, Saving};
+use crate::text_boxes::{self, PageSave, Saving, TextBoxes};
 use crate::text_layers::TextLayers;
 use crate::theme::{Palette, palette};
 use crate::view::{Canvas, Wants, fit_width_zoom};
@@ -352,6 +352,7 @@ impl Window {
             Command::FindPrevious => self.find_step(false),
             Command::Save => self.save(ctx),
             Command::Revert => self.revert(self.active),
+            Command::Print => self.print(ctx),
             _ => {}
         }
     }
@@ -544,13 +545,7 @@ impl Window {
         if !boxes.unsaved() || boxes.saving() {
             return;
         }
-        let rotations = &tab.rotations;
-        let job = boxes.save_job(|page, b| {
-            let shown = layout.page_size(page as usize);
-            let upright = if rotations.of(page).degrees() % 180 == 90 { vec2(shown.y, shown.x) } else { shown };
-            text_boxes::rect_on_page(ctx, b, upright)
-        });
-        let job = match job {
+        let job = match save_job(ctx, boxes, &tab.rotations, layout) {
             Ok(job) => job,
             Err(e) => {
                 boxes.saving = Some(Saving::Failed(e));
@@ -567,6 +562,19 @@ impl Window {
             Ok(_) => Saving::Running(result),
             Err(e) => Saving::Failed(e.to_string()),
         });
+    }
+
+    /// Shows the print sheet for the active tab as it shows the document: turned as it is,
+    /// with its edits not yet saved.
+    fn print(&mut self, ctx: &Context) {
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        let DocState::Ready(layout) = &tab.doc else { return };
+        tab.text_boxes.finish_editing();
+        let printed = save_job(ctx, &tab.text_boxes, &tab.rotations, layout)
+            .and_then(|job| engine::print(&tab.path, &tab.rotations, &job));
+        if let Err(e) = printed {
+            eprintln!("Couldn't print {}: {e}", tab.path.display());
+        }
     }
 
     /// Drops tab `index`'s unsaved edits; ⌘Z brings them back.
@@ -667,6 +675,7 @@ impl Window {
                 (cmd | alt, KeyCode::ArrowRight, Command::NextTab),
                 (cmd, KeyCode::O, Command::Open),
                 (cmd, KeyCode::S, Command::Save),
+                (cmd, KeyCode::P, Command::Print),
                 (cmd, KeyCode::N, Command::NewWindow),
                 (cmd, KeyCode::K, Command::QuickOpen),
                 (cmd, KeyCode::Comma, Command::Settings),
@@ -1070,6 +1079,20 @@ fn empty_state(ui: &mut egui::Ui, palette: &Palette, text: &str) {
 
 /// Reopens `tab`'s file as a new document, at `restore`: its tiles, links, outline positions
 /// and text layers go with the old one. The search starts over with the same text.
+/// The edits in `boxes` to write into the PDF, each box placed on its page as `layout` shows it.
+fn save_job(
+    ctx: &Context,
+    boxes: &TextBoxes,
+    rotations: &Rotations,
+    layout: &DocLayout,
+) -> Result<Vec<PageSave>, String> {
+    boxes.save_job(|page, b| {
+        let shown = layout.page_size(page as usize);
+        let upright = if rotations.of(page).degrees() % 180 == 90 { vec2(shown.y, shown.x) } else { shown };
+        text_boxes::rect_on_page(ctx, b, upright)
+    })
+}
+
 fn reopen(ctx: &Context, shared: &mut Shared, tab: &mut Tab, restore: Option<history::Place>) {
     shared.renderer.forget(tab.id);
     shared.cache.evict_doc(tab.id);
