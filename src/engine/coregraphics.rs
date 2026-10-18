@@ -16,14 +16,16 @@ use objc2::MainThreadMarker;
 use objc2::rc::Retained;
 use objc2_app_kit::{NSApplication, NSColor, NSFont, NSPrintInfo};
 use objc2_core_foundation::{
-    CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType, CFURL, CGAffineTransform, CGPoint, CGRect, CGSize,
+    CFBoolean, CFDictionary, CFMutableData, CFNumber, CFRetained, CFString, CFType, CFURL, CGAffineTransform, CGPoint,
+    CGRect, CGSize,
 };
 use objc2_core_graphics::{
-    CGAffineTransformInvert, CGBitmapContextCreate, CGColorSpace, CGContext, CGImage, CGImageAlphaInfo,
-    CGInterpolationQuality, CGPDFArray, CGPDFArrayRef, CGPDFBox, CGPDFDictionary, CGPDFDictionaryRef, CGPDFDocument,
-    CGPDFPage, CGPDFReal, CGPDFString, CGPDFStringRef, kCGColorSpaceSRGB,
+    CGAffineTransformInvert, CGBitmapContextCreate, CGColorSpace, CGContext, CGDataConsumer, CGImage, CGImageAlphaInfo,
+    CGInterpolationQuality, CGPDFArray, CGPDFArrayRef, CGPDFBox, CGPDFContextClose, CGPDFContextCreate,
+    CGPDFDictionary, CGPDFDictionaryRef, CGPDFDocument, CGPDFPage, CGPDFReal, CGPDFString, CGPDFStringRef,
+    kCGColorSpaceSRGB,
 };
-use objc2_foundation::{NSArray, NSPoint, NSRange, NSString, NSURL, NSValue};
+use objc2_foundation::{NSArray, NSData, NSPoint, NSRange, NSString, NSURL, NSValue};
 use objc2_image_io::{
     CGImageSource, kCGImagePropertyDPIHeight, kCGImagePropertyDPIWidth, kCGImagePropertyOrientation,
     kCGImageSourceShouldCacheImmediately,
@@ -173,6 +175,37 @@ impl Image {
         let crop = CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size };
         let geometry = PageGeometry { crop, rotation: (turn + rotation.degrees()) % 360 };
         Some(Self { image, geometry, mirrored })
+    }
+
+    /// Draws the image as its page shows it, in a context whose origin is the page's
+    /// bottom-left corner, one unit a point.
+    fn draw(&self, ctx: &CGContext) {
+        let c = Some(ctx);
+        CGContext::concat_ctm(c, self.geometry.page_to_display());
+        let crop = self.geometry.crop;
+        if self.mirrored {
+            CGContext::translate_ctm(c, crop.size.width, 0.0);
+            CGContext::scale_ctm(c, -1.0, 1.0);
+        }
+        CGContext::draw_image(c, crop, Some(&self.image));
+    }
+
+    /// The image as a one-page PDF, in memory, as its page shows it.
+    fn to_pdf(&self) -> Option<Retained<PDFDocument>> {
+        let size = self.geometry.size();
+        let media =
+            CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: size.x as f64, height: size.y as f64 } };
+        let data = CFMutableData::new(None, 0)?;
+        let consumer = CGDataConsumer::with_cf_data(Some(&data))?;
+        // SAFETY: `media` outlives the calls that read it.
+        let ctx = unsafe { CGPDFContextCreate(Some(&consumer), &media, None) }?;
+        unsafe { CGContext::begin_page(Some(&ctx), &media) };
+        self.draw(&ctx);
+        CGContext::end_page(Some(&ctx));
+        CGPDFContextClose(Some(&ctx));
+        // SAFETY: CFData is toll-free bridged with NSData.
+        let data: &NSData = unsafe { &*(&*data as *const CFMutableData).cast() };
+        unsafe { PDFDocument::initWithData(PDFDocument::alloc(), data) }
     }
 }
 
@@ -537,24 +570,32 @@ pub fn save_annotations(path: &Path, pages: &[PageSave]) -> Result<super::SaveOu
     })
 }
 
-/// Shows the print sheet on the key window for the PDF at `path` as its tab shows it: pages
-/// turned by `rotations`, with the edits in `pages` not yet saved. The sheet runs on its own;
+/// Shows the print sheet on the key window for the PDF or image at `path` as its tab shows
+/// it: pages turned by `rotations`, with the edits in `pages` not yet saved. The sheet runs on its own;
 /// the print operation keeps the document alive until it's done.
 pub fn print(path: &Path, rotations: &Rotations, pages: &[PageSave]) -> Result<(), String> {
     let mtm = MainThreadMarker::new().ok_or("Printing needs the main thread")?;
     let window = NSApplication::sharedApplication(mtm).keyWindow().ok_or("No window to print from")?;
     autoreleasepool(|| {
-        let pdf = open_pdf(path).ok_or("Only PDFs can be printed")?;
-        apply_edits(&pdf, pages);
-        // SAFETY: plain PDFKit calls on objects owned by `pdf`.
-        for i in 0..unsafe { pdf.pageCount() } {
-            let turn = rotations.of(i as u32).degrees() as isize;
-            if turn != 0
-                && let Some(page) = unsafe { pdf.pageAtIndex(i) }
-            {
-                unsafe { page.setRotation((page.rotation() + turn).rem_euclid(360)) };
+        let pdf = match open_pdf(path) {
+            Some(pdf) => {
+                apply_edits(&pdf, pages);
+                // SAFETY: plain PDFKit calls on objects owned by `pdf`.
+                for i in 0..unsafe { pdf.pageCount() } {
+                    let turn = rotations.of(i as u32).degrees() as isize;
+                    if turn != 0
+                        && let Some(page) = unsafe { pdf.pageAtIndex(i) }
+                    {
+                        unsafe { page.setRotation((page.rotation() + turn).rem_euclid(360)) };
+                    }
+                }
+                pdf
             }
-        }
+            // Images draw turned as they show, so they need no rotation of their own.
+            None => Image::open(path, rotations.of(0))
+                .and_then(|image| image.to_pdf())
+                .ok_or("The file couldn't be opened")?,
+        };
         let info = NSPrintInfo::sharedPrintInfo();
         // SAFETY: plain PDFKit and AppKit calls on the main thread.
         let operation = unsafe {
@@ -960,15 +1001,7 @@ impl<'a> Bitmap<'a> {
                 CGContext::draw_pdf_page(c, Some(&page.page));
                 page.draw_annotations(&self.ctx);
             }
-            PageSource::Image(image) => {
-                CGContext::concat_ctm(c, image.geometry.page_to_display());
-                let crop = image.geometry.crop;
-                if image.mirrored {
-                    CGContext::translate_ctm(c, crop.size.width, 0.0);
-                    CGContext::scale_ctm(c, -1.0, 1.0);
-                }
-                CGContext::draw_image(c, crop, Some(&image.image));
-            }
+            PageSource::Image(image) => image.draw(&self.ctx),
         }
         CGContext::restore_g_state(c);
     }
@@ -1142,6 +1175,20 @@ mod tests {
         assert_near(&pixels[0], BLUE, (5, 3));
         assert_near(&pixels[1], RED, (35, 3));
         assert_near(&pixels[2], GREEN, (20, 16));
+    }
+
+    /// An image prints as a PDF page drawn as the image shows: here turned by its EXIF
+    /// orientation.
+    #[test]
+    fn images_print_as_they_show() {
+        let path = quarters_png("print", None, Some(6));
+        let pdf = Image::open(&path, Rotation::default()).unwrap().to_pdf().unwrap();
+        let printed = path.with_extension("pdf");
+        assert!(unsafe { pdf.writeToURL(&NSURL::from_file_path(&printed).unwrap()) });
+        let (size, pixels) = pixels_at(&printed, &Rotations::default(), &TURNED);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&printed);
+        assert_turned_clockwise(size, &pixels);
     }
 
     #[test]

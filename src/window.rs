@@ -35,6 +35,8 @@ const ZOOM_STEP: f32 = 1.25;
 const LINE_SCROLL: f32 = 48.0;
 /// Seconds the status says a save finished.
 const SAVED_SECONDS: f64 = 2.0;
+/// Seconds the status says why printing failed.
+const PRINT_FAILED_SECONDS: f64 = 5.0;
 
 /// State shared by every window.
 pub struct Shared {
@@ -105,6 +107,8 @@ pub struct Window {
     sidebar_mode: SidebarMode,
     /// The annotate bar's tool, while it's showing.
     annotate: Option<Tool>,
+    /// Why the last print didn't start, and when (egui's clock).
+    print_failed: Option<(f64, String)>,
     pub tab_scroll: f32,
     /// The last tab switched away from, whose tiles are kept until this time.
     pub parked: Option<(DocId, f64)>,
@@ -129,6 +133,7 @@ impl Window {
             sidebar: true,
             sidebar_mode: SidebarMode::Pages,
             annotate: None,
+            print_failed: None,
             tab_scroll: 0.0,
             parked: None,
             visible_ready: false,
@@ -572,8 +577,9 @@ impl Window {
         tab.text_boxes.finish_editing();
         let printed = save_job(ctx, &tab.text_boxes, &tab.rotations, layout)
             .and_then(|job| engine::print(&tab.path, &tab.rotations, &job));
-        if let Err(e) = printed {
-            eprintln!("Couldn't print {}: {e}", tab.path.display());
+        self.print_failed = printed.err().map(|e| (ctx.input(|i| i.time), e));
+        if self.print_failed.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(PRINT_FAILED_SECONDS));
         }
     }
 
@@ -815,6 +821,11 @@ impl Window {
             _ => format!("{}–{}", spread.start + 1, spread.end),
         };
         let edits = match &tab.text_boxes.saving {
+            _ if let Some((at, e)) = &self.print_failed
+                && now - at < PRINT_FAILED_SECONDS =>
+            {
+                format!("   Not printed: {e}")
+            }
             Some(Saving::Running(_)) => "   Saving…".to_string(),
             Some(Saving::Failed(e)) => format!("   Not saved: {e}"),
             _ if tab.text_boxes.unsaved() => "   Edited".to_string(),

@@ -53,6 +53,7 @@ Searching a document saves its text in `~/Library/Caches/Lightweight PDF/Search/
 | ⌘O | Open |
 | ⌘K | Open a recent file (type to filter; most-used and latest first) |
 | ⌘W | Close tab |
+| ⌘P | Print, with highlights and text boxes not yet saved |
 | ⌘1 … ⌘9 | Go to tab (⌘9 is the last tab) |
 | ⌘⇧[ / ⌘⇧] or ⌃⇧Tab / ⌃Tab | Previous / next tab |
 | ⌘B | Show or hide page thumbnails |
