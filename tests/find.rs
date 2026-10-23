@@ -155,23 +155,22 @@ fn background_search_lets_go_of_its_worker() {
     let _ = std::fs::remove_file(second);
 }
 
-/// Sleeping stops every search worker; after waking, the search carries on.
+/// An unfocused window keeps its pages and search usable.
 #[test]
-fn sleep_stops_search_workers() {
+fn unfocused_window_keeps_pages_and_search() {
     let mut h = Harness::new();
-    let path = searched(&mut h, "sleep");
+    let path = searched(&mut h, "unfocused");
+    h.wait("sharp pages", |s| s.ready);
     h.focused = false;
     h.frame(vec![]);
     h.time += 11.0;
-    h.wait("sleep", |s| s.asleep);
-    assert_eq!(h.app.stats().search_workers, 0);
+    h.frame(vec![]);
+    assert!(h.app.stats().ready, "unfocused window lost its rendered pages");
+    assert!(h.app.stats().texture_bytes > 0);
     assert_eq!(h.app.stats().find.as_deref(), Some("1 of 2"));
 
     h.focused = true;
-    for _ in 0..10 {
-        h.frame(vec![]);
-    }
-    assert_eq!(h.app.stats().search_workers, 0, "waking alone doesn't restart the search");
+    h.frame(vec![]);
     h.key(Key::G, Modifiers::COMMAND);
     h.wait("the second match", |s| s.find.as_deref() == Some("2 of 2") && s.current_page == 6);
     let _ = std::fs::remove_file(path);

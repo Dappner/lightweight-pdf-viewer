@@ -387,7 +387,11 @@ impl Canvas<'_> {
                     match cache.get(&key) {
                         Some(image) if tile_visible => grey::paint(painter, image, tile_rect),
                         Some(_) => {}
-                        None if failed.contains(&key) => {}
+                        None if failed.contains(&key) => {
+                            if tile_visible {
+                                all_visible_ready = false;
+                            }
+                        }
                         None if tile_visible => {
                             all_visible_ready = false;
                             wants.visible.push(key);

@@ -1,0 +1,137 @@
+{
+  "metal_buffers_per_window": 3,
+  "phases": [
+    {
+      "actions": 0,
+      "distinct_sizes": 2,
+      "footprint_peak_bytes": 65995760,
+      "phase": "idle",
+      "ui_callbacks": {
+        "count": 299,
+        "max_ms": 2.455958,
+        "over_100_ms": 0,
+        "over_500_ms": 0,
+        "p50_ms": 0.550834,
+        "p95_ms": 1.435584
+      },
+      "ui_intervals": {
+        "count": 299,
+        "max_ms": 19.6145,
+        "over_100_ms": 0,
+        "over_500_ms": 0,
+        "p50_ms": 9.98075,
+        "p95_ms": 11.089291
+      }
+    },
+    {
+      "actions": 152,
+      "distinct_sizes": 210,
+      "footprint_peak_bytes": 71943152,
+      "phase": "paired_resize",
+      "ui_callbacks": {
+        "count": 601,
+        "max_ms": 1.5447080000000002,
+        "over_100_ms": 0,
+        "over_500_ms": 0,
+        "p50_ms": 0.2985,
+        "p95_ms": 0.624959
+      },
+      "ui_intervals": {
+        "count": 601,
+        "max_ms": 26.227,
+        "over_100_ms": 0,
+        "over_500_ms": 0,
+        "p50_ms": 10.292666,
+        "p95_ms": 13.965584
+      }
+    },
+    {
+      "actions": 0,
+      "distinct_sizes": 2,
+      "footprint_peak_bytes": 64078832,
+      "phase": "after_resize",
+      "ui_callbacks": {
+        "count": 300,
+        "max_ms": 2.447959,
+        "over_100_ms": 0,
+        "over_500_ms": 0,
+        "p50_ms": 0.603041,
+        "p95_ms": 1.714625
+      },
+      "ui_intervals": {
+        "count": 300,
+        "max_ms": 16.006833,
+        "over_100_ms": 0,
+        "over_500_ms": 0,
+        "p50_ms": 10.032875,
+        "p95_ms": 11.235375000000001
+      }
+    },
+    {
+      "actions": 21,
+      "distinct_sizes": 2,
+      "footprint_peak_bytes": 76891120,
+      "phase": "zoom_first",
+      "ui_callbacks": {
+        "count": 401,
+        "max_ms": 2.355584,
+        "over_100_ms": 0,
+        "over_500_ms": 0,
+        "p50_ms": 0.5459590000000001,
+        "p95_ms": 1.608166
+      },
+      "ui_intervals": {
+        "count": 401,
+        "max_ms": 13.353083,
+        "over_100_ms": 0,
+        "over_500_ms": 0,
+        "p50_ms": 9.9995,
+        "p95_ms": 11.007583
+      }
+    },
+    {
+      "actions": 21,
+      "distinct_sizes": 2,
+      "footprint_peak_bytes": 76415984,
+      "phase": "zoom_second",
+      "ui_callbacks": {
+        "count": 400,
+        "max_ms": 2.456083,
+        "over_100_ms": 0,
+        "over_500_ms": 0,
+        "p50_ms": 0.574542,
+        "p95_ms": 1.674125
+      },
+      "ui_intervals": {
+        "count": 400,
+        "max_ms": 15.675708,
+        "over_100_ms": 0,
+        "over_500_ms": 0,
+        "p50_ms": 9.994334,
+        "p95_ms": 11.126334
+      }
+    },
+    {
+      "actions": 0,
+      "distinct_sizes": 2,
+      "footprint_peak_bytes": 73286640,
+      "phase": "after_zoom",
+      "ui_callbacks": {
+        "count": 301,
+        "max_ms": 2.2139170000000004,
+        "over_100_ms": 0,
+        "over_500_ms": 0,
+        "p50_ms": 0.5794590000000001,
+        "p95_ms": 1.693459
+      },
+      "ui_intervals": {
+        "count": 301,
+        "max_ms": 11.737208,
+        "over_100_ms": 0,
+        "over_500_ms": 0,
+        "p50_ms": 9.986583,
+        "p95_ms": 10.973
+      }
+    }
+  ]
+}

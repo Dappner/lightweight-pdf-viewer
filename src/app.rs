@@ -52,29 +52,14 @@ pub struct State {
     next_serial: u64,
     /// Quitting closes the main window, which otherwise hands over to another window.
     quitting: bool,
-    sleep: Sleep,
-    /// See [`crate::memory::Tuning::sleep_after`].
-    sleep_after: Option<f64>,
-    /// When the app was last focused, scrolled or zoomed.
-    last_active: f64,
     /// Texture budget per window.
     texture_budget: usize,
     /// What each window wanted rendered in its latest frame, by serial.
     wants: HashMap<u64, Wants>,
     /// Tiles and thumbnails received from the render thread, and how many of them were
-    /// thrown away on arrival (their tab had gone to the background, or the app to sleep).
+    /// thrown away on arrival (their tab had gone to the background).
     rendered: u64,
     discarded: u64,
-}
-
-/// Whether the app has let go of its page tiles while in the background.
-#[derive(PartialEq, Eq, Debug)]
-enum Sleep {
-    Awake,
-    /// Waiting for snapshots of these tabs (each window's active one) to show in place of
-    /// their tiles.
-    Falling(HashSet<DocId>),
-    Asleep,
 }
 
 /// Actions reachable from the menu bar and keyboard shortcuts.
@@ -152,8 +137,6 @@ pub struct Stats {
     pub snapshot_bytes: usize,
     /// What those snapshots' buffers have allocated, which can exceed `snapshot_bytes`.
     pub snapshot_capacity: usize,
-    /// Page tiles were dropped while the app was in the background.
-    pub asleep: bool,
     /// The active tab's find bar status, while the bar is open ("" before a query).
     pub find: Option<String>,
     /// The active tab's search: its reads of page text from the disk index, and with PDFKit.
@@ -236,6 +219,14 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn raw_input_hook(&mut self, ctx: &Context, raw: &mut eframe::egui::RawInput) {
+        if tab_bar::is_dragging(ctx, raw.viewport_id)
+            && let Some((position, down)) = crate::titlebar::drag_pointer()
+        {
+            tab_bar::update_drag_input(raw, position / ctx.zoom_factor(), down);
+        }
+    }
+
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.ui(ctx);
     }
@@ -274,9 +265,6 @@ impl State {
             focused: 0,
             next_serial: 1,
             quitting: false,
-            sleep: Sleep::Awake,
-            sleep_after: tuning.sleep_after,
-            last_active: 0.0,
             texture_budget: tuning.texture_budget,
             wants: HashMap::default(),
             rendered: 0,
@@ -504,7 +492,6 @@ impl State {
                 ctx.request_repaint_of(window.viewport);
             }
         }
-        self.finish_falling_asleep();
     }
 
     /// Takes in one result from the render thread.
@@ -546,8 +533,6 @@ impl State {
                     Err(e) => DocState::Failed(e),
                 };
             }
-            // Tiles that were in flight when the app fell asleep.
-            Output::Image { key: Key::Tile { .. }, .. } if self.sleep != Sleep::Awake => self.discarded += 1,
             Output::Image { key, size, pixels } if self.is_active(key.doc()) => {
                 let (texture, bytes) = match pixels {
                     Pixels::Rgba(pixels) => {
@@ -573,14 +558,16 @@ impl State {
             }
             Output::Snapshot { doc, snapshot } => {
                 let Some((w, i)) = self.find_doc(doc) else { return };
-                if self.windows[w].active != i {
-                    self.windows[w].tabs[i].snapshot = snapshot;
-                } else if let Sleep::Falling(pending) = &mut self.sleep
-                    && pending.remove(&doc)
-                {
-                    // Without a snapshot, the pages show as placeholders while asleep.
-                    self.windows[w].tabs[i].snapshot_texture =
-                        snapshot.and_then(|snapshot| snapshot_texture(ctx, &snapshot));
+                // A failed replacement must not erase the last usable snapshot. A result
+                // may arrive after switching back; show it until the visible tiles are ready.
+                if let Some(snapshot) = snapshot {
+                    if self.windows[w].active == i && !self.windows[w].visible_ready {
+                        let tab = &mut self.windows[w].tabs[i];
+                        if let Some(texture) = snapshot_texture(ctx, &snapshot) {
+                            tab.snapshot_texture = Some(texture);
+                        }
+                    }
+                    self.windows[w].tabs[i].snapshot = Some(snapshot);
                 }
             }
             Output::Links { doc, page, links, text_boxes, highlights } => {
@@ -598,70 +585,6 @@ impl State {
                 }
             }
         }
-    }
-
-    /// Lets go of the tiles once every awaited snapshot has arrived. A tab that was closed
-    /// or switched away from since is no longer awaited: its snapshot never comes, or is
-    /// kept for when it's switched back to.
-    fn finish_falling_asleep(&mut self) {
-        let Sleep::Falling(pending) = &self.sleep else { return };
-        let pending: HashSet<DocId> = pending.iter().copied().filter(|doc| self.is_active(*doc)).collect();
-        if pending.is_empty() {
-            self.release_tiles();
-            self.sleep = Sleep::Asleep;
-        } else {
-            self.sleep = Sleep::Falling(pending);
-        }
-    }
-
-    /// In the background, the page tiles (most of the app's GPU memory) are swapped for a
-    /// snapshot of each window once the app has been left alone for a while. Focusing,
-    /// scrolling or zooming wakes it; the snapshots show until the tiles are redrawn.
-    fn sleep_or_wake(&mut self, ctx: &Context) {
-        let Some(after) = self.sleep_after else { return };
-        let now = ctx.input(|i| i.time);
-        let active = self.windows.iter().any(|w| {
-            ctx.input_for(w.viewport, |i| {
-                i.viewport().focused.unwrap_or(true) || i.raw_scroll_delta != Vec2::ZERO || i.zoom_delta() != 1.0
-            })
-        });
-        if active {
-            self.last_active = now;
-            self.sleep = Sleep::Awake;
-        } else if self.sleep == Sleep::Awake {
-            let idle = now - self.last_active;
-            if idle < after {
-                ctx.request_repaint_after(std::time::Duration::from_secs_f64(after - idle));
-                return;
-            }
-            // The tiles go once the snapshots that replace them arrive (see `receive`).
-            let mut pending = HashSet::default();
-            for window in &self.windows {
-                if let Some(tab) = window.active_tab()
-                    && let DocState::Ready(layout) = &tab.doc
-                    && tab.view.zoom > 0.0
-                {
-                    self.shared.remember(tab);
-                    self.shared.renderer.snapshot(tab.view.snapshot_job(layout, tab.id, ctx.pixels_per_point()));
-                    pending.insert(tab.id);
-                }
-            }
-            self.sleep = Sleep::Falling(pending);
-            self.finish_falling_asleep();
-        }
-    }
-
-    /// Drops every page tile (thumbnails are small and stay), closes the open documents and
-    /// stops the search workers (searches keep their results).
-    fn release_tiles(&mut self) {
-        self.shared.cache.retain(|k| !matches!(k, Key::Tile { .. }));
-        for window in &mut self.windows {
-            window.parked = None;
-            for search in window.tabs.iter_mut().filter_map(|t| t.search.as_mut()) {
-                search.sleep();
-            }
-        }
-        self.shared.renderer.release();
     }
 
     /// Runs `command` in window `w`.
@@ -686,7 +609,6 @@ impl State {
             Command::SetMemory(memory) => {
                 let tuning = memory.tuning();
                 self.texture_budget = tuning.texture_budget;
-                self.sleep_after = tuning.sleep_after;
                 self.shared.prefetch = tuning.prefetch;
                 self.shared.config.memory = memory;
                 self.shared.config.save();
@@ -779,7 +701,6 @@ impl State {
                 .filter_map(|t| t.snapshot.as_ref())
                 .map(|s| s.qoi.capacity())
                 .sum(),
-            asleep: self.sleep == Sleep::Asleep,
             find: active.and_then(|t| t.search.as_ref()).map(|s| s.status().unwrap_or_default()),
             find_reads: active
                 .and_then(|t| t.search.as_ref())
@@ -803,8 +724,6 @@ impl State {
 impl State {
     /// One frame of window `w`: the work shared by all windows, then the window itself.
     fn pass(&mut self, ctx: &Context, w: usize) {
-        // Before `receive`, so a snapshot that arrives as the app wakes is ignored.
-        self.sleep_or_wake(ctx);
         self.receive(ctx);
         self.windows[w].expire_parked(ctx, &mut self.shared);
         let serial = self.windows[w].serial;
@@ -896,13 +815,8 @@ impl State {
 
     /// What every window wants rendered, the focused window's pages first. Windows that
     /// haven't drawn since their wants were met still list them, so what's already rendered
-    /// is left out. Nothing while asleep: the snapshots stand in for the pages and the
-    /// thumbnails already drawn stay, and drawing anything else would reopen the documents
-    /// that falling asleep closed.
+    /// is left out. Every open window keeps its current pages even when unfocused.
     fn render_queue(&self) -> Vec<Key> {
-        if self.sleep != Sleep::Awake {
-            return Vec::new();
-        }
         let focused = self.windows[self.focused].serial;
         let mut order: Vec<u64> = self.windows.iter().map(|w| w.serial).collect();
         order.sort_by_key(|serial| *serial != focused);
@@ -930,6 +844,7 @@ impl State {
 mod tests {
     use super::*;
     use crate::renderer::Snapshot;
+    use eframe::egui;
 
     /// An app with one tab (whose file doesn't exist, so it never loads) and a page tile of it.
     fn app() -> (Context, State, DocId) {
@@ -944,6 +859,70 @@ mod tests {
 
     fn tile(doc: DocId) -> Key {
         Key::Tile { doc, page: 0, scale: 100, tx: 0, ty: 0 }
+    }
+
+    #[test]
+    fn tabs_rejoin_another_window_after_the_source_loses_its_pointer() {
+        use egui::{Event, Modifiers, PointerButton, RawInput, Rect, ViewportInfo};
+        // Exercise closing/handover of the main window as well as closing a child window.
+        for source in [0, 1] {
+            let (ctx, mut state, _) = app();
+            state.open(&ctx, "/nonexistent/b.pdf".into());
+            state.detach(&ctx, 0, 1, None);
+            let rects = [
+                Rect::from_min_size(egui::pos2(20.0, 40.0), vec2(1000.0, 800.0)),
+                Rect::from_min_size(egui::pos2(1100.0, 40.0), vec2(1000.0, 800.0)),
+            ];
+            for (window, rect) in state.windows.iter_mut().zip(rects) {
+                window.inner_rect = Some(rect);
+                window.outer_rect = Some(rect);
+            }
+            let viewport = state.windows[source].viewport;
+            let viewports: egui::ViewportIdMap<ViewportInfo> = state
+                .windows
+                .iter()
+                .zip(rects)
+                .map(|(w, rect)| {
+                    (
+                        w.viewport,
+                        ViewportInfo {
+                            inner_rect: Some(rect),
+                            outer_rect: Some(rect),
+                            native_pixels_per_point: Some(1.0),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect();
+            let raw = |events| RawInput {
+                viewport_id: viewport,
+                viewports: viewports.clone(),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, rects[source].size())),
+                events,
+                ..Default::default()
+            };
+            let button = |pressed| Event::PointerButton {
+                pos: egui::pos2(230.0, 16.0),
+                button: PointerButton::Primary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            };
+            let _ = ctx.run(raw(vec![]), |ctx| state.pass(ctx, source));
+            let _ = ctx.run(raw(vec![button(true)]), |ctx| state.pass(ctx, source));
+            let _ = ctx.run(raw(vec![Event::PointerMoved(egui::pos2(280.0, 16.0))]), |ctx| state.pass(ctx, source));
+            assert!(tab_bar::is_dragging(&ctx, viewport));
+            let _ = ctx.run(raw(vec![Event::PointerGone]), |ctx| state.pass(ctx, source));
+            assert!(tab_bar::is_dragging(&ctx, viewport), "leaving the source stopped native tracking");
+
+            // The OS reports the cursor over the other strip, with the button up;
+            // there is no PointerButton release event from the source window.
+            let mut released = raw(vec![]);
+            tab_bar::update_drag_input(&mut released, rects[1 - source].min + vec2(230.0, 16.0), false);
+            let _ = ctx.run(released, |ctx| state.pass(ctx, source));
+            assert_eq!(state.windows.len(), 1, "source {source} was not closed after the drop");
+            assert_eq!(state.windows[0].tabs.len(), 2, "the tab did not join the destination");
+            assert!(!tab_bar::is_dragging(&ctx, viewport));
+        }
     }
 
     #[test]
@@ -1064,41 +1043,61 @@ mod tests {
         assert!(search.done(), "adoption left the search paused");
     }
 
-    #[test]
-    fn failed_snapshot_still_completes_sleep() {
-        let (ctx, mut state, doc) = app();
-        state.sleep = Sleep::Falling(HashSet::from_iter([doc]));
-        state.handle(&ctx, Output::Snapshot { doc, snapshot: None });
-        state.finish_falling_asleep();
-        assert_eq!(state.sleep, Sleep::Asleep);
-        assert!(!state.shared.cache.contains(&tile(doc)), "tiles were not released");
-        assert!(state.windows[0].tabs[0].snapshot_texture.is_none());
+    fn snapshot() -> Snapshot {
+        Snapshot { size: [1, 1], qoi: qoi::encode_to_vec([255u8; 4], 1, 1).unwrap() }
     }
 
     #[test]
-    fn snapshot_completes_sleep() {
+    fn late_snapshot_covers_a_tab_switched_back_before_rendering() {
         let (ctx, mut state, doc) = app();
-        state.sleep = Sleep::Falling(HashSet::from_iter([doc]));
-        let qoi = qoi::encode_to_vec([255u8; 4], 1, 1).unwrap();
-        state.handle(&ctx, Output::Snapshot { doc, snapshot: Some(Snapshot { size: [1, 1], qoi }) });
-        state.finish_falling_asleep();
-        assert_eq!(state.sleep, Sleep::Asleep);
-        assert!(state.windows[0].tabs[0].snapshot_texture.is_some());
-    }
-
-    /// The render thread drops a closed tab's snapshot job, so its result never arrives.
-    #[test]
-    fn closing_the_awaited_tab_completes_sleep() {
-        let (ctx, mut state, doc) = app();
+        state.windows[0].visible_ready = true;
         state.open(&ctx, "/nonexistent/b.pdf".into());
-        let other = state.windows[0].tabs[1].id;
-        state.sleep = Sleep::Falling(HashSet::from_iter([other]));
-        state.finish_falling_asleep();
-        assert_eq!(state.sleep, Sleep::Falling(HashSet::from_iter([other])), "fell asleep too early");
-        state.windows[0].close(&ctx, &mut state.shared, 1);
-        state.finish_falling_asleep();
-        assert_eq!(state.sleep, Sleep::Asleep);
-        assert!(!state.shared.cache.contains(&tile(doc)));
+        state.windows[0].activate(&ctx, &mut state.shared, 0);
+        assert!(!state.windows[0].visible_ready);
+        state.handle(&ctx, Output::Snapshot { doc, snapshot: Some(snapshot()) });
+        assert!(state.windows[0].tabs[0].snapshot_texture.is_some());
+        let texture = state.windows[0].tabs[0].snapshot_texture.as_ref().unwrap().id();
+        state.handle(&ctx, Output::Snapshot { doc, snapshot: None });
+        assert_eq!(state.windows[0].tabs[0].snapshot_texture.as_ref().unwrap().id(), texture);
+        assert!(state.windows[0].tabs[0].snapshot.is_some());
+    }
+
+    #[test]
+    fn failed_tiles_do_not_discard_the_snapshot() {
+        let (ctx, mut state, doc) = app();
+        let tab = &mut state.windows[0].tabs[0];
+        tab.doc = DocState::Ready(DocLayout::new(vec![Vec2::splat(1000.0)], Default::default()));
+        tab.view.zoom = 1.0;
+        tab.view.render_zoom = 1.0;
+        let raw = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))),
+            time: Some(1.0),
+            ..Default::default()
+        };
+        let mut wants = Wants::default();
+        let _ = ctx.run(raw(), |ctx| {
+            state.windows[0].ui(ctx, &mut state.shared, &mut wants);
+        });
+        let tiles: Vec<_> = wants.visible.into_iter().filter(|k| matches!(k, Key::Tile { .. })).collect();
+        assert!(!tiles.is_empty());
+        state.shared.failed.extend(tiles.iter().copied());
+        state.handle(&ctx, Output::Snapshot { doc, snapshot: Some(snapshot()) });
+        let _ = ctx.run(raw(), |ctx| {
+            state.windows[0].ui(ctx, &mut state.shared, &mut Wants::default());
+        });
+        assert!(!state.windows[0].visible_ready);
+        assert!(state.windows[0].tabs[0].snapshot_texture.is_some(), "failed tiles erased the fallback");
+
+        state.shared.failed.clear();
+        for key in tiles {
+            state.handle(&ctx, Output::Image { key, size: [1, 1], pixels: Pixels::Rgba(vec![egui::Color32::WHITE]) });
+        }
+        let _ = ctx.run(raw(), |ctx| {
+            state.windows[0].ui(ctx, &mut state.shared, &mut Wants::default());
+        });
+        assert!(state.windows[0].visible_ready);
+        assert!(state.windows[0].tabs[0].snapshot_texture.is_none(), "ready tiles kept the fallback alive");
+        assert!(state.windows[0].tabs[0].snapshot.is_none());
     }
 
     #[test]
@@ -1126,22 +1125,8 @@ mod tests {
         let low = Memory::Low.tuning();
         assert_eq!(state.shared.config.memory, Memory::Low);
         assert_eq!(state.texture_budget, low.texture_budget);
-        assert_eq!(state.sleep_after, low.sleep_after);
         assert_eq!(state.shared.prefetch, low.prefetch);
         state.request_renders();
         assert_eq!(state.shared.cache.budget(), low.texture_budget);
-    }
-
-    #[test]
-    fn nothing_is_rendered_while_asleep() {
-        let (_, mut state, doc) = app();
-        let serial = state.windows[0].serial;
-        let thumb = Key::Thumb { doc, page: 0, width: 100 };
-        state.wants.insert(serial, Wants { thumbs: vec![thumb], ..Default::default() });
-        assert_eq!(state.render_queue(), vec![thumb]);
-        state.sleep = Sleep::Falling(HashSet::from_iter([doc]));
-        assert!(state.render_queue().is_empty(), "rendering while falling asleep");
-        state.sleep = Sleep::Asleep;
-        assert!(state.render_queue().is_empty(), "rendering while asleep");
     }
 }

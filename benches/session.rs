@@ -489,11 +489,8 @@ fn main() {
         search(&mut h, &files);
     }
 
-    println!("\nbackground (unfocused and left alone; the snapshot texture is not counted)");
-    match preset.tuning().sleep_after {
-        Some(after) => background(&mut h, after),
-        None => println!("  never drops tiles with this preset"),
-    }
+    println!("\nbackground (unfocused windows retain their pages)");
+    background(&mut h);
 
     if files.len() > 1 {
         two_windows(&mut h, &rounds, preset);
@@ -682,33 +679,19 @@ fn search(h: &mut Harness, files: &[PathBuf]) {
     breakdown("after the search rounds");
     h.find("the", false);
     h.wait(|s| s.find_done);
-    // The last tab's search stays open for the background phase, where sleeping stops it.
+    // The last tab's search stays open for the background phase.
     h.end_phase();
 }
 
-/// Leaves the app unfocused until it drops its tiles, then focuses it again.
-fn background(h: &mut Harness, after: f64) {
+/// Checks that an unfocused window retains its rendered pages.
+fn background(h: &mut Harness) {
     h.begin_phase();
     let textures = h.stats().texture_bytes;
     h.focused = false;
-    let t = Instant::now();
-    // An idle app draws no frames; check a few times a second instead of spinning.
-    while !h.stats().asleep && t.elapsed() < Duration::from_secs_f64(after + 5.0) {
-        h.frame();
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    h.idle(Duration::from_millis(500));
+    h.idle(Duration::from_secs(12));
     let s = h.stats();
-    println!(
-        "  asleep {} after {:.1} s   textures {:.1} -> {:.1} MB   search workers {}   footprint {:.1} MB",
-        s.asleep,
-        t.elapsed().as_secs_f64(),
-        mb(textures),
-        mb(s.texture_bytes),
-        s.search_workers,
-        footprint_mb()
-    );
-    h.check(!s.asleep || s.search_workers == 0, || format!("{} search workers while asleep", s.search_workers));
+    println!("  textures {:.1} -> {:.1} MB   footprint {:.1} MB", mb(textures), mb(s.texture_bytes), footprint_mb());
+    h.check(s.ready && s.texture_bytes >= textures, || "unfocused window lost its pages".into());
     h.end_phase();
 
     h.focused = true;

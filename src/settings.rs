@@ -96,7 +96,7 @@ impl Settings {
         });
         ui.label(weak(match config.memory {
             Memory::Low => "Keeps only what is on screen; pages you return to are redrawn.",
-            Memory::Balanced => "Keeps nearby pages ready, and lets go of them in the background.",
+            Memory::Balanced => "Keeps nearby pages ready; inactive tabs release their pages.",
             Memory::Fast => "Keeps more pages drawn and ready, at several times the memory.",
         }));
         if config.memory != status.launched {

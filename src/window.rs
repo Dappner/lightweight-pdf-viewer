@@ -168,6 +168,11 @@ impl Window {
     pub fn activate(&mut self, ctx: &Context, shared: &mut Shared, index: usize) {
         // Returning to the parked tab within the grace period: its tiles are still cached.
         let returning = self.parked.is_some_and(|(doc, _)| doc == self.tabs[index].id);
+        if returning {
+            // This tab is visible again, including when its neighbour was detached.
+            // Its old grace-period timer must not evict the pages it now shows.
+            self.parked = None;
+        }
         let mut expired = None;
         if index != self.active
             && let Some(old) = self.tabs.get_mut(self.active)
@@ -184,7 +189,8 @@ impl Window {
             } else {
                 old.text_boxes.clear_file();
             }
-            old.snapshot_texture = None;
+            // Keep an existing fallback until the new snapshot succeeds. It is released
+            // with the parked tiles, or once sharp tiles cover the viewport on return.
             old.links.clear();
             old.text.clear();
             if let Some(search) = &mut old.search {
@@ -201,6 +207,9 @@ impl Window {
         if let Some(doc) = expired {
             self.suspend_search(doc);
         }
+        if self.active != index {
+            self.visible_ready = false;
+        }
         self.active = index;
 
         let tab = &mut self.tabs[index];
@@ -212,8 +221,10 @@ impl Window {
         if returning {
             return;
         }
-        if let Some(snapshot) = tab.snapshot.take() {
-            tab.snapshot_texture = snapshot_texture(ctx, &snapshot);
+        if let Some(snapshot) = &tab.snapshot
+            && let Some(texture) = snapshot_texture(ctx, snapshot)
+        {
+            tab.snapshot_texture = Some(texture);
         }
     }
 
@@ -231,6 +242,11 @@ impl Window {
     pub fn release_parked(&mut self, shared: &mut Shared) {
         if let Some((doc, _)) = self.parked.take() {
             shared.cache.evict_doc(doc);
+            if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == doc)
+                && tab.snapshot.is_some()
+            {
+                tab.snapshot_texture = None;
+            }
             self.suspend_search(doc);
         }
     }
@@ -1024,6 +1040,9 @@ impl Window {
                         }
                         .show(ui, wants);
                         self.visible_ready = out.ready;
+                        if out.ready {
+                            tab.snapshot = None;
+                        }
                         if let Some(search) = &mut tab.search {
                             search.want_geometry(&out.visible_pages);
                         }

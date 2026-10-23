@@ -41,13 +41,15 @@ struct Harness {
     ctx: egui::Context,
     app: App,
     time: f64,
+    focused: bool,
 }
 
 impl Harness {
     fn new() -> Self {
         let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
         let app = App::new(&ctx, Config::default(), History::default(), Vec::new());
-        Self { ctx, app, time: 0.0 }
+        Self { ctx, app, time: 0.0, focused: true }
     }
 
     fn frame(&mut self, events: Vec<Event>) {
@@ -60,10 +62,24 @@ impl Harness {
         };
         raw.viewports.insert(
             ViewportId::ROOT,
-            ViewportInfo { native_pixels_per_point: Some(1.0), focused: Some(true), ..Default::default() },
+            ViewportInfo { native_pixels_per_point: Some(1.0), focused: Some(self.focused), ..Default::default() },
         );
         let app = &mut self.app;
-        let _ = self.ctx.run(raw, |ctx| app.ui(ctx));
+        let output = self.ctx.run(raw, |ctx| app.ui(ctx));
+        for (id, viewport) in output.viewport_output {
+            let Some(callback) = viewport.viewport_ui_cb else { continue };
+            let mut raw = RawInput {
+                viewport_id: id,
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 800.0))),
+                time: Some(self.time),
+                ..Default::default()
+            };
+            raw.viewports.insert(
+                id,
+                ViewportInfo { native_pixels_per_point: Some(1.0), focused: Some(self.focused), ..Default::default() },
+            );
+            let _ = self.ctx.run(raw, |ctx| callback(ctx));
+        }
     }
 
     fn press(&mut self, key: Key) {
@@ -179,4 +195,35 @@ fn single_pages_rotate_alone() {
     let stats = h.app.stats();
     let _ = std::fs::remove_file(path);
     assert_eq!((stats.current_page, stats.rotation), (3, 180));
+}
+
+/// Losing focus on every window must not reclaim pages visible on another monitor.
+#[test]
+fn unfocused_windows_keep_rendered_pages_under_every_memory_preset() {
+    use lightweight_pdf_viewer::memory::Memory;
+
+    for memory in [Memory::Low, Memory::Balanced, Memory::Fast] {
+        let path = blank_pdf(&format!("unfocused-{memory:?}"), 2);
+        let mut h = Harness::new();
+        h.app.run(&h.ctx, 0, Command::SetMemory(memory));
+        h.app.open(&h.ctx, path.clone());
+        h.wait(|s| s.ready);
+        let second = blank_pdf(&format!("unfocused-second-{memory:?}"), 2);
+        h.app.open(&h.ctx, second.clone());
+        h.app.run(&h.ctx, 0, Command::MoveTabToNewWindow);
+        h.wait(|s| s.windows == 2 && s.windows_ready);
+        h.focused = false;
+        h.frame(vec![]);
+        h.time += 60.0;
+        for _ in 0..30 {
+            h.frame(vec![]);
+            let stats = h.app.stats();
+            assert!(stats.windows_ready, "{memory:?} reclaimed an unfocused window's pages");
+            assert!(stats.texture_bytes > 0);
+            assert!(!stats.snapshot_shown, "{memory:?} replaced visible pages with a snapshot");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(second);
+    }
 }

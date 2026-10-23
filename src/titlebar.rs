@@ -9,6 +9,20 @@
 use objc2::runtime::{AnyClass, AnyObject, Bool, Imp, Sel};
 use objc2::{ffi, sel};
 
+/// Current pointer in the same top-left screen coordinates winit uses, even outside
+/// the source window. AppKit's first screen is the primary display, not the display
+/// containing the key window; its height is the global coordinate system's origin.
+pub fn drag_pointer() -> Option<(eframe::egui::Pos2, bool)> {
+    use objc2_app_kit::{NSEvent, NSScreen};
+    let mtm = objc2::MainThreadMarker::new()?;
+    let screen = NSScreen::screens(mtm).firstObject()?;
+    let point = NSEvent::mouseLocation();
+    Some((
+        eframe::egui::pos2(point.x as f32, (screen.frame().size.height - point.y) as f32),
+        NSEvent::pressedMouseButtons() & 1 != 0,
+    ))
+}
+
 /// Call once the window exists (winit registers its view class when creating it).
 pub fn install() {
     let Some(class) = AnyClass::get(c"WinitView") else {

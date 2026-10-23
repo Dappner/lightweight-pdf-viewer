@@ -10,6 +10,7 @@ Most PDF apps are heavy. This one does one thing: shows PDFs, quickly and cheapl
 
 - **Tabs.** Keep a stack of PDFs open in one window.
 - **Idle tabs cost almost nothing.** When you switch away from a tab, it keeps a small compressed snapshot of what was on screen and closes the document. Switching back shows the snapshot straight away while the pages redraw.
+- **Visible windows stay readable.** Every window keeps its current rendered pages, including when another app has focus.
 - **Light on memory.** Rendered pages share one fixed GPU budget across all tabs, and only the pages near the screen are rendered. Pages you have scrolled past are let go instead of piling up, so memory stays flat however long you read.
 - **Light on CPU.** Nothing redraws unless something changes. Pages are drawn with macOS's built-in PDF engine, the same one Preview uses.
 - **Native.** Real macOS menu bar, Finder "Open With", drag and drop.
@@ -35,6 +36,8 @@ cargo run --release -- some.pdf another.pdf
 ## Using it
 
 Open PDFs with ⌘O, by dragging them onto the window, or from Finder. Drag the sidebar's edge to resize it.
+
+Drag a tab onto another window's tab strip to move it there. Dropping it away from an existing strip opens a new window; a window's last tab closes its source window when moved into another one.
 
 The app reopens the windows and tabs you had open last time, including whether each window's sidebar was open or collapsed. Settings live in `~/Library/Application Support/Lightweight PDF/config.json`; set `"restore_tabs": false` there to start empty instead.
 

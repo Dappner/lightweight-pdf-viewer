@@ -37,6 +37,10 @@ pub mod menu {
 
 pub mod titlebar {
     pub fn install() {}
+
+    pub fn drag_pointer() -> Option<(eframe::egui::Pos2, bool)> {
+        None
+    }
 }
 
 /// Files picked in an Open dialog.

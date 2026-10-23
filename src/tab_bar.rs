@@ -75,6 +75,42 @@ pub struct ViewMenu {
     pub annotating: bool,
 }
 
+fn drag_key(viewport: eframe::egui::ViewportId) -> eframe::egui::Id {
+    eframe::egui::Id::new(("tab-drag", viewport))
+}
+
+pub fn is_dragging(ctx: &eframe::egui::Context, viewport: eframe::egui::ViewportId) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(drag_key(viewport)).unwrap_or(false))
+}
+
+/// Recover motion and release outside a native window. egui-winit clears its
+/// pointer position on CursorLeft, then omits MouseInput without a known position.
+/// This adapter runs before egui processes the frame, so both its pointer state
+/// and the drag response finish normally, including when no mouse-up was delivered.
+pub fn update_drag_input(raw: &mut eframe::egui::RawInput, position: Pos2, down: bool) {
+    use eframe::egui::{Event, PointerButton};
+    let Some(rect) = raw.viewport().inner_rect else { return };
+    let local = (position - rect.min).to_pos2();
+    raw.events.push(Event::PointerMoved(local));
+    if !down {
+        let mut released = false;
+        for event in &mut raw.events {
+            if let Event::PointerButton { pos, button: PointerButton::Primary, pressed: false, .. } = event {
+                *pos = local;
+                released = true;
+            }
+        }
+        if !released {
+            raw.events.push(Event::PointerButton {
+                pos: local,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: raw.modifiers,
+            });
+        }
+    }
+}
+
 /// `scroll` is the strip's horizontal scroll offset, kept by the caller between frames.
 pub fn show(
     ui: &mut Ui,
@@ -134,6 +170,17 @@ pub fn show(
         .enumerate()
         .map(|(i, tab)| ui.interact(slot(i).intersect(area), ui.id().with(("tab", tab.id)), Sense::click_and_drag()))
         .collect();
+    let drag_key = drag_key(ui.ctx().viewport_id());
+    if responses.iter().any(Response::drag_started) {
+        ui.ctx().data_mut(|d| d.insert_temp(drag_key, true));
+    }
+    if responses.iter().any(Response::drag_stopped) {
+        ui.ctx().data_mut(|d| d.remove::<bool>(drag_key));
+    }
+    if is_dragging(ui.ctx(), ui.ctx().viewport_id()) {
+        // Keep receiving native pointer samples after the pointer leaves this window.
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
+    }
     let closes: Vec<Response> = tabs
         .iter()
         .enumerate()

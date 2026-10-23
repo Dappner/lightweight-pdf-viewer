@@ -1,0 +1,137 @@
+{
+  "metal_buffers_per_window": 2,
+  "phases": [
+    {
+      "actions": 0,
+      "distinct_sizes": 2,
+      "footprint_peak_bytes": 60310536,
+      "phase": "idle",
+      "ui_callbacks": {
+        "count": 300,
+        "max_ms": 2.6450419999999997,
+        "over_100_ms": 0,
+        "over_500_ms": 0,
+        "p50_ms": 0.43724999999999997,
+        "p95_ms": 1.716958
+      },
+      "ui_intervals": {
+        "count": 300,
+        "max_ms": 17.449875,
+        "over_100_ms": 0,
+        "over_500_ms": 0,
+        "p50_ms": 10.007334,
+        "p95_ms": 11.127291
+      }
+    },
+    {
+      "actions": 11,
+      "distinct_sizes": 21,
+      "footprint_peak_bytes": 62080008,
+      "phase": "paired_resize",
+      "ui_callbacks": {
+        "count": 51,
+        "max_ms": 1.4892919999999998,
+        "over_100_ms": 0,
+        "over_500_ms": 0,
+        "p50_ms": 0.38225,
+        "p95_ms": 0.5966250000000001
+      },
+      "ui_intervals": {
+        "count": 51,
+        "max_ms": 1020.829625,
+        "over_100_ms": 6,
+        "over_500_ms": 6,
+        "p50_ms": 4.354,
+        "p95_ms": 1009.08025
+      }
+    },
+    {
+      "actions": 0,
+      "distinct_sizes": 2,
+      "footprint_peak_bytes": 59114504,
+      "phase": "after_resize",
+      "ui_callbacks": {
+        "count": 308,
+        "max_ms": 4.269583000000001,
+        "over_100_ms": 0,
+        "over_500_ms": 0,
+        "p50_ms": 0.545666,
+        "p95_ms": 1.740333
+      },
+      "ui_intervals": {
+        "count": 308,
+        "max_ms": 20.625125,
+        "over_100_ms": 0,
+        "over_500_ms": 0,
+        "p50_ms": 9.999209,
+        "p95_ms": 10.382125
+      }
+    },
+    {
+      "actions": 21,
+      "distinct_sizes": 2,
+      "footprint_peak_bytes": 67666952,
+      "phase": "zoom_first",
+      "ui_callbacks": {
+        "count": 397,
+        "max_ms": 3.030459,
+        "over_100_ms": 0,
+        "over_500_ms": 0,
+        "p50_ms": 0.51225,
+        "p95_ms": 1.559583
+      },
+      "ui_intervals": {
+        "count": 397,
+        "max_ms": 23.342083,
+        "over_100_ms": 0,
+        "over_500_ms": 0,
+        "p50_ms": 10.001792,
+        "p95_ms": 10.219333
+      }
+    },
+    {
+      "actions": 17,
+      "distinct_sizes": 2,
+      "footprint_peak_bytes": 67666952,
+      "phase": "zoom_second",
+      "ui_callbacks": {
+        "count": 306,
+        "max_ms": 2.32225,
+        "over_100_ms": 0,
+        "over_500_ms": 0,
+        "p50_ms": 0.51,
+        "p95_ms": 1.652666
+      },
+      "ui_intervals": {
+        "count": 306,
+        "max_ms": 1024.509208,
+        "over_100_ms": 1,
+        "over_500_ms": 1,
+        "p50_ms": 9.997875,
+        "p95_ms": 10.323709000000001
+      }
+    },
+    {
+      "actions": 0,
+      "distinct_sizes": 2,
+      "footprint_peak_bytes": 64570376,
+      "phase": "after_zoom",
+      "ui_callbacks": {
+        "count": 203,
+        "max_ms": 1.913208,
+        "over_100_ms": 0,
+        "over_500_ms": 0,
+        "p50_ms": 0.4775,
+        "p95_ms": 1.524334
+      },
+      "ui_intervals": {
+        "count": 203,
+        "max_ms": 1004.993459,
+        "over_100_ms": 1,
+        "over_500_ms": 1,
+        "p50_ms": 10.001542,
+        "p95_ms": 10.265165999999999
+      }
+    }
+  ]
+}

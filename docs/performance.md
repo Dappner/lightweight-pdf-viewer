@@ -72,19 +72,81 @@ When upgrading egui-wgpu, diff `grey.wgsl` against the new `egui.wgsl` and the c
 
 ## Open
 
-- Native two-window presentation: an October 18 live sample found 2,451 of 3,491
-  main-thread samples in `CAMetalLayer nextDrawable`, while the PDF render worker
-  was waiting for work in 3,489 samples. This identifies presentation waiting,
-  but does not by itself prove the two-drawable limit is wrong: vsync also waits
-  there normally. Keep that limit while fixing unnecessary cross-window wakeups.
-  Render results now wake the document's owning viewport explicitly; search and
-  text workers share a repaint destination that follows a moved tab. Closing the
-  main window and handing another window over to it also reroutes those workers.
-  Idle windows keep their last native frame and cached visible tiles; focusing
-  and scrolling runs the selected window's deferred callback and prioritizes its
-  render queue. The user confirmed that this fixed the slowdown after rebuilding
-  and reopening. Native before/after timings remain unmeasured: the headless
-  benchmark cannot measure drawable acquisition or input stalls.
+- Native two-window presentation: the October 18 live resize capture found 1,033
+  of 1,660 main-thread samples in `CAMetalLayer nextDrawable`, with the PDF worker
+  idle throughout. Zooming showed the same path (871 of 1,258 main-thread samples;
+  PDF worker idle in 1,234 of 1,253 samples). The native benchmark below reproduced
+  the stalls and verified the presentation change.
 - Thread QoS on battery power is unmeasured; see the TODO on `Renderer::spawn`.
 - Zooming waits a fixed 150 ms (`ZOOM_SETTLE` in `src/view.rs`) of the ~250 ms zoom-to-sharp on `balanced`. Shortening it throws away more renders during a slow pinch.
 - The snapshot's QOI encode runs on the render thread (TODO on `render_snapshot`).
+
+## Unfocused windows
+
+Open windows retain their rendered pages under every memory preset. Losing keyboard
+focus no longer triggers app-wide tile release: a window may still be visible on
+another monitor. The cache continues to protect the tiles used by each window's
+latest frame and evict older pages under its budget. Inactive tabs still release
+their caches after the tab-switch grace period.
+
+Removing app-wide background sleep also removes its unsafe snapshot-to-tile handoff.
+Tab-switch snapshots accept late results after switching back, preserve the previous
+fallback if a replacement fails, and remain visible when sharp tiles fail to render.
+Scrolling or zooming invalidates a snapshot because its geometry no longer matches.
+
+## Native resize and zoom regression benchmark
+
+`benches/native_windows.rs` opens two real windows with generated PDFs, alternates
+paired window sizes, zooms each window, then closes. It measures root UI callback
+intervals (including event-loop/presentation delays) and callback durations separately.
+It also records action counts, observed window sizes and process footprint. Settings
+and PDFs in the user's session are untouched. This opens and moves desktop windows:
+warn the user before running it while they are working.
+
+On macOS 27.0 / Apple Silicon, October 18 (one run per configuration):
+
+| Configuration | Resize p95 / max UI interval | Second-window zoom max | After-zoom max |
+| --- | --- | --- | --- |
+| Transaction resize workaround, 2 buffers/window | 1009 / 1021 ms | 1024 ms | 1005 ms |
+| Workaround disabled, 2 buffers/window | 19 / 28 ms | 15 ms | 11 ms |
+| Workaround disabled, 3 buffers/window | 14 / 26 ms | 16 ms | 12 ms |
+
+The old path completed only 11 resize steps in six seconds; the fixed path completed
+157. Reports: [before](benchmarks/2026-10-18-native-windows/before.json),
+[fixed](benchmarks/2026-10-18-native-windows/fixed.json),
+[three buffers](benchmarks/2026-10-18-native-windows/three.json).
+
+The enabled `macos-window-resize-jitter-fix` uses transaction-based Metal presentation,
+but eframe 0.33.3 tracks only the last resized viewport. Interleaved window resizes
+can replace that tracking slot without clearing the previous surface's transaction
+mode. Disable this optional workaround and select the Metal backend explicitly.
+Keep two buffers per window: three modestly improved resize p95 in this run but was
+not needed to remove the second-long stalls. Possible tradeoff: visual jitter while
+manually resizing, which the disabled workaround was intended to suppress. These
+results measure this synthetic workload, not every PDF or tiling manager gesture.
+
+Run after announcing the temporary desktop disruption:
+
+```sh
+BENCH_REPORT=/tmp/pdf-native-fixed.json cargo bench --bench native_windows
+python3 scripts/check-native.py /tmp/pdf-native-fixed.json
+# Reproduce the old path for comparison:
+BENCH_REPORT=/tmp/pdf-native-before.json cargo bench --bench native_windows --features egui-wgpu/macos-window-resize-jitter-fix
+python3 scripts/check-native.py /tmp/pdf-native-fixed.json --before /tmp/pdf-native-before.json
+# Optional three-buffer comparison:
+BENCH_FRAME_LATENCY=2 BENCH_REPORT=/tmp/pdf-native-three.json cargo bench --bench native_windows
+```
+
+The checker rejects insufficient activity or a UI update gap over 500 ms by default;
+`--max-ui-ms` adjusts that explicit threshold. The benchmark has a 60-second watchdog
+so a presentation hang terminates the temporary process instead of leaving it running.
+
+## Dropping tabs into another window
+
+While a tab is dragged, sample the native pointer and button state before egui handles
+the frame. `egui-winit` clears its pointer on `CursorLeft` and can omit a subsequent
+mouse-up outside the source window. Supply the current coordinates and a release
+when necessary so the ordinary drag response and screen-coordinate drop hit test
+complete. Poll only during tab drags. The headless regression covers losing the pointer
+and dropping into another strip from either the main or a secondary window, including
+closing the emptied source and rerouting the destination viewport.

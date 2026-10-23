@@ -242,9 +242,6 @@ struct Queue {
     done: Vec<Output>,
     /// Each document's file, and how its pages are turned.
     paths: HashMap<DocId, (PathBuf, Rotations)>,
-    /// Bumped to have every thread close its open documents, releasing CoreGraphics' caches
-    /// for them.
-    release: u64,
     /// How many documents may be open at once: one for each window showing one.
     open_limit: usize,
 }
@@ -313,15 +310,6 @@ impl Renderer {
         self.shared.0.lock().unwrap().open_limit = limit;
     }
 
-    /// Drops queued work and closes the open documents; the next job reopens what it needs.
-    pub fn release(&self) {
-        self.with_queue(|q| {
-            q.wanted.clear();
-            q.current.clear();
-            q.release += 1;
-        });
-    }
-
     /// Renders a snapshot of a tab's viewport, replacing one of the same tab still queued.
     pub fn snapshot(&self, job: SnapshotJob) {
         self.with_queue(|q| q.queue_snapshot(job));
@@ -359,17 +347,12 @@ struct OpenDoc {
 fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context, pages_per_open: usize) {
     // Least recently used first.
     let mut open: Vec<OpenDoc> = Vec::new();
-    let mut released = 0;
 
     loop {
         let (lock, cvar) = shared;
         let (work, (path, rotations), limit) = {
             let mut q = lock.lock().unwrap();
             loop {
-                if q.release != released {
-                    released = q.release;
-                    open.clear();
-                }
                 open.retain(|o| q.paths.contains_key(&o.id));
                 if let Some(c) = q.control.pop_front() {
                     match q.paths.get(&c.doc()) {

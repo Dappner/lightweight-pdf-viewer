@@ -8,8 +8,10 @@ license = "MIT"
 # Zero-copy pixel buffers: tiles are drawn straight into the `Color32`s egui uploads.
 bytemuck = { version = "1.25.2", features = ["derive", "extern_crate_alloc"] }
 eframe = { version = "0.33.3", default-features = false, features = ["wgpu", "default_fonts"] }
-# Only the Metal backend (eframe's defaults would also pull in GL/Vulkan backends).
-egui-wgpu = { version = "0.33.3", default-features = false, features = ["macos-window-resize-jitter-fix"] }
+# Keep presentation asynchronous when a tiling manager resizes several windows together.
+# eframe 0.33 tracks only the last resized viewport for the transaction-based jitter fix;
+# interleaved resizes can leave another surface presenting inside CoreAnimation transactions.
+egui-wgpu = { version = "0.33.3", default-features = false }
 qoi = "0.4.1"
 # Save-time Preview compatibility: parse PDF dictionaries and Apple's keyed plist without
 # decoding annotation classes or depending on private framework APIs.
@@ -22,11 +24,13 @@ serde_json = "1.0.151"
 # The PDF engine (CoreGraphics, PDFKit) and the native menu bar, Finder and file dialog glue.
 # Elsewhere the crate still builds, so the portable core can be tested and benchmarked.
 [target.'cfg(target_os = "macos")'.dependencies]
+# Select Metal explicitly; the optional resize workaround used to enable it indirectly.
+wgpu = { version = "27.0.1", default-features = false, features = ["metal"] }
 # The process footprint shown in Settings.
 libc = "0.2.189"
 block2 = { version = "0.6.2", default-features = false, features = ["std"] }
 objc2 = { version = "0.6.4", default-features = false, features = ["std"] }
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSCell", "NSMenu", "NSMenuItem", "NSApplication", "NSResponder", "NSEvent", "NSFont", "NSColor", "NSPrintInfo", "NSPrintOperation", "NSView", "NSWindow", "objc2-core-foundation"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSCell", "NSMenu", "NSMenuItem", "NSApplication", "NSResponder", "NSEvent", "NSFont", "NSColor", "NSPrintInfo", "NSPrintOperation", "NSView", "NSWindow", "NSScreen", "objc2-core-foundation"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFURL", "CFCGTypes", "CFData", "CFDictionary", "CFNumber", "CFString"] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGPDFDocument", "CGPDFPage", "CGContext", "CGBitmapContext", "CGColorSpace", "CGImage", "CGAffineTransform", "CGPDFDictionary", "CGPDFArray", "CGPDFObject", "CGPDFString", "CGPDFContext", "CGDataConsumer"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSData", "NSNotification", "NSOperation", "NSString", "NSArray", "NSURL", "NSObject", "NSValue", "NSGeometry", "objc2-core-foundation"] }
@@ -66,4 +70,8 @@ harness = false
 
 [[bench]]
 name = "text_spike"
+harness = false
+
+[[bench]]
+name = "native_windows"
 harness = false
