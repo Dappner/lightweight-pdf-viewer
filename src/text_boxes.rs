@@ -98,6 +98,31 @@ impl TextBox {
         let width = self.width.unwrap_or(text.x.max(self.size) + 2.0 * PAD + 1.0);
         vec2(width, text.y.max(self.size) + 2.0 * PAD)
     }
+
+    /// The box with `edge` dragged `by` PDF points rightwards, on a page `page_width` points
+    /// wide upright, from `width` points wide (see [`Self::size_around`]): wrapping at its new
+    /// width, at least a letter wide (or as wide as it was, if narrower), its left edge kept
+    /// on the page.
+    pub fn resized(&self, edge: Edge, by: f32, width: f32, page_width: f32) -> Self {
+        let min = (self.size + 2.0 * PAD).min(width);
+        let mut b = self.clone();
+        match edge {
+            Edge::Right => b.width = Some((width + by).max(min)),
+            Edge::Left => {
+                let by = by.min(width - min).max(-self.at[0] * page_width);
+                b.width = Some(width - by);
+                b.at[0] += by / page_width;
+            }
+        }
+        b
+    }
+}
+
+/// A side of a box, dragged to change how wide it wraps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Edge {
+    Left,
+    Right,
 }
 
 /// The family boxes are drawn in: Helvetica once loaded (the first time a box is shown, as
@@ -255,9 +280,11 @@ pub struct Editing {
     /// For a new box, its top-left corner; see [`TextBox::at`].
     pub at: Pos2,
     pub draft: String,
-    /// Size and colour, which the field's menu changes along with the text.
+    /// Size and colour, which the field's menu changes along with the text, and the width and
+    /// left edge, which dragging its sides changes.
     pub size: f32,
     pub color: [u8; 3],
+    pub width: Option<f32>,
     /// Ask for the keyboard on the next frame.
     pub focus: bool,
 }
@@ -378,6 +405,9 @@ pub struct TextBoxes {
     /// A box being dragged, and how far so far, as fractions of the page upright. Moved
     /// for good when the drag ends, so the drag is one change to undo.
     pub dragging: Option<(BoxRef, Vec2)>,
+    /// A box's side being dragged, and how far so far in PDF points, kept as
+    /// [`Self::dragging`] is.
+    pub resizing: Option<(BoxRef, Edge, f32)>,
     pub saving: Option<Saving>,
 }
 
@@ -405,6 +435,7 @@ impl TextBoxes {
             selected: None,
             editing: None,
             dragging: None,
+            resizing: None,
             saving: None,
         };
         let mut unsaved = this.store.as_deref().and_then(read).filter(|u| u.pdf == pdf);
@@ -607,7 +638,8 @@ impl TextBoxes {
         }
         self.finish_editing();
         self.selected = None;
-        self.editing = Some(Editing { page, index: None, at, draft: String::new(), size, color, focus: true });
+        self.editing =
+            Some(Editing { page, index: None, at, draft: String::new(), size, color, width: None, focus: true });
     }
 
     /// Starts typing into an existing box.
@@ -624,12 +656,13 @@ impl TextBoxes {
             draft: b.text.clone(),
             size: b.size,
             color: b.color,
+            width: b.width,
             focus: true,
         });
         self.selected = Some(r);
     }
 
-    /// Ends typing: keeps the text, size and colour (one change to undo), adding a new box
+    /// Ends typing: keeps the text, size, colour and width (one change to undo), adding a new box
     /// if it has text, and deletes a box emptied of it.
     pub fn finish_editing(&mut self) {
         let Some(editing) = self.editing.take() else { return };
@@ -638,8 +671,12 @@ impl TextBoxes {
             None if empty => {}
             None => {
                 let index = self.change(editing.page, |boxes| {
-                    let b =
-                        TextBox { size: editing.size, color: editing.color, ..TextBox::new(editing.at, editing.draft) };
+                    let b = TextBox {
+                        size: editing.size,
+                        color: editing.color,
+                        width: editing.width,
+                        ..TextBox::new(editing.at, editing.draft)
+                    };
                     boxes.push(b);
                     boxes.len() - 1
                 });
@@ -647,8 +684,13 @@ impl TextBoxes {
             }
             Some(index) => {
                 let r = BoxRef { page: editing.page, index };
-                let unchanged =
-                    |b: &TextBox| b.text == editing.draft && b.size == editing.size && b.color == editing.color;
+                let unchanged = |b: &TextBox| {
+                    b.text == editing.draft
+                        && b.size == editing.size
+                        && b.color == editing.color
+                        && b.width == editing.width
+                        && b.at() == editing.at
+                };
                 if empty {
                     self.delete(r);
                 } else if self.get(r).is_some_and(|b| !unchanged(b)) {
@@ -656,6 +698,8 @@ impl TextBoxes {
                         b.text = editing.draft;
                         b.size = editing.size;
                         b.color = editing.color;
+                        b.width = editing.width;
+                        b.at = [editing.at.x, editing.at.y];
                     });
                 }
             }
@@ -760,6 +804,7 @@ impl TextBoxes {
         self.undo.push(Undo::Revert(Box::new(edits)));
         self.selected = None;
         self.dragging = None;
+        self.resizing = None;
         self.persist();
     }
 
@@ -931,6 +976,41 @@ mod tests {
         }
         // A quarter turn clockwise takes the top-left corner to the top-right.
         assert_eq!(turn(pos2(0.0, 0.0), Rotation::default().clockwise()), pos2(1.0, 0.0));
+    }
+
+    #[test]
+    fn dragging_a_side_sets_the_width_and_keeps_the_other_side() {
+        // 12 pt text, 100 points wide, its left edge 50 points in on a 500 point page.
+        let b = TextBox::new(pos2(0.1, 0.5), "text".into());
+        let right = b.resized(Edge::Right, -30.0, 100.0, 500.0);
+        assert_eq!((right.width, right.at), (Some(70.0), b.at));
+        let left = b.resized(Edge::Left, 30.0, 100.0, 500.0);
+        assert_eq!(left.width, Some(70.0));
+        assert!((left.at[0] - 0.16).abs() < 1e-6);
+        // No narrower than a letter, and the left edge stays on the page.
+        assert_eq!(b.resized(Edge::Right, -200.0, 100.0, 500.0).width, Some(16.0));
+        let narrowest = b.resized(Edge::Left, 200.0, 100.0, 500.0);
+        assert_eq!(narrowest.width, Some(16.0));
+        assert!((narrowest.at[0] - 0.268).abs() < 1e-6);
+        let widest = b.resized(Edge::Left, -200.0, 100.0, 500.0);
+        assert_eq!((widest.width, widest.at[0]), (Some(150.0), 0.0));
+    }
+
+    #[test]
+    fn resizing_while_typing_is_kept_with_the_text() {
+        let dir = temp_dir("resize");
+        let mut boxes = TextBoxes::load(&pdf(&dir), Some(&dir));
+        boxes.set_file(0, vec![TextBox::new(pos2(0.1, 0.1), "a long line".into())], Vec::new());
+        let r = BoxRef { page: 0, index: 0 };
+        boxes.edit(r);
+        let editing = boxes.editing.as_mut().unwrap();
+        editing.width = Some(40.0);
+        editing.at.x = 0.2;
+        boxes.finish_editing();
+        let b = boxes.get(r).unwrap();
+        assert_eq!((b.width, b.at[0], b.changed), (Some(40.0), 0.2, true));
+        assert!(boxes.undo());
+        assert_eq!(boxes.get(r).unwrap().width, None);
     }
 
     #[test]

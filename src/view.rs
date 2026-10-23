@@ -22,7 +22,7 @@ use crate::renderer::{DocId, Key, Link, SnapshotJob, SnapshotPage, TILE, Target,
 use crate::search::Search;
 use crate::selection::Unit;
 use crate::tab::View;
-use crate::text_boxes::{self, BoxRef, PAD, TextBox, TextBoxes, turn, unturn};
+use crate::text_boxes::{self, BoxRef, Edge, PAD, TextBox, TextBoxes, turn, unturn};
 use crate::text_layers::{MIN_LAYER_HEIGHT, TextLayers};
 
 pub const MIN_ZOOM: f32 = 0.1;
@@ -738,6 +738,12 @@ enum BoxAction {
     Edit(BoxRef),
     Drag(BoxRef, Vec2),
     Drop(BoxRef),
+    /// A side dragged this far, in PDF points.
+    Resize(BoxRef, Edge, f32),
+    /// A side let go: the box's left edge (see [`TextBox::at`]) and width now.
+    Resized(BoxRef, f32, Option<f32>),
+    /// Grows to fit its text again.
+    Fit(BoxRef),
     Size(BoxRef, f32),
     Color(BoxRef, [u8; 3]),
     Delete(BoxRef),
@@ -755,8 +761,9 @@ enum Typing {
 }
 
 /// Draws the text boxes of the pages on screen and takes the pointer's part in editing them:
-/// a click selects a box, dragging moves it, a double click types into it, and its right-click
-/// menu sizes, colours and deletes it. A click elsewhere ends typing. `pages` are the pages
+/// a click selects a box, dragging moves it, dragging a side sets the width its text wraps
+/// at (a double click on one fits it to the text again), a double click types into it, and its
+/// right-click menu sizes, colours and deletes it. A click elsewhere ends typing. `pages` are the pages
 /// on screen, with their screen rects. While `zooming`, text is drawn at a rounded size (see
 /// [`text_boxes::glyph_scale`]).
 #[allow(clippy::too_many_arguments)]
@@ -791,7 +798,15 @@ fn show_text_boxes(
             let r = BoxRef { page, index };
             let offset = boxes.dragging.filter(|(d, _)| *d == r).map_or(Vec2::ZERO, |(_, o)| o);
             let glyphs = text_boxes::glyph_scale(scale, zooming);
-            let galley = b.galley(&ctx, &b.text, glyphs);
+            let mut galley = b.galley(&ctx, &b.text, glyphs);
+            let b = &match boxes.resizing.filter(|(d, ..)| *d == r) {
+                Some((_, edge, by)) => {
+                    let resized = b.resized(edge, by, b.size_around(&galley, glyphs).x, upright.x);
+                    galley = resized.galley(&ctx, &b.text, glyphs);
+                    resized
+                }
+                None => b.clone(),
+            };
             let size = b.size_around(&galley, glyphs) * scale;
             let (anchor, area) = placed(rect, rotation, b.at() + offset, size);
             let text_at = anchor + turn_vec(vec2(PAD, PAD) * scale, rotation);
@@ -817,6 +832,25 @@ fn show_text_boxes(
             }
             if response.drag_stopped() {
                 actions.push(BoxAction::Drop(r));
+            }
+            for edge in [Edge::Left, Edge::Right] {
+                let id = ui.id().with(("text box edge", doc, page, index, edge));
+                let handle = edge_handle(ui, id, anchor, size, rotation, edge);
+                if boxes.selected == Some(r) {
+                    paint_grip(ui, anchor, size, rotation, edge, accent);
+                }
+                if handle.double_clicked() {
+                    actions.push(BoxAction::Fit(r));
+                } else if handle.clicked() || handle.drag_started() {
+                    actions.push(BoxAction::Select(r));
+                }
+                if handle.dragged() {
+                    let by = unturn_vec(handle.drag_delta(), rotation).x / scale;
+                    actions.push(BoxAction::Resize(r, edge, by));
+                }
+                if handle.drag_stopped() {
+                    actions.push(BoxAction::Resized(r, b.at[0], b.width));
+                }
             }
             response.context_menu(|ui| {
                 if ui.button("Edit Text").clicked() {
@@ -874,6 +908,25 @@ fn show_text_boxes(
                     });
                 }
             }
+            // As a box can't move while a save runs, nor can it be resized.
+            BoxAction::Resize(_, _, _) if boxes.saving() => {}
+            BoxAction::Resize(r, edge, by) => {
+                let so_far = boxes.resizing.filter(|(d, e, _)| (*d, *e) == (r, edge)).map_or(0.0, |(.., b)| b);
+                boxes.resizing = Some((r, edge, so_far + by));
+            }
+            BoxAction::Resized(r, x, width) => {
+                if boxes.resizing.take().is_some_and(|(d, ..)| d == r) {
+                    boxes.change_box(r, |b| {
+                        b.at[0] = x;
+                        b.width = width;
+                    });
+                }
+            }
+            BoxAction::Fit(r) => {
+                if boxes.get(r).is_some_and(|b| b.width.is_some()) {
+                    boxes.change_box(r, |b| b.width = None);
+                }
+            }
             BoxAction::Size(r, size) => boxes.change_box(r, |b| b.size = size),
             BoxAction::Color(r, color) => boxes.change_box(r, |b| b.color = color),
             BoxAction::Delete(r) => boxes.delete(r),
@@ -921,6 +974,8 @@ fn type_into(
     let b = TextBox {
         size: editing.size,
         color: editing.color,
+        width: editing.width,
+        at: [editing.at.x, editing.at.y],
         ..existing.cloned().unwrap_or_else(|| TextBox::new(editing.at, String::new()))
     };
     let galley = b.galley(&ctx, &editing.draft, scale);
@@ -940,6 +995,31 @@ fn type_into(
     ui.painter().rect_filled(area, 0.0, Color32::from_white_alpha(140));
     let response = ui.put(area, field);
     ui.painter().rect_stroke(area, 0.0, Stroke::new(1.5, accent), StrokeKind::Outside);
+    // The field is upright, so on a turned page moving its left side would move it along the
+    // page's other axis: only its right side is offered there.
+    let edges: &[Edge] = if rotation.degrees() == 0 { &[Edge::Left, Edge::Right] } else { &[Edge::Right] };
+    let page_width = if rotation.degrees() % 180 == 90 { page_rect.height() } else { page_rect.width() } / scale;
+    let mut resizing = false;
+    for &edge in edges {
+        let handle = edge_handle(
+            ui,
+            ui.id().with(("typing edge", doc, editing.page, edge)),
+            anchor,
+            size,
+            Rotation::default(),
+            edge,
+        );
+        paint_grip(ui, anchor, size, Rotation::default(), edge, accent);
+        if handle.double_clicked() {
+            editing.width = None;
+        } else if handle.dragged() {
+            let resized = b.resized(edge, handle.drag_delta().x / scale, b.size_around(&galley, scale).x, page_width);
+            editing.at.x = resized.at[0];
+            editing.width = resized.width;
+        }
+        // A click there takes the keyboard from the field: typing goes on all the same.
+        resizing |= handle.is_pointer_button_down_on() || handle.clicked() || handle.drag_stopped();
+    }
     let mut outcome = None;
     let menu = response.context_menu(|ui| {
         ui.menu_button("Size", |ui| {
@@ -967,8 +1047,8 @@ fn type_into(
     if let Some(outcome) = outcome {
         return outcome;
     }
-    if menu.is_some() {
-        // The menu has the pointer, not the keyboard: typing goes on once it closes.
+    if menu.is_some() || resizing {
+        // The menu or a side has the pointer, not the keyboard: typing goes on once it lets go.
         editing.focus = true;
         return Typing::Going;
     }
@@ -987,6 +1067,39 @@ fn placed(page_rect: Rect, rotation: Rotation, at: Pos2, size: Vec2) -> (Pos2, R
     let anchor = page_rect.min + turn(at, rotation).to_vec2() * page_rect.size();
     let far = anchor + turn_vec(size, rotation);
     (anchor, Rect::from_two_pos(anchor, far))
+}
+
+/// The strip, `half` screen points either side, along `edge` of a box placed at `anchor`
+/// (see [`placed`]), `size` screen points upright, turned by `rotation`; `len` long, centred
+/// on the edge.
+fn edge_strip(anchor: Pos2, size: Vec2, rotation: Rotation, edge: Edge, half: f32, len: f32) -> Rect {
+    let x = match edge {
+        Edge::Left => 0.0,
+        Edge::Right => size.x,
+    };
+    let y = (size.y - len) / 2.0;
+    Rect::from_two_pos(
+        anchor + turn_vec(vec2(x - half, y), rotation),
+        anchor + turn_vec(vec2(x + half, y + len), rotation),
+    )
+}
+
+/// Takes the pointer along `edge` of a box (see [`edge_strip`]), to drag it. Narrow on a small
+/// box, so the middle is left to move it by.
+fn edge_handle(ui: &Ui, id: eframe::egui::Id, anchor: Pos2, size: Vec2, rotation: Rotation, edge: Edge) -> Response {
+    let cursor = if rotation.degrees() % 180 == 0 { CursorIcon::ResizeHorizontal } else { CursorIcon::ResizeVertical };
+    let strip = edge_strip(anchor, size, rotation, edge, 4.0f32.min(size.x / 4.0), size.y);
+    let response = ui.interact(strip, id, Sense::click_and_drag()).on_hover_cursor(cursor);
+    if response.dragged() {
+        ui.ctx().set_cursor_icon(cursor);
+    }
+    response
+}
+
+/// Marks `edge` of a box (see [`edge_strip`]) as one to drag.
+fn paint_grip(ui: &Ui, anchor: Pos2, size: Vec2, rotation: Rotation, edge: Edge, color: Color32) {
+    let grip = edge_strip(anchor, size, rotation, edge, 1.5, (size.y * 0.6).min(14.0));
+    ui.painter().rect_filled(grip, 1.5, color);
 }
 
 /// The inverse of [`turn_vec`].
