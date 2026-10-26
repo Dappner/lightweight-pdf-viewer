@@ -293,7 +293,7 @@ pub fn show(
     if plus_response.hovered() {
         painter.rect_filled(plus, CornerRadius::same(6), palette.hover);
     }
-    let stroke = Stroke::new(1.4, palette.text_weak);
+    let stroke = Stroke::new(1.4_f32, palette.text_weak);
     painter.line_segment([plus_center - vec2(5.0, 0.0), plus_center + vec2(5.0, 0.0)], stroke);
     painter.line_segment([plus_center - vec2(0.0, 5.0), plus_center + vec2(0.0, 5.0)], stroke);
     if plus_response.clicked() {
@@ -354,13 +354,13 @@ fn paint_detached(ui: &Ui, tab: &Tab, pointer: Pos2, tab_width: f32, palette: &P
         rect,
         CornerRadius::same(7),
         palette.content,
-        Stroke::new(1.0, palette.separator),
+        Stroke::new(1.0_f32, palette.separator),
         eframe::egui::StrokeKind::Inside,
     );
 
     let badge = pos2(rect.left() + 13.0, rect.center().y);
     painter.circle_filled(badge, 7.0, palette.accent);
-    let stroke = Stroke::new(1.5, eframe::egui::Color32::WHITE);
+    let stroke = Stroke::new(1.5_f32, eframe::egui::Color32::WHITE);
     painter.line_segment([badge - vec2(3.5, 0.0), badge + vec2(3.5, 0.0)], stroke);
     painter.line_segment([badge - vec2(0.0, 3.5), badge + vec2(0.0, 3.5)], stroke);
 
@@ -382,7 +382,7 @@ fn view_button(ui: &mut Ui, rect: Rect, menu: &ViewMenu, palette: &Palette) -> O
     if response.hovered() || open {
         painter.rect_filled(rect, CornerRadius::same(6), palette.hover);
     }
-    let stroke = Stroke::new(1.3, palette.text_weak);
+    let stroke = Stroke::new(1.3_f32, palette.text_weak);
     let icon = Rect::from_center_size(rect.center() - vec2(5.0, 0.0), vec2(15.0, 12.0));
     painter.rect_stroke(icon, CornerRadius::same(2), stroke, eframe::egui::StrokeKind::Inside);
     painter.line_segment([pos2(icon.left() + 5.0, icon.top()), pos2(icon.left() + 5.0, icon.bottom())], stroke);
@@ -424,7 +424,7 @@ fn annotate_button(ui: &mut Ui, rect: Rect, on: bool, palette: &Palette) -> bool
         painter.rect_filled(rect, CornerRadius::same(6), if on { palette.separator } else { palette.hover });
     }
     // A pen slanting up to the right, its tip at the bottom left.
-    let stroke = Stroke::new(1.3, if on { palette.text } else { palette.text_weak });
+    let stroke = Stroke::new(1.3_f32, if on { palette.text } else { palette.text_weak });
     let c = rect.center();
     let (tip, base, end) = (c + vec2(-5.5, 5.5), c + vec2(-3.0, 3.0), c + vec2(4.5, -4.5));
     let side = vec2(1.6, 1.6);
@@ -452,7 +452,7 @@ fn rotate_button(ui: &mut Ui, rect: Rect, palette: &Palette) -> Option<Command> 
     }
     // A counterclockwise arrow: an arc from the top round the right to the left, with its
     // head at the top pointing left.
-    let stroke = Stroke::new(1.3, palette.text_weak);
+    let stroke = Stroke::new(1.3_f32, palette.text_weak);
     let (center, radius) = (rect.center() + vec2(0.0, 0.5), 5.5);
     let at = |degrees: f32| {
         let a = degrees.to_radians();
@@ -491,7 +491,7 @@ fn paint_tab(
         let x = rect.right();
         painter.line_segment(
             [pos2(x, rect.top() + 8.0), pos2(x, rect.bottom() - 8.0)],
-            Stroke::new(1.0, palette.separator),
+            Stroke::new(1.0_f32, palette.separator),
         );
     }
 
@@ -517,7 +517,7 @@ fn paint_tab(
         }
         let c = close.center();
         let d = 3.5;
-        let stroke = Stroke::new(1.3, palette.text_weak);
+        let stroke = Stroke::new(1.3_f32, palette.text_weak);
         painter.line_segment([c + vec2(-d, -d), c + vec2(d, d)], stroke);
         painter.line_segment([c + vec2(d, -d), c + vec2(-d, d)], stroke);
     }

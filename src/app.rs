@@ -703,12 +703,10 @@ impl State {
                 .map(|s| s.qoi.capacity())
                 .sum(),
             find: active.and_then(|t| t.search.as_ref()).map(|s| s.status().unwrap_or_default()),
-            find_reads: active
-                .and_then(|t| t.search.as_ref())
-                .map_or((0, 0), |s| {
-                    let stats = s.stats();
-                    (stats.loaded, stats.extracted)
-                }),
+            find_reads: active.and_then(|t| t.search.as_ref()).map_or((0, 0), |s| {
+                let stats = s.stats();
+                (stats.loaded, stats.extracted)
+            }),
             find_done: active.and_then(|t| t.search.as_ref()).is_some_and(|s| s.done()),
             search_workers: self
                 .windows

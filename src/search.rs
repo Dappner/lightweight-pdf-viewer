@@ -645,8 +645,7 @@ impl Search {
 
     /// Whether the current match's rectangles are known.
     fn has_current_rects(&self, hit: Hit) -> bool {
-        self.has_page_rects(hit)
-            || self.current_rects.as_ref().is_some_and(|(h, _)| *h == hit)
+        self.has_page_rects(hit) || self.current_rects.as_ref().is_some_and(|(h, _)| *h == hit)
     }
 
     /// Asks for the geometry of the current match and of the matches on `visible` pages,

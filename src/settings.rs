@@ -55,7 +55,7 @@ impl Settings {
         let area = Modal::default_area(Id::new("settings")).anchor(Align2::CENTER_TOP, vec2(0.0, TOP));
         let frame = Frame::new()
             .fill(palette.content)
-            .stroke(Stroke::new(1.0, palette.separator))
+            .stroke(Stroke::new(1.0_f32, palette.separator))
             .corner_radius(CornerRadius::same(10))
             .inner_margin(Margin::same(16));
         let modal = Modal::new(Id::new("settings"))

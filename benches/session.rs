@@ -35,10 +35,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use common::footprint_mb;
 use eframe::egui::{
     self, DeferredViewportUiCallback, Event, Key, Modifiers, RawInput, Rect, Vec2, ViewportId, ViewportInfo, pos2,
 };
-use common::footprint_mb;
 use lightweight_pdf_viewer::app::{App, Command, Stats};
 use lightweight_pdf_viewer::config::Config;
 use lightweight_pdf_viewer::history::History;

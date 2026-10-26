@@ -115,10 +115,10 @@ pub(crate) fn support_file(name: &str) -> Option<PathBuf> {
 
 /// Writes through a temporary file and a rename, so a crash never leaves a half-written file.
 pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> bool {
-    if let Some(dir) = path.parent() {
-        if std::fs::create_dir_all(dir).is_err() {
-            return false;
-        }
+    if let Some(dir) = path.parent()
+        && std::fs::create_dir_all(dir).is_err()
+    {
+        return false;
     }
     let temp = path.with_extension("tmp");
     std::fs::write(&temp, bytes).is_ok() && std::fs::rename(&temp, path).is_ok()

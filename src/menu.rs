@@ -1,8 +1,8 @@
 //! Native menu bar. Items queue [`Command`]s that the app runs on its next frame. AppKit
 //! matches the ⌘ shortcuts shown in the menus before key events reach egui. The page layout
 //! items show a checkmark next to the active tab's layout, and Annotate one while it's on.
-//! Revert to Saved is enabled while the active tab has unsaved edits, Close Tab while the window
-//! has a tab, and Move Tab to New Window while it has more than one.
+//! Revert to Saved is enabled while the active tab has unsaved edits, and Move Tab to New Window
+//! while the window has more than one tab.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -28,7 +28,7 @@ static LAYOUT: Mutex<Option<PageLayout>> = Mutex::new(None);
 static ANNOTATING: Mutex<bool> = Mutex::new(false);
 /// The focused window's active tab has edits not yet saved, which Revert to Saved drops.
 static UNSAVED: Mutex<bool> = Mutex::new(false);
-/// How many tabs the focused window has; Close Tab needs one, Move Tab to New Window two.
+/// How many tabs the focused window has; Move Tab to New Window needs two.
 static TABS: Mutex<usize> = Mutex::new(0);
 
 define_class!(
@@ -73,7 +73,6 @@ fn validate(item: &NSMenuItem) -> bool {
             true
         }
         Some(Command::Revert) => *UNSAVED.lock().unwrap(),
-        Some(Command::CloseTab) => *TABS.lock().unwrap() > 0,
         Some(Command::MoveTabToNewWindow) => *TABS.lock().unwrap() > 1,
         _ => true,
     }

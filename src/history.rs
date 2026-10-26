@@ -83,8 +83,13 @@ impl History {
     fn upsert(&mut self, path: &Path, now: u64, update: impl FnOnce(&mut Entry) -> bool) {
         let found = self.entries.iter().position(|e| e.path == path);
         let index = found.unwrap_or_else(|| {
-            let entry =
-                Entry { path: path.to_path_buf(), score: 0.0, updated: now, place: None, rotations: Rotations::default() };
+            let entry = Entry {
+                path: path.to_path_buf(),
+                score: 0.0,
+                updated: now,
+                place: None,
+                rotations: Rotations::default(),
+            };
             self.entries.push(entry);
             self.entries.len() - 1
         });

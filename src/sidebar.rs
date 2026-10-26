@@ -232,7 +232,7 @@ fn thumbnails(
                 None if !failed.contains(&key) => wants.thumbs.push(key),
                 None => {}
             }
-            painter.rect_stroke(thumb, 0.0, Stroke::new(1.0, palette.page_border), StrokeKind::Outside);
+            painter.rect_stroke(thumb, 0.0, Stroke::new(1.0_f32, palette.page_border), StrokeKind::Outside);
 
             let label_center = pos2(center_x, thumb.bottom() + LABEL_HEIGHT / 2.0 + 2.0);
             let font = FontId::proportional(11.0);

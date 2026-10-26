@@ -48,7 +48,7 @@ pub fn show(ctx: &Context, serial: u64, top: f32, search: &mut Search, palette: 
     }
     let frame = Frame::new()
         .fill(palette.content)
-        .stroke(Stroke::new(1.0, palette.separator))
+        .stroke(Stroke::new(1.0_f32, palette.separator))
         .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::symmetric(8, 4));
     eframe::egui::Area::new(Id::new(("find-bar", serial)))
@@ -107,7 +107,7 @@ fn icon_button(ui: &mut Ui, palette: &Palette, icon: Icon) -> eframe::egui::Resp
     if response.hovered() {
         painter.rect_filled(rect, CornerRadius::same(5), palette.hover);
     }
-    let stroke = Stroke::new(1.4, palette.text);
+    let stroke = Stroke::new(1.4_f32, palette.text);
     let c = rect.center();
     let lines: &[[(f32, f32); 2]] = match icon {
         Icon::Up => &[[(-4.0, 2.0), (0.0, -2.0)], [(0.0, -2.0), (4.0, 2.0)]],

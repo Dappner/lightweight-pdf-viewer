@@ -442,7 +442,12 @@ pub fn dir() -> Option<PathBuf> {
 impl TextBoxes {
     /// The boxes of the PDF at `pdf`, with any edits left unsaved in `dir`.
     pub fn load(pdf: &Path, dir: Option<&Path>) -> Self {
-        let store = dir.map(|d| d.join(format!("{:016x}.json", crate::text::fnv(crate::text::FNV_OFFSET, pdf.as_os_str().as_encoded_bytes()))));
+        let store = dir.map(|d| {
+            d.join(format!(
+                "{:016x}.json",
+                crate::text::fnv(crate::text::FNV_OFFSET, pdf.as_os_str().as_encoded_bytes())
+            ))
+        });
         let read = |s: &Path| std::fs::read(s).ok().and_then(|bytes| serde_json::from_slice::<Unsaved>(&bytes).ok());
         let mut this = Self {
             pdf: pdf.to_owned(),
@@ -1251,7 +1256,10 @@ mod tests {
         let source_store = boxes.store.clone().unwrap();
         let renamed = dir.join("renamed.pdf");
         std::fs::rename(&original, &renamed).unwrap();
-        let target_store = dir.join(format!("{:016x}.json", crate::text::fnv(crate::text::FNV_OFFSET, renamed.as_os_str().as_encoded_bytes())));
+        let target_store = dir.join(format!(
+            "{:016x}.json",
+            crate::text::fnv(crate::text::FNV_OFFSET, renamed.as_os_str().as_encoded_bytes())
+        ));
         std::fs::create_dir(&target_store).unwrap();
 
         assert_eq!(TextBoxes::load(&renamed, Some(&dir)).page(0).unwrap()[0].text, "Note");
