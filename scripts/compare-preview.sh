@@ -14,7 +14,13 @@ SETTLE=${SETTLE:-6}
 cargo build --release -q
 VIEWER="$PWD/target/release/lightweight-pdf-viewer"
 
-footprint_of() { footprint "$1" 2>/dev/null | sed -n 's/.*Footprint: \([0-9.]* [KMG]B\).*/\1/p'; }
+# Fails loudly if `footprint` fails or prints nothing parseable, rather than leaving a blank column.
+footprint_of() {
+    out=$(footprint "$1") || { echo "footprint failed for pid $1" >&2; exit 1; }
+    mb=$(printf '%s\n' "$out" | sed -n 's/.*Footprint: \([0-9.]* [KMG]B\).*/\1/p' | head -1)
+    [ -n "$mb" ] || { echo "no footprint in output for pid $1" >&2; exit 1; }
+    printf '%s\n' "$mb"
+}
 # Average CPU over 5 s of idling.
 cpu_of() { top -l 2 -s 5 -pid "$1" -stats cpu | tail -1 | tr -d ' '; }
 
