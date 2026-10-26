@@ -261,7 +261,7 @@ impl Window {
     pub fn close(&mut self, ctx: &Context, shared: &mut Shared, index: usize) {
         let mut tab = self.take(ctx, shared, index);
         tab.text_boxes.finish_editing();
-        tab.text_boxes.finish_saving();
+        tab.text_boxes.detach_saving();
         shared.forget(&tab);
     }
 
@@ -269,7 +269,7 @@ impl Window {
     pub fn close_all(&mut self, shared: &mut Shared) {
         for mut tab in self.tabs.drain(..) {
             tab.text_boxes.finish_editing();
-            tab.text_boxes.finish_saving();
+            tab.text_boxes.detach_saving();
             shared.forget(&tab);
         }
         self.active = 0;

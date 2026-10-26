@@ -238,6 +238,7 @@ impl eframe::App for App {
             tab.text_boxes.finish_saving();
             state.shared.remember(tab);
         }
+        crate::text_boxes::wait_for_detached_saves();
         state.save_session(true);
     }
 }
