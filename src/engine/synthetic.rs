@@ -164,7 +164,7 @@ impl<'a> Bitmap<'a> {
             let row = &mut rgba[(y * w * 4) as usize..((y + 1) * w * 4) as usize];
             for x in x0..x1 {
                 let px = x as f64 - top_left[0];
-                let ink = inked && px > page_px[0] * 0.1 && px < page_px[0] * 0.9 && (x / 3) % 4 != 0;
+                let ink = inked && px > page_px[0] * 0.1 && px < page_px[0] * 0.9 && (px as i64 / 3) % 4 != 0;
                 let v = if ink { 40 } else { 255 };
                 row[(x * 4) as usize..(x * 4 + 4) as usize].copy_from_slice(&[v, v, v, 255]);
             }

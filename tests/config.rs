@@ -216,6 +216,18 @@ fn memory_preset_is_read_from_the_config_file() {
 }
 
 #[test]
+fn an_unreadable_config_is_backed_up_before_a_save_overwrites_it() {
+    let dir = temp_dir("bad-config");
+    let config = dir.join("config.json");
+    let bad = r#"{ "sidebar_width": "wide", "memory": "low" }"#;
+    std::fs::write(&config, bad).unwrap();
+    Config::load_from(config.clone()).save();
+    assert_eq!(std::fs::read_to_string(dir.join("config.json.bad")).unwrap(), bad);
+    assert!(serde_json::from_slice::<serde_json::Value>(&std::fs::read(&config).unwrap()).is_ok());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn texture_budget_holds_with_a_single_tab() {
     use lightweight_pdf_viewer::memory::Memory;
 

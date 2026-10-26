@@ -269,7 +269,12 @@ impl Pdf {
     fn destination_target(&self, destination: &PDFDestination) -> Option<Target> {
         // SAFETY: plain PDFKit getters on objects owned by `self`.
         let page = unsafe { destination.page() }?;
-        let index = unsafe { self.pdf.indexForPage(&page) } as u32;
+        let index = unsafe { self.pdf.indexForPage(&page) };
+        // NSNotFound (a broken link) isn't a page.
+        if index == objc2_foundation::NSNotFound as usize {
+            return None;
+        }
+        let index = index as u32;
         let point = unsafe { destination.point() };
         // PDFKit uses a huge sentinel (kPDFDestinationUnspecifiedValue) for "no position".
         let y = (point.y.abs() < 1e6)

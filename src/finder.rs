@@ -38,7 +38,7 @@ pub fn set_context(ctx: &egui::Context) {
 }
 
 pub fn take() -> Vec<PathBuf> {
-    std::mem::take(&mut PENDING.lock().unwrap())
+    std::mem::take(&mut PENDING.lock().unwrap_or_else(|p| p.into_inner()))
 }
 
 fn add_open_urls_method() {
@@ -60,7 +60,7 @@ fn add_open_urls_method() {
 }
 
 unsafe extern "C-unwind" fn open_urls(_this: &AnyObject, _cmd: Sel, _app: &AnyObject, urls: &NSArray<NSURL>) {
-    PENDING.lock().unwrap().extend(urls.iter().filter_map(|url| url.to_file_path()));
+    PENDING.lock().unwrap_or_else(|p| p.into_inner()).extend(urls.iter().filter_map(|url| url.to_file_path()));
     if let Some(ctx) = CONTEXT.get() {
         ctx.request_repaint();
     }
