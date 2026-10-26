@@ -233,12 +233,12 @@ struct Queue {
     viewports: HashMap<DocId, egui::ViewportId>,
     control: VecDeque<Control>,
     /// What to render next: what the UI wants, less what is in flight or done.
-    wanted: Vec<Key>,
+    wanted: VecDeque<Key>,
     /// Everything the UI wanted in its latest frame, in flight or not. A batch skips keys
     /// that have left it, such as tiles of a tab switched away from mid-page.
     current: HashSet<Key>,
     /// Keys being worked on by any thread.
-    busy: Vec<Key>,
+    busy: HashSet<Key>,
     done: Vec<Output>,
     /// Each document's file, and how its pages are turned.
     paths: HashMap<DocId, (PathBuf, Rotations)>,
@@ -331,8 +331,9 @@ impl Renderer {
         self.with_queue(|q| {
             q.current.clear();
             q.current.extend(wanted.iter().copied());
-            wanted.retain(|k| !q.busy.contains(k) && !q.done.iter().any(|o| o.key() == Some(*k)));
-            q.wanted = wanted;
+            let finished: HashSet<Key> = q.done.iter().filter_map(Output::key).collect();
+            wanted.retain(|k| !q.busy.contains(k) && !finished.contains(k));
+            q.wanted = wanted.into();
         });
     }
 }
@@ -362,7 +363,7 @@ fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context, pages_per_open:
                 }
                 if !q.wanted.is_empty() {
                     // Batch every queued job for the same page so it is only looked up once.
-                    let first = q.wanted.remove(0);
+                    let Some(first) = q.wanted.pop_front() else { continue };
                     let mut batch = vec![first];
                     q.wanted.retain(|k| {
                         let same = k.doc() == first.doc() && k.page() == first.page();
@@ -372,7 +373,7 @@ fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context, pages_per_open:
                         !same
                     });
                     if let Some(path) = q.paths.get(&first.doc()).cloned() {
-                        q.busy.extend(&batch);
+                        q.busy.extend(batch.iter().copied());
                         break (Work::Render(batch), path, q.open_limit.max(1));
                     }
                 }
@@ -427,7 +428,10 @@ fn worker(shared: &(Mutex<Queue>, Condvar), ctx: &egui::Context, pages_per_open:
             }
         });
         // Skipped keys never produce an output.
-        lock.lock().unwrap().busy.retain(|k| !mine.contains(k));
+        let mut q = lock.lock().unwrap();
+        for k in &mine {
+            q.busy.remove(k);
+        }
     }
 }
 
@@ -443,7 +447,7 @@ impl Delivery<'_> {
         let mut q = self.shared.0.lock().unwrap();
         let viewport = q.viewports.get(&output.doc()).copied();
         if let Some(key) = output.key() {
-            q.busy.retain(|k| *k != key);
+            q.busy.remove(&key);
         }
         q.done.push(output);
         drop(q);
@@ -546,7 +550,7 @@ fn render_thumb(page: &Page, key: Key, width: u32) -> Option<Output> {
     let h = thumb_height(page.size(), width);
     let mut pixels: Vec<Color32> = bytemuck::allocation::zeroed_vec((width * h) as usize);
     Bitmap::new(bytemuck::cast_slice_mut(&mut pixels), width, h)?.draw(page, [width as f64, h as f64], [0.0, 0.0]);
-    Some(Output::Image { key, size: [width as usize, h as usize], pixels: Pixels::Rgba(pixels) })
+    Some(Output::Image { key, size: [width as usize, h as usize], pixels: Pixels::tile(pixels) })
 }
 
 // TODO(perf): the QOI encode runs on the render thread, delaying tiles for the tab just
