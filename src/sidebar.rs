@@ -186,10 +186,11 @@ fn thumbnails(
     palette: &Palette,
 ) -> Option<usize> {
     let tw = thumb_width(ui.available_width());
-    if view.thumbnail_layout.as_ref().is_none_or(|cached| cached.doc != doc || cached.width != tw) {
-        view.thumbnail_layout = Some(ThumbnailLayout::new(doc, tw, layout));
-    }
-    let cached = view.thumbnail_layout.as_ref().unwrap().clone();
+    let stale = |cached: &ThumbnailLayout| cached.doc != doc || cached.width != tw;
+    let cached = match &view.thumbnail_layout {
+        Some(cached) if !stale(cached) => cached.clone(),
+        _ => view.thumbnail_layout.insert(ThumbnailLayout::new(doc, tw, layout)).clone(),
+    };
     let tops = cached.tops;
     let content_height = cached.height;
     let follow = view.sidebar_page != Some(view.current_page);

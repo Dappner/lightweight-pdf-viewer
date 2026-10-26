@@ -167,7 +167,7 @@ impl DocLayout {
     }
 
     pub fn page_size(&self, page: usize) -> Vec2 {
-        self.sizes[page]
+        self.sizes.get(page).copied().unwrap_or_default()
     }
 
     fn row_count(&self) -> usize {
