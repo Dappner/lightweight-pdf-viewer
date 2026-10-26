@@ -17,10 +17,10 @@ Most PDF apps are heavy. This one does one thing: shows PDFs, quickly and cheapl
 
 ## Install
 
-You need [Rust](https://rustup.rs) installed.
+You need [Rust](https://rustup.rs) and the Xcode Command Line Tools (`xcode-select --install`).
 
 ```sh
-git clone <this repo>
+git clone https://github.com/Dappner/lightweight-pdf-viewer.git
 cd lightweight-pdf-viewer
 ./scripts/bundle.sh --install
 ```
@@ -88,8 +88,12 @@ cargo bench --bench search -- a.pdf b.pdf
 
 ## Requirements
 
-macOS 11 or later. It uses macOS's own PDF engine, so it runs on macOS only.
+macOS 11 or later. It uses macOS's own PDF engine, so it runs on macOS only. Elsewhere the crate still builds with a stand-in engine, so the portable core can be tested and benchmarked.
+
+## Contributing
+
+Issues and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-MIT
+MIT; see [LICENSE](LICENSE). `src/case_folding.rs` is generated from Unicode's CaseFolding.txt, under the [Unicode License v3](https://www.unicode.org/license.txt).

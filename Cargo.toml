@@ -3,6 +3,14 @@ name = "lightweight-pdf-viewer"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+description = "A small, fast PDF viewer for macOS, with tabs"
+repository = "https://github.com/Dappner/lightweight-pdf-viewer"
+readme = "README.md"
+keywords = ["pdf", "viewer", "macos"]
+categories = ["gui"]
+rust-version = "1.90"
+# An app, not a library.
+publish = false
 
 [dependencies]
 # Zero-copy pixel buffers: tiles are drawn straight into the `Color32`s egui uploads.
