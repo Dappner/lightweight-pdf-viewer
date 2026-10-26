@@ -1006,7 +1006,7 @@ impl Worker {
         let mut highlights = Vec::new();
         match job {
             Job::Match => {
-                let query = self.query.clone().unwrap();
+                let Some(query) = self.query.clone() else { return (counts, highlights) };
                 let end = (self.match_cursor + MATCH_CHUNK).min(self.cache.slots.len());
                 for p in self.match_cursor..end {
                     if let Slot::Cached(text) = &self.cache.slots[p]

@@ -365,6 +365,8 @@ struct UnsavedRef<'a> {
 
 /// One page's boxes to write into the PDF.
 pub struct PageSave {
+    // Read by the macOS engine's save.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub page: u32,
     /// Each box with its rect as fractions of the page upright.
     pub boxes: Vec<(TextBox, Rect)>,
