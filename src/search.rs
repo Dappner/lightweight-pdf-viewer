@@ -472,7 +472,13 @@ impl Search {
         }
         self.update_pending();
         self.shown = focus;
-        self.with_inbox(|inbox| inbox.focus = focus as u32);
+        if let Some((lock, cvar)) = self.channel.as_deref() {
+            let mut inbox = lock.lock().unwrap();
+            if inbox.focus != focus as u32 {
+                inbox.focus = focus as u32;
+                cvar.notify_one();
+            }
+        }
     }
 
     fn apply_query(&mut self, anchor: Anchor) {
@@ -639,7 +645,7 @@ impl Search {
 
     /// Whether the current match's rectangles are known.
     fn has_current_rects(&self, hit: Hit) -> bool {
-        self.highlights.get(&hit.page).is_some_and(|p| hit.index < p.covered)
+        self.has_page_rects(hit)
             || self.current_rects.as_ref().is_some_and(|(h, _)| *h == hit)
     }
 
@@ -729,11 +735,8 @@ impl Search {
             None => format!("{}{more} matches", self.matches),
             Some(hit) => {
                 let before = &self.counts[..hit.page as usize];
-                match before.iter().copied().collect::<Option<Vec<u32>>>() {
-                    Some(before) => {
-                        let rank = before.iter().map(|&c| c as u64).sum::<u64>() + hit.index as u64 + 1;
-                        format!("{rank} of {}{more}", self.matches)
-                    }
+                match before.iter().try_fold(0u64, |sum, c| c.map(|c| sum + c as u64)) {
+                    Some(before) => format!("{} of {}{more}", before + hit.index as u64 + 1, self.matches),
                     None => format!("{}{more} matches", self.matches),
                 }
             }
@@ -929,7 +932,13 @@ impl Worker {
                     }
                     // Nothing to do (or paused) until the query changes or highlights are
                     // wanted: let go of the pages PDFKit holds parsed meanwhile.
-                    self.close_doc();
+                    // Without holding the lock the UI takes every frame.
+                    if self.doc.is_some() || !self.touched.is_empty() {
+                        drop(inbox);
+                        self.close_doc();
+                        inbox = lock.lock().unwrap();
+                        continue;
+                    }
                     inbox = cvar.wait(inbox).unwrap();
                 }
             };
@@ -1083,8 +1092,8 @@ impl Worker {
                 let source = page.and_then(|page| page.text());
                 let text = PageText::new(source.as_deref().unwrap_or(""));
                 self.extracted += 1;
-                // A page PDFKit couldn't open isn't known to be empty.
-                if !self.failed
+                // A page PDFKit couldn't open or read isn't known to be empty.
+                if source.is_some()
                     && let Some(index) = &mut self.index
                 {
                     index.save(p as usize, &text);

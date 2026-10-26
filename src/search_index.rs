@@ -173,8 +173,7 @@ impl Index {
     fn try_write(&mut self) {
         match self.file.try_lock() {
             Ok(()) => self.writer = true,
-            Err(TryLockError::WouldBlock) => return,
-            Err(TryLockError::Error(_)) => return,
+            Err(TryLockError::WouldBlock | TryLockError::Error(_)) => return,
         }
         if !self.scan() {
             self.pages.iter_mut().for_each(|p| *p = None);
