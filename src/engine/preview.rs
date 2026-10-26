@@ -154,7 +154,15 @@ fn verify(a: &Dictionary, b: &EditedBox) -> Result<()> {
     Ok(())
 }
 
-fn archive(encoded: &[u8]) -> Result<(Value, usize)> {
+/// An Apple annotation archive that `archive` has checked: the plist, the index of its text box
+/// object in `$objects`, and that object's scale.
+struct Archive {
+    value: Value,
+    root: usize,
+    scale: f64,
+}
+
+fn archive(encoded: &[u8]) -> Result<Archive> {
     let bytes = check(STANDARD.decode(encoded))?;
     let value = check(Value::from_reader(Cursor::new(bytes)))?;
     let dict = value.as_dictionary().ok_or("Expected an Apple annotation archive")?;
@@ -186,22 +194,18 @@ fn archive(encoded: &[u8]) -> Result<(Value, usize)> {
     if !scale.is_finite() || scale < 0.0 {
         return Err("Invalid Apple annotation scale".into());
     }
-    Ok((value, root))
+    Ok(Archive { value, root, scale })
 }
 
 fn archive_scale(encoded: &[u8]) -> Result<f64> {
-    let (value, root) = archive(encoded)?;
-    Ok(value.as_dictionary().unwrap()["$objects"].as_array().unwrap()[root].as_dictionary().unwrap()[SCALE]
-        .as_real()
-        .unwrap())
+    Ok(archive(encoded)?.scale)
 }
 
 fn normalize_archive(encoded: &[u8]) -> Result<Vec<u8>> {
-    let (mut value, root) = archive(encoded)?;
-    value.as_dictionary_mut().unwrap().get_mut("$objects").unwrap().as_array_mut().unwrap()[root]
-        .as_dictionary_mut()
-        .unwrap()
-        .insert(SCALE.into(), Value::Real(1.0));
+    let Archive { mut value, root, .. } = archive(encoded)?;
+    let objects = value.as_dictionary_mut().and_then(|d| d.get_mut("$objects")).and_then(Value::as_array_mut);
+    let root_dict = objects.and_then(|o| o.get_mut(root)).and_then(Value::as_dictionary_mut);
+    root_dict.ok_or("Invalid Apple annotation root")?.insert(SCALE.into(), Value::Real(1.0));
     let mut bytes = Vec::new();
     check(value.to_writer_binary(&mut bytes))?;
     Ok(STANDARD.encode(bytes).into_bytes())
@@ -299,12 +303,12 @@ mod tests {
         for scale in [0.0, 0.564240790655885, 1.0, 2.0] {
             let original = blob(scale);
             let corrected = normalize_archive(&original).unwrap();
-            let (mut expected, root) = archive(&original).unwrap();
+            let Archive { value: mut expected, root, .. } = archive(&original).unwrap();
             expected.as_dictionary_mut().unwrap().get_mut("$objects").unwrap().as_array_mut().unwrap()[root]
                 .as_dictionary_mut()
                 .unwrap()
                 .insert(SCALE.into(), Value::Real(1.0));
-            assert_eq!(archive(&corrected).unwrap().0, expected);
+            assert_eq!(archive(&corrected).unwrap().value, expected);
         }
         assert!(normalize_archive(b"not an archive").is_err());
     }
@@ -328,7 +332,7 @@ mod tests {
             let (path, selected) = fixture(if missing_scale { "missing-scale" } else { "unknown-class" });
             let mut doc = Document::load(&path).unwrap();
             let (id, _) = annotation(&doc, &selected).unwrap();
-            let (mut value, root) = archive(&blob(0.56424)).unwrap();
+            let Archive { mut value, root, .. } = archive(&blob(0.56424)).unwrap();
             let objects = value.as_dictionary_mut().unwrap().get_mut("$objects").unwrap().as_array_mut().unwrap();
             if missing_scale {
                 objects[root].as_dictionary_mut().unwrap().remove(SCALE);

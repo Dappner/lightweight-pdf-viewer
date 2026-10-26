@@ -254,7 +254,7 @@ fn quality(file: &str, pages: &[usize], width: f64) {
                 let mut b = vec![];
                 render_page(&page, width, whole(BASE), &mut |t| a = t);
                 render_page(&page, width, whole(v), &mut |t| b = t);
-                for (pa, pb) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+                for (pa, pb) in a.as_chunks::<4>().0.iter().zip(b.as_chunks::<4>().0) {
                     let d = (0..3).map(|i| pa[i].abs_diff(pb[i])).max().unwrap();
                     differing += (d > 2) as usize;
                     max = max.max(d);
@@ -346,8 +346,12 @@ fn gray(file: &str, count: usize, width: f64) {
             let page = CGPDFDocument::page(Some(&cg), p + 1).unwrap();
             render_page(&page, width, Variant { mode: Mode::Row, ..BASE }, &mut |tile| {
                 let start = Instant::now();
-                let spread =
-                    tile.chunks_exact(4).map(|px| px[0].max(px[1]).max(px[2]) - px[0].min(px[1]).min(px[2])).max();
+                let spread = tile
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|px| px[0].max(px[1]).max(px[2]) - px[0].min(px[1]).min(px[2]))
+                    .max();
                 check += start.elapsed();
                 let spread = spread.unwrap_or(0);
                 tiles += 1;

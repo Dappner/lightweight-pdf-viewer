@@ -58,7 +58,7 @@ pub fn show(ui: &mut Ui, tool: Tool, style: &Style, palette: &Palette) -> Option
     let mut action = None;
     let rect = ui.max_rect();
     ui.painter().rect_filled(rect, 0.0, palette.content);
-    ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, palette.separator));
+    ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0_f32, palette.separator));
     let frame = Frame::NONE.inner_margin(Margin::symmetric(10, 0));
     frame.show(ui, |ui| {
         ui.set_height(HEIGHT);
@@ -118,7 +118,7 @@ fn tool_button(ui: &mut Ui, tool: Tool, chosen: bool, highlight: [u8; 3], palett
         painter.rect_filled(rect, CornerRadius::same(5), if chosen { palette.separator } else { palette.hover });
     }
     let color = if chosen { palette.text } else { palette.text_weak };
-    let stroke = Stroke::new(1.3, color);
+    let stroke = Stroke::new(1.3_f32, color);
     let c = rect.center();
     match tool {
         Tool::Select => {
@@ -151,12 +151,12 @@ fn swatch(ui: &mut Ui, color: [u8; 3], chosen: bool, palette: &Palette) -> Respo
     let painter = ui.painter();
     let center = rect.center();
     if chosen {
-        painter.circle_stroke(center, SWATCH / 2.0, Stroke::new(1.5, palette.accent));
+        painter.circle_stroke(center, SWATCH / 2.0, Stroke::new(1.5_f32, palette.accent));
     }
     painter.circle_filled(center, SWATCH / 2.0 - 3.0, Color32::from_rgb(r, g, b));
-    painter.circle_stroke(center, SWATCH / 2.0 - 3.0, Stroke::new(0.5, palette.separator));
+    painter.circle_stroke(center, SWATCH / 2.0 - 3.0, Stroke::new(0.5_f32, palette.separator));
     if response.hovered() && !chosen {
-        painter.circle_stroke(center, SWATCH / 2.0, Stroke::new(1.0, palette.text_weak));
+        painter.circle_stroke(center, SWATCH / 2.0, Stroke::new(1.0_f32, palette.text_weak));
     }
     response
 }
@@ -164,6 +164,6 @@ fn swatch(ui: &mut Ui, color: [u8; 3], chosen: bool, palette: &Palette) -> Respo
 fn divider(ui: &mut Ui, palette: &Palette) {
     ui.add_space(4.0);
     let (rect, _) = ui.allocate_exact_size(vec2(1.0, 16.0), Sense::hover());
-    ui.painter().vline(rect.center().x, rect.y_range(), Stroke::new(1.0, palette.separator));
+    ui.painter().vline(rect.center().x, rect.y_range(), Stroke::new(1.0_f32, palette.separator));
     ui.add_space(4.0);
 }

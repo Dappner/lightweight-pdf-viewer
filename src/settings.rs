@@ -55,7 +55,7 @@ impl Settings {
         let area = Modal::default_area(Id::new("settings")).anchor(Align2::CENTER_TOP, vec2(0.0, TOP));
         let frame = Frame::new()
             .fill(palette.content)
-            .stroke(Stroke::new(1.0, palette.separator))
+            .stroke(Stroke::new(1.0_f32, palette.separator))
             .corner_radius(CornerRadius::same(10))
             .inner_margin(Margin::same(16));
         let modal = Modal::new(Id::new("settings"))
@@ -141,9 +141,7 @@ impl Settings {
         }
         command
     }
-}
 
-impl Settings {
     /// The footprint, and what it is made of. The window buffers are an estimate and the
     /// rest is what the other rows leave, so the rows add up to the total.
     fn usage_rows(&self, ui: &mut Ui, palette: &Palette, status: &Status) {

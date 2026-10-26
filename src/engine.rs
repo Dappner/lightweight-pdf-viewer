@@ -2,6 +2,8 @@
 //! thread, and reads their text for search. CoreGraphics and PDFKit on macOS; elsewhere a
 //! synthetic stand-in, so everything else can be built, tested and benchmarked on any platform.
 
+// Only the macOS engine saves; the synthetic one never does.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SaveOutcome {
     Saved,

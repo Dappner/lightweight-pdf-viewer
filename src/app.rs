@@ -238,6 +238,7 @@ impl eframe::App for App {
             tab.text_boxes.finish_saving();
             state.shared.remember(tab);
         }
+        crate::text_boxes::wait_for_detached_saves();
         state.save_session(true);
     }
 }
@@ -424,7 +425,7 @@ impl State {
             }
         };
         let tab = self.windows[from].take(ctx, &mut self.shared, index);
-        self.windows[to].adopt(ctx, &mut self.shared, tab, at);
+        self.windows[to].adopt(ctx, &mut self.shared, tab, at, true);
         let to_serial = self.windows[to].serial;
         if self.windows[from].tabs.is_empty() {
             self.close_window(ctx, from);
@@ -440,11 +441,10 @@ impl State {
         let others: Vec<u64> = self.windows.iter().map(|w| w.serial).filter(|s| *s != target).collect();
         for serial in others {
             let Some(from) = self.index_of(serial) else { continue };
-            while !self.windows[from].tabs.is_empty() {
-                let tab = self.windows[from].take(ctx, &mut self.shared, 0);
+            for tab in self.windows[from].take_all() {
                 let to = self.index_of(target).unwrap_or(0);
                 let end = self.windows[to].tabs.len();
-                self.windows[to].adopt(ctx, &mut self.shared, tab, end);
+                self.windows[to].adopt(ctx, &mut self.shared, tab, end, false);
             }
             self.close_window(ctx, from);
         }
@@ -702,9 +702,10 @@ impl State {
                 .map(|s| s.qoi.capacity())
                 .sum(),
             find: active.and_then(|t| t.search.as_ref()).map(|s| s.status().unwrap_or_default()),
-            find_reads: active
-                .and_then(|t| t.search.as_ref())
-                .map_or((0, 0), |s| (s.stats().loaded, s.stats().extracted)),
+            find_reads: active.and_then(|t| t.search.as_ref()).map_or((0, 0), |s| {
+                let stats = s.stats();
+                (stats.loaded, stats.extracted)
+            }),
             find_done: active.and_then(|t| t.search.as_ref()).is_some_and(|s| s.done()),
             search_workers: self
                 .windows
@@ -762,6 +763,7 @@ impl State {
         menu::set_layout(self.windows[self.focused].layout());
         menu::set_annotating(self.windows[self.focused].annotating());
         menu::set_unsaved(self.windows[self.focused].unsaved());
+        menu::set_tabs(self.windows[self.focused].tabs.len());
 
         let changed = external || close || !requests.is_empty();
         for request in requests {

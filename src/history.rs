@@ -66,24 +66,36 @@ impl History {
 
     /// Records that `path` was opened at `now` (Unix seconds).
     pub fn visit(&mut self, path: &Path, now: u64) {
-        match self.entries.iter_mut().find(|e| e.path == path) {
-            Some(entry) => {
-                entry.score = entry.score_at(now) + 1.0;
-                entry.updated = now;
-            }
-            None => self.entries.push(Entry {
-                path: path.to_path_buf(),
-                score: 1.0,
-                updated: now,
-                place: None,
-                rotations: Rotations::default(),
-            }),
-        }
+        self.upsert(path, now, |entry| {
+            entry.score = entry.score_at(now) + 1.0;
+            entry.updated = now;
+            true
+        });
         if self.entries.len() > MAX_ENTRIES {
             self.sort(now);
             self.entries.truncate(MAX_ENTRIES);
+            self.save();
         }
-        self.save();
+    }
+
+    /// Updates `path`'s entry, adding an unscored one first if there is none, and saves if
+    /// `update` reports a change (or the entry is new).
+    fn upsert(&mut self, path: &Path, now: u64, update: impl FnOnce(&mut Entry) -> bool) {
+        let found = self.entries.iter().position(|e| e.path == path);
+        let index = found.unwrap_or_else(|| {
+            let entry = Entry {
+                path: path.to_path_buf(),
+                score: 0.0,
+                updated: now,
+                place: None,
+                rotations: Rotations::default(),
+            };
+            self.entries.push(entry);
+            self.entries.len() - 1
+        });
+        if update(&mut self.entries[index]) || found.is_none() {
+            self.save();
+        }
     }
 
     /// Where `path` was left, if it has been open before.
@@ -93,18 +105,11 @@ impl History {
 
     /// Records where `path` was left. Doesn't count as opening it.
     pub fn remember(&mut self, path: &Path, place: Place, now: u64) {
-        match self.entries.iter_mut().find(|e| e.path == path) {
-            Some(entry) if entry.place == Some(place) => return,
-            Some(entry) => entry.place = Some(place),
-            None => self.entries.push(Entry {
-                path: path.to_path_buf(),
-                score: 0.0,
-                updated: now,
-                place: Some(place),
-                rotations: Rotations::default(),
-            }),
-        }
-        self.save();
+        self.upsert(path, now, |entry| {
+            let changed = entry.place != Some(place);
+            entry.place = Some(place);
+            changed
+        });
     }
 
     /// How `path`'s pages were last turned; upright if they never were.
@@ -114,18 +119,11 @@ impl History {
 
     /// Records how `path`'s pages are turned. Doesn't count as opening it.
     pub fn set_rotations(&mut self, path: &Path, rotations: &Rotations, now: u64) {
-        match self.entries.iter_mut().find(|e| e.path == path) {
-            Some(entry) if entry.rotations == *rotations => return,
-            Some(entry) => entry.rotations = rotations.clone(),
-            None => self.entries.push(Entry {
-                path: path.to_path_buf(),
-                score: 0.0,
-                updated: now,
-                place: None,
-                rotations: rotations.clone(),
-            }),
-        }
-        self.save();
+        self.upsert(path, now, |entry| {
+            let changed = entry.rotations != *rotations;
+            entry.rotations = rotations.clone();
+            changed
+        });
     }
 
     /// Every recorded file, highest-ranked first.

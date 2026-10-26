@@ -354,7 +354,7 @@ impl Canvas<'_> {
                             grey::paint(painter, image, rect);
                         }
                     }
-                    painter.rect_stroke(rect, 0.0, Stroke::new(1.0, page_border), StrokeKind::Outside);
+                    painter.rect_stroke(rect, 0.0, Stroke::new(1.0_f32, page_border), StrokeKind::Outside);
                     match links.get(&(page as u32)) {
                         None => wants.visible.push(Key::Links { doc, page: page as u32 }),
                         Some(page_links) => {
@@ -785,7 +785,7 @@ fn show_text_boxes(
     let accent = ui.visuals().selection.stroke.color;
     let mut actions = Vec::new();
     for &(page, rect) in pages {
-        let Some(list) = boxes.page(page).map(<[TextBox]>::to_vec) else { continue };
+        let Some(list) = boxes.page(page) else { continue };
         let rotation = rotations.of(page);
         let shown = layout.page_size(page as usize);
         let upright = if rotation.degrees() % 180 == 90 { vec2(shown.y, shown.x) } else { shown };
@@ -816,9 +816,14 @@ fn show_text_boxes(
                 .interact(area, ui.id().with(("text box", doc, page, index)), Sense::click_and_drag())
                 .on_hover_cursor(CursorIcon::Grab);
             if boxes.selected == Some(r) {
-                ui.painter().rect_stroke(area, 0.0, Stroke::new(1.5, accent), StrokeKind::Outside);
+                ui.painter().rect_stroke(area, 0.0, Stroke::new(1.5_f32, accent), StrokeKind::Outside);
             } else if response.hovered() {
-                ui.painter().rect_stroke(area, 0.0, Stroke::new(1.0, accent.gamma_multiply(0.5)), StrokeKind::Outside);
+                ui.painter().rect_stroke(
+                    area,
+                    0.0,
+                    Stroke::new(1.0_f32, accent.gamma_multiply(0.5)),
+                    StrokeKind::Outside,
+                );
             }
             if response.double_clicked() {
                 actions.push(BoxAction::Edit(r));
@@ -876,9 +881,10 @@ fn show_text_boxes(
                 }
             });
         }
+        // Only the box being typed into is cloned: `editing` needs the boxes mutably.
+        let existing = typing_into.flatten().and_then(|i| boxes.page(page)?.get(i)).cloned();
         if let Some(editing) = boxes.editing.as_mut().filter(|e| e.page == page) {
-            let existing = editing.index.and_then(|i| list.get(i));
-            match type_into(ui, editing, existing, rect, rotation, scale, accent, doc) {
+            match type_into(ui, editing, existing.as_ref(), rect, rotation, scale, accent, doc) {
                 Typing::Going => {}
                 Typing::Done => actions.push(BoxAction::Finish),
                 Typing::Discard => actions.push(BoxAction::Discard),
@@ -994,7 +1000,7 @@ fn type_into(
         .desired_rows(1);
     ui.painter().rect_filled(area, 0.0, Color32::from_white_alpha(140));
     let response = ui.put(area, field);
-    ui.painter().rect_stroke(area, 0.0, Stroke::new(1.5, accent), StrokeKind::Outside);
+    ui.painter().rect_stroke(area, 0.0, Stroke::new(1.5_f32, accent), StrokeKind::Outside);
     // The field is upright, so on a turned page moving its left side would move it along the
     // page's other axis: only its right side is offered there.
     let edges: &[Edge] = if rotation.degrees() == 0 { &[Edge::Left, Edge::Right] } else { &[Edge::Right] };

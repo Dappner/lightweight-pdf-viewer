@@ -21,6 +21,8 @@
 //! macOS only: it reads text with PDFKit, which the synthetic engine elsewhere has no stand-in for.
 
 #[cfg(target_os = "macos")]
+mod common;
+#[cfg(target_os = "macos")]
 #[path = "search_spike/macos.rs"]
 mod macos;
 

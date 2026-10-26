@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+use crate::common::{PeakSampler, footprint_mb};
 
 use eframe::egui;
 use lightweight_pdf_viewer::search::{CACHE_BUDGET, Search};
@@ -20,13 +20,13 @@ const TIMEOUT: Duration = Duration::from_secs(120);
 
 pub fn main() {
     let files: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with("--")).collect();
+    assert!(!files.is_empty(), "usage: cargo bench --bench search -- a.pdf [...]");
     if let Ok(budget) = std::env::var("SEARCH_BUDGET") {
         let index = std::env::var("SEARCH_INDEX").ok().filter(|s| !s.is_empty()).map(PathBuf::from);
         let warm = std::env::var("SEARCH_WARM").is_ok();
         let ok = run(&files[0], budget.parse().unwrap(), index, warm);
         std::process::exit(if ok { 0 } else { 1 });
     }
-    assert!(!files.is_empty(), "usage: cargo bench --bench search -- a.pdf [...]");
     let index = std::env::temp_dir().join(format!("lightweight-pdf-bench-index-{}", std::process::id()));
     let mut failed = 0;
     for file in &files {
@@ -271,47 +271,6 @@ fn pump(
         }
         std::thread::sleep(Duration::from_millis(1));
     }
-}
-
-struct PeakSampler {
-    stop: Arc<AtomicBool>,
-    peak: Arc<AtomicU64>,
-    thread: std::thread::JoinHandle<()>,
-}
-
-impl PeakSampler {
-    fn start() -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let peak = Arc::new(AtomicU64::new(footprint_mb().to_bits()));
-        let thread = {
-            let (stop, peak) = (stop.clone(), peak.clone());
-            std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    let now = footprint_mb();
-                    if now > f64::from_bits(peak.load(Ordering::Relaxed)) {
-                        peak.store(now.to_bits(), Ordering::Relaxed);
-                    }
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-            })
-        };
-        Self { stop, peak, thread }
-    }
-
-    fn finish(self) -> f64 {
-        self.stop.store(true, Ordering::Relaxed);
-        self.thread.join().unwrap();
-        f64::from_bits(self.peak.load(Ordering::Relaxed)).max(footprint_mb())
-    }
-}
-
-fn footprint_mb() -> f64 {
-    let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
-    let ok = unsafe {
-        libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V2, &mut info as *mut _ as *mut libc::rusage_info_t)
-    };
-    assert_eq!(ok, 0, "proc_pid_rusage failed");
-    info.ri_phys_footprint as f64 / 1_048_576.0
 }
 
 fn dir_mb(dir: &std::path::Path) -> f64 {

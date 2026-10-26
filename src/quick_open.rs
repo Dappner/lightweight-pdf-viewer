@@ -15,6 +15,8 @@ use eframe::egui::{
 
 use crate::theme::Palette;
 
+/// Identifies the modal and its area to egui.
+const ID: &str = "quick_open";
 const WIDTH: f32 = 560.0;
 const TOP: f32 = 80.0;
 const ROW_HEIGHT: f32 = 38.0;
@@ -45,13 +47,13 @@ impl QuickOpen {
 
     pub fn show(&mut self, ctx: &Context, palette: &Palette) -> Option<Outcome> {
         let width = WIDTH.min(ctx.content_rect().width() - 32.0);
-        let area = Modal::default_area(Id::new("quick_open")).anchor(Align2::CENTER_TOP, vec2(0.0, TOP));
+        let area = Modal::default_area(Id::new(ID)).anchor(Align2::CENTER_TOP, vec2(0.0, TOP));
         let frame = Frame::new()
             .fill(palette.content)
-            .stroke(Stroke::new(1.0, palette.separator))
+            .stroke(Stroke::new(1.0_f32, palette.separator))
             .corner_radius(CornerRadius::same(10))
             .inner_margin(Margin::same(8));
-        let modal = Modal::new(Id::new("quick_open"))
+        let modal = Modal::new(Id::new(ID))
             .area(area)
             .frame(frame)
             .backdrop_color(Color32::from_black_alpha(60))

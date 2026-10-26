@@ -186,10 +186,11 @@ fn thumbnails(
     palette: &Palette,
 ) -> Option<usize> {
     let tw = thumb_width(ui.available_width());
-    if view.thumbnail_layout.as_ref().is_none_or(|cached| cached.doc != doc || cached.width != tw) {
-        view.thumbnail_layout = Some(ThumbnailLayout::new(doc, tw, layout));
-    }
-    let cached = view.thumbnail_layout.as_ref().unwrap().clone();
+    let stale = |cached: &ThumbnailLayout| cached.doc != doc || cached.width != tw;
+    let cached = match &view.thumbnail_layout {
+        Some(cached) if !stale(cached) => cached.clone(),
+        _ => view.thumbnail_layout.insert(ThumbnailLayout::new(doc, tw, layout)).clone(),
+    };
     let tops = cached.tops;
     let content_height = cached.height;
     let follow = view.sidebar_page != Some(view.current_page);
@@ -231,7 +232,7 @@ fn thumbnails(
                 None if !failed.contains(&key) => wants.thumbs.push(key),
                 None => {}
             }
-            painter.rect_stroke(thumb, 0.0, Stroke::new(1.0, palette.page_border), StrokeKind::Outside);
+            painter.rect_stroke(thumb, 0.0, Stroke::new(1.0_f32, palette.page_border), StrokeKind::Outside);
 
             let label_center = pos2(center_x, thumb.bottom() + LABEL_HEIGHT / 2.0 + 2.0);
             let font = FontId::proportional(11.0);

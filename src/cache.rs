@@ -49,6 +49,9 @@ impl TextureCache {
     /// Stops protecting what a closed window showed.
     pub fn forget_window(&mut self, window: u64) {
         self.latest.retain(|(w, _)| *w != window);
+        for e in self.entries.values_mut() {
+            e.used_by.retain(|(w, _)| *w != window);
+        }
     }
 
     pub fn set_budget(&mut self, budget: usize) {
@@ -111,12 +114,15 @@ impl TextureCache {
         if self.bytes <= self.budget {
             return evicted;
         }
-        let mut candidates: Vec<(u64, Key)> = self
-            .entries
-            .iter()
-            .filter(|(k, e)| !awaited.contains(*k) && !e.used_by.iter().any(|used| self.latest.contains(used)))
-            .map(|(k, e)| (e.last_used, *k))
-            .collect();
+        // Pairs from frames a window has since redrawn no longer protect anything.
+        let latest = &self.latest;
+        let mut candidates: Vec<(u64, Key)> = Vec::new();
+        for (k, e) in self.entries.iter_mut() {
+            e.used_by.retain(|used| latest.contains(used));
+            if e.used_by.is_empty() && !awaited.contains(k) {
+                candidates.push((e.last_used, *k));
+            }
+        }
         candidates.sort_unstable_by_key(|(used, _)| *used);
         for (_, key) in candidates {
             if self.bytes <= self.budget {

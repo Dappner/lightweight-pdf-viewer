@@ -1,7 +1,7 @@
 use std::process::Command;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+use crate::common::{PeakSampler, footprint_mb};
 
 use objc2::AnyThread;
 use objc2::rc::{Retained, autoreleasepool};
@@ -17,11 +17,11 @@ const REOPEN_EVERY: usize = 16;
 
 pub fn main() {
     let files: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with("--")).collect();
+    assert!(!files.is_empty(), "usage: cargo bench --bench text_spike -- a.pdf [...]");
     if std::env::var("SPIKE_CHILD").is_ok() {
         child(&files[0]);
         return;
     }
-    assert!(!files.is_empty(), "usage: cargo bench --bench text_spike -- a.pdf [...]");
     for file in &files {
         let name = std::path::Path::new(file).file_name().unwrap().to_string_lossy();
         let pages = unsafe { open(file).pageCount() };
@@ -193,47 +193,6 @@ fn whole_document(path: &str, count: usize) {
 
 // ---------------------------------------------------------------------------------------------
 // Measurement helpers
-
-struct PeakSampler {
-    stop: Arc<AtomicBool>,
-    peak: Arc<AtomicU64>,
-    thread: std::thread::JoinHandle<()>,
-}
-
-impl PeakSampler {
-    fn start() -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let peak = Arc::new(AtomicU64::new(footprint_mb().to_bits()));
-        let thread = {
-            let (stop, peak) = (stop.clone(), peak.clone());
-            std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    let now = footprint_mb();
-                    if now > f64::from_bits(peak.load(Ordering::Relaxed)) {
-                        peak.store(now.to_bits(), Ordering::Relaxed);
-                    }
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-            })
-        };
-        Self { stop, peak, thread }
-    }
-
-    fn finish(self) -> f64 {
-        self.stop.store(true, Ordering::Relaxed);
-        self.thread.join().unwrap();
-        f64::from_bits(self.peak.load(Ordering::Relaxed)).max(footprint_mb())
-    }
-}
-
-fn footprint_mb() -> f64 {
-    let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
-    let ok = unsafe {
-        libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V2, &mut info as *mut _ as *mut libc::rusage_info_t)
-    };
-    assert_eq!(ok, 0, "proc_pid_rusage failed");
-    info.ri_phys_footprint as f64 / 1_048_576.0
-}
 
 fn mb(bytes: usize) -> f64 {
     bytes as f64 / 1_048_576.0

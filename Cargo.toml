@@ -3,6 +3,14 @@ name = "lightweight-pdf-viewer"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+description = "A small, fast PDF viewer for macOS, with tabs"
+repository = "https://github.com/Dappner/lightweight-pdf-viewer"
+readme = "README.md"
+keywords = ["pdf", "viewer", "macos"]
+categories = ["gui"]
+rust-version = "1.90"
+# An app, not a library.
+publish = false
 
 [dependencies]
 # Zero-copy pixel buffers: tiles are drawn straight into the `Color32`s egui uploads.
@@ -47,8 +55,13 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
-[dev-dependencies]
+# Vulkan, so the GPU tests can find a device off macOS too (Mesa's drivers on Linux).
+# libc for the session bench's CPU time; on macOS the app's own dependency serves.
+[target.'cfg(not(target_os = "macos"))'.dev-dependencies]
+wgpu = { version = "27.0.1", default-features = false, features = ["vulkan"] }
 libc = "0.2.189"
+
+[dev-dependencies]
 png = "0.18.1"
 pollster = "0.4.0"
 

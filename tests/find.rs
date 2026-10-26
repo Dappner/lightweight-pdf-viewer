@@ -3,108 +3,18 @@
 #![cfg(target_os = "macos")]
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use eframe::egui::{self, Event, Key, Modifiers, RawInput, Rect, ViewportId, ViewportInfo, pos2, vec2};
-use lightweight_pdf_viewer::app::{App, Stats};
-use lightweight_pdf_viewer::{config::Config, history::History};
+use eframe::egui::{Event, Key, Modifiers};
+use lightweight_pdf_viewer::config::Config;
+
+mod common;
+use common::{Harness, placed_text_pdf};
 
 /// Writes a PDF with one line of Helvetica text per page and returns its path.
 fn text_pdf(name: &str, lines: &[&str]) -> PathBuf {
     let pages: Vec<Vec<(&str, i32)>> = lines.iter().map(|l| vec![(*l, 400)]).collect();
     placed_text_pdf(name, &pages)
-}
-
-/// Writes a PDF of US Letter pages, each with lines of text at the given heights (points
-/// from the bottom), and returns its path.
-fn placed_text_pdf(name: &str, page_lines: &[Vec<(&str, i32)>]) -> PathBuf {
-    let pages = page_lines.len();
-    let mut objects = vec![
-        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
-        format!(
-            "<< /Type /Pages /Count {pages} /Kids [{}] >>",
-            (0..pages).map(|i| format!("{} 0 R", 4 + i * 2)).collect::<Vec<_>>().join(" ")
-        ),
-        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
-    ];
-    for (i, lines) in page_lines.iter().enumerate() {
-        let content: String =
-            lines.iter().map(|(line, y)| format!("BT /F1 18 Tf 72 {y} Td ({line}) Tj ET\n")).collect();
-        objects.push(format!(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents {} 0 R >>",
-            5 + i * 2
-        ));
-        objects.push(format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()));
-    }
-    let mut pdf = b"%PDF-1.4\n".to_vec();
-    let mut offsets = Vec::new();
-    for (i, object) in objects.iter().enumerate() {
-        offsets.push(pdf.len());
-        pdf.extend(format!("{} 0 obj\n{object}\nendobj\n", i + 1).bytes());
-    }
-    let xref = pdf.len();
-    pdf.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).bytes());
-    for offset in offsets {
-        pdf.extend(format!("{offset:010} 00000 n \n").bytes());
-    }
-    pdf.extend(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objects.len() + 1).bytes());
-    let path = std::env::temp_dir().join(format!("lightweight-pdf-viewer-{}-{name}.pdf", std::process::id()));
-    std::fs::write(&path, pdf).unwrap();
-    path
-}
-
-struct Harness {
-    ctx: egui::Context,
-    app: App,
-    time: f64,
-    focused: bool,
-}
-
-impl Harness {
-    fn new() -> Self {
-        Self::with_config(Config::default())
-    }
-
-    fn with_config(config: Config) -> Self {
-        let ctx = egui::Context::default();
-        let app = App::new(&ctx, config, History::default(), Vec::new());
-        Self { ctx, app, time: 0.0, focused: true }
-    }
-
-    fn frame(&mut self, events: Vec<Event>) {
-        self.time += 1.0 / 60.0;
-        let mut raw = RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 800.0))),
-            time: Some(self.time),
-            events,
-            ..Default::default()
-        };
-        raw.viewports.insert(
-            ViewportId::ROOT,
-            ViewportInfo { native_pixels_per_point: Some(1.0), focused: Some(self.focused), ..Default::default() },
-        );
-        let app = &mut self.app;
-        let _ = self.ctx.run(raw, |ctx| app.ui(ctx));
-    }
-
-    fn key(&mut self, key: Key, modifiers: Modifiers) {
-        self.frame(vec![Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }]);
-    }
-
-    fn wait(&mut self, what: &str, done: impl Fn(&Stats) -> bool) {
-        let start = Instant::now();
-        while !done(&self.app.stats()) {
-            let s = self.app.stats();
-            assert!(
-                start.elapsed() < Duration::from_secs(10),
-                "timed out waiting for {what}: find {:?}, page {}",
-                s.find,
-                s.current_page
-            );
-            self.frame(vec![]);
-            std::thread::sleep(Duration::from_millis(2));
-        }
-    }
 }
 
 const LINES: [&str; 8] = [
@@ -207,20 +117,10 @@ fn first_match_is_below_the_top_of_the_viewport() {
 
 #[test]
 fn finds_steps_through_and_closes() {
-    let lines = [
-        "Chapter one",
-        "filler text",
-        "the needle is here",
-        "more filler",
-        "and more",
-        "still nothing",
-        "a second NEEDLE",
-        "the end",
-    ];
-    let path = text_pdf("find", &lines);
+    let path = text_pdf("find", &LINES);
     let mut h = Harness::new();
     h.app.open(&h.ctx, path.clone());
-    h.wait("the document", |s| s.page_count == lines.len());
+    h.wait("the document", |s| s.page_count == LINES.len());
     h.frame(vec![]);
 
     h.key(Key::F, Modifiers::COMMAND);

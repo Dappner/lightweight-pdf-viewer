@@ -220,7 +220,9 @@ impl PageText {
             return None;
         }
         let runs: Vec<Run> = tail
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .map(|c| Run {
                 at: u32::from_le_bytes(c[..4].try_into().unwrap()),
                 source: u32::from_le_bytes(c[4..].try_into().unwrap()),
