@@ -372,6 +372,10 @@ mod tests {
     }
 
     fn gpu() -> Option<Gpu> {
+        // Without a backend built in for this platform, creating an instance panics.
+        if wgpu::Instance::enabled_backend_features().is_empty() {
+            return None;
+        }
         let instance = wgpu::Instance::default();
         let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
         let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).ok()?;

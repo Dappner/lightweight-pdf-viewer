@@ -47,6 +47,10 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
+# Vulkan, so the GPU tests can find a device off macOS too (Mesa's drivers on Linux).
+[target.'cfg(not(target_os = "macos"))'.dev-dependencies]
+wgpu = { version = "27.0.1", default-features = false, features = ["vulkan"] }
+
 [dev-dependencies]
 libc = "0.2.189"
 png = "0.18.1"
