@@ -1,9 +1,9 @@
 name: CI
 
+# Manual only for now: run it from the Actions tab. Add push / pull_request triggers to run it
+# on every change.
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 jobs:
   macos:
