@@ -295,6 +295,17 @@ impl Window {
         tab
     }
 
+    /// Removes every tab without activating any in turn, as when the window merges into another.
+    pub fn take_all(&mut self) -> Vec<Tab> {
+        self.parked = None;
+        self.active = 0;
+        let mut tabs = std::mem::take(&mut self.tabs);
+        for tab in &mut tabs {
+            tab.text_boxes.finish_editing();
+        }
+        tabs
+    }
+
     /// Adds a tab from another window at `index`. It becomes active if `activate` is set, or
     /// if the window had no tabs; otherwise the window keeps its active tab.
     pub fn adopt(&mut self, ctx: &Context, shared: &mut Shared, mut tab: Tab, index: usize, activate: bool) {
@@ -313,6 +324,16 @@ impl Window {
             }
             if activate {
                 self.activate(ctx, shared, index);
+            } else {
+                // A background tab here, so it holds no worker or page text.
+                let tab = &mut self.tabs[index];
+                tab.text_boxes.clear_file();
+                tab.links.clear();
+                tab.text.clear();
+                if let Some(search) = &mut tab.search {
+                    search.pause(true);
+                    search.suspend();
+                }
             }
         }
     }

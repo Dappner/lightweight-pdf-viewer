@@ -383,15 +383,25 @@ impl PageSave {
     }
 }
 
-/// How many closed tabs' saves are still running, with the condition their end signals.
-static DETACHED: (std::sync::Mutex<usize>, std::sync::Condvar) = (std::sync::Mutex::new(0), std::sync::Condvar::new());
+/// The PDFs whose closed tabs' saves are still running, with the condition their end signals.
+static DETACHED: (std::sync::Mutex<Vec<PathBuf>>, std::sync::Condvar) =
+    (std::sync::Mutex::new(Vec::new()), std::sync::Condvar::new());
 
 /// Waits for the saves of closed tabs (see [`TextBoxes::detach_saving`]), so quitting
 /// doesn't cut one off halfway through writing a PDF.
 pub fn wait_for_detached_saves() {
-    let mut running = DETACHED.0.lock().unwrap();
-    while *running > 0 {
-        running = DETACHED.1.wait(running).unwrap();
+    let mut running = DETACHED.0.lock().unwrap_or_else(|p| p.into_inner());
+    while !running.is_empty() {
+        running = DETACHED.1.wait(running).unwrap_or_else(|p| p.into_inner());
+    }
+}
+
+/// Waits for a closed tab's save of `pdf`, so reopening it reads the saved file, and that
+/// save's end doesn't remove edits made since.
+fn wait_for_detached_save(pdf: &Path) {
+    let mut running = DETACHED.0.lock().unwrap_or_else(|p| p.into_inner());
+    while running.iter().any(|p| p == pdf) {
+        running = DETACHED.1.wait(running).unwrap_or_else(|p| p.into_inner());
     }
 }
 
@@ -442,6 +452,7 @@ pub fn dir() -> Option<PathBuf> {
 impl TextBoxes {
     /// The boxes of the PDF at `pdf`, with any edits left unsaved in `dir`.
     pub fn load(pdf: &Path, dir: Option<&Path>) -> Self {
+        wait_for_detached_save(pdf);
         let store = dir.map(|d| {
             d.join(format!(
                 "{:016x}.json",
@@ -870,18 +881,27 @@ impl TextBoxes {
     pub fn detach_saving(&mut self) {
         let Some(Saving::Running(result)) = self.saving.take() else { return };
         let store = self.store.clone();
-        *DETACHED.0.lock().unwrap() += 1;
-        let spawned = std::thread::Builder::new().name("save-wait".into()).spawn(move || {
-            if let (Ok(Ok(_)), Some(store)) = (result.recv(), store) {
-                let _ = std::fs::remove_file(store);
+        let pdf = self.pdf.clone();
+        DETACHED.0.lock().unwrap_or_else(|p| p.into_inner()).push(pdf.clone());
+        let done = move || {
+            let mut running = DETACHED.0.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(i) = running.iter().position(|p| *p == pdf) {
+                running.swap_remove(i);
             }
-            *DETACHED.0.lock().unwrap() -= 1;
             DETACHED.1.notify_all();
+        };
+        let spawned = std::thread::Builder::new().name("save-wait".into()).spawn({
+            let done = done.clone();
+            move || {
+                if let (Ok(Ok(_)), Some(store)) = (result.recv(), store) {
+                    let _ = std::fs::remove_file(store);
+                }
+                done();
+            }
         });
         if spawned.is_err() {
-            // The edits stay in the store, but the count must not hold the quit forever.
-            *DETACHED.0.lock().unwrap() -= 1;
-            DETACHED.1.notify_all();
+            // The edits stay in the store, but the save must not hold the quit forever.
+            done();
         }
     }
 
@@ -1318,6 +1338,26 @@ mod tests {
         });
         boxes.finish_saving();
         assert!(!TextBoxes::load(&pdf, Some(&dir)).unsaved(), "not added again on top of the file's");
+    }
+
+    #[test]
+    fn reopening_during_a_closed_tabs_save_waits_for_it() {
+        let dir = temp_dir("reopening");
+        let pdf = pdf(&dir);
+        let mut boxes = TextBoxes::load(&pdf, Some(&dir));
+        type_box(&mut boxes, 0, "Note");
+        let (done, result) = std::sync::mpsc::channel();
+        boxes.saving = Some(Saving::Running(result));
+        boxes.detach_saving();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let _ = done.send(Ok(crate::engine::SaveOutcome::Saved));
+        });
+        let mut reopened = TextBoxes::load(&pdf, Some(&dir));
+        assert!(!reopened.unsaved(), "the saved edits aren't offered again");
+        type_box(&mut reopened, 0, "Later");
+        wait_for_detached_saves();
+        assert!(TextBoxes::load(&pdf, Some(&dir)).unsaved(), "the save's end kept the newer edit");
     }
 
     #[test]

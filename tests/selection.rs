@@ -129,17 +129,25 @@ fn select_all_copies_every_page() {
 /// text arrives, though the press is over by then.
 #[test]
 fn a_drag_over_unread_text_selects_once_it_arrives() {
-    // The text is read on another thread, so the drag may end before or after it arrives. The
-    // selection must come out the same either way, so nothing here depends on winning the race.
-    let mut h = Harness::new();
-    let path = opened(&mut h, "cold-drag", &["Selected words here", "Next page"]);
-    let (from, to) = (pos2(5.0, 100.0), pos2(995.0, 795.0));
-    h.frame(vec![Event::PointerMoved(from)]);
-    h.button(from, true);
-    h.frame(vec![Event::PointerMoved(to)]);
-    h.button(to, false);
-    assert_eq!(h.copy_once_selected().trim(), "Selected words here");
-    let _ = std::fs::remove_file(path);
+    // The text is read on another thread, which can win the race with a quick drag. Either
+    // way the selection must come out the same; try again for a drag that's over first.
+    for attempt in 0..20 {
+        let mut h = Harness::new();
+        let path = opened(&mut h, &format!("cold-drag-{attempt}"), &["Selected words here", "Next page"]);
+        let (from, to) = (pos2(5.0, 100.0), pos2(995.0, 795.0));
+        h.frame(vec![Event::PointerMoved(from)]);
+        h.button(from, true);
+        h.frame(vec![Event::PointerMoved(to)]);
+        h.button(to, false);
+        let cold = h.app.stats().text_bytes == 0;
+        assert_eq!(h.copy_once_selected().trim(), "Selected words here");
+        let _ = std::fs::remove_file(path);
+        if cold {
+            return;
+        }
+    }
+    // A machine this fast can't show the cold path; the warm one passed every time.
+    eprintln!("the text always arrived before the drag was over; the unread path went untested");
 }
 
 /// Double and triple clicks on unread text select the word and line nearest the click.

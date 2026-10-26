@@ -441,8 +441,7 @@ impl State {
         let others: Vec<u64> = self.windows.iter().map(|w| w.serial).filter(|s| *s != target).collect();
         for serial in others {
             let Some(from) = self.index_of(serial) else { continue };
-            while !self.windows[from].tabs.is_empty() {
-                let tab = self.windows[from].take(ctx, &mut self.shared, 0);
+            for tab in self.windows[from].take_all() {
                 let to = self.index_of(target).unwrap_or(0);
                 let end = self.windows[to].tabs.len();
                 self.windows[to].adopt(ctx, &mut self.shared, tab, end, false);
