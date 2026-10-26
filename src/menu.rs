@@ -1,7 +1,8 @@
 //! Native menu bar. Items queue [`Command`]s that the app runs on its next frame. AppKit
 //! matches the ⌘ shortcuts shown in the menus before key events reach egui. The page layout
 //! items show a checkmark next to the active tab's layout, and Annotate one while it's on.
-//! Revert to Saved is enabled while the active tab has unsaved edits.
+//! Revert to Saved is enabled while the active tab has unsaved edits, Close Tab while the window
+//! has a tab, and Move Tab to New Window while it has more than one.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -27,6 +28,8 @@ static LAYOUT: Mutex<Option<PageLayout>> = Mutex::new(None);
 static ANNOTATING: Mutex<bool> = Mutex::new(false);
 /// The focused window's active tab has edits not yet saved, which Revert to Saved drops.
 static UNSAVED: Mutex<bool> = Mutex::new(false);
+/// How many tabs the focused window has; Close Tab needs one, Move Tab to New Window two.
+static TABS: Mutex<usize> = Mutex::new(0);
 
 define_class!(
     // SAFETY: NSObject has no subclassing requirements and MenuTarget does not implement Drop.
@@ -70,6 +73,8 @@ fn validate(item: &NSMenuItem) -> bool {
             true
         }
         Some(Command::Revert) => *UNSAVED.lock().unwrap(),
+        Some(Command::CloseTab) => *TABS.lock().unwrap() > 0,
+        Some(Command::MoveTabToNewWindow) => *TABS.lock().unwrap() > 1,
         _ => true,
     }
 }
@@ -102,6 +107,11 @@ pub fn set_annotating(on: bool) {
 /// Tells the menu whether the active tab has edits to revert.
 pub fn set_unsaved(unsaved: bool) {
     *UNSAVED.lock().unwrap() = unsaved;
+}
+
+/// Tells the menu how many tabs the focused window has.
+pub fn set_tabs(tabs: usize) {
+    *TABS.lock().unwrap() = tabs;
 }
 
 pub fn take() -> Vec<Command> {

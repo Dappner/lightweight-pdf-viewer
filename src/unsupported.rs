@@ -28,6 +28,8 @@ pub mod menu {
 
     pub fn set_unsaved(_unsaved: bool) {}
 
+    pub fn set_tabs(_tabs: usize) {}
+
     pub fn take() -> Vec<Command> {
         Vec::new()
     }

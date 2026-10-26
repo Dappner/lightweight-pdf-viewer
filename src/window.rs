@@ -295,8 +295,9 @@ impl Window {
         tab
     }
 
-    /// Adds a tab from another window at `index` and makes it active.
-    pub fn adopt(&mut self, ctx: &Context, shared: &mut Shared, mut tab: Tab, index: usize) {
+    /// Adds a tab from another window at `index`. It becomes active if `activate` is set, or
+    /// if the window had no tabs; otherwise the window keeps its active tab.
+    pub fn adopt(&mut self, ctx: &Context, shared: &mut Shared, mut tab: Tab, index: usize, activate: bool) {
         let index = index.min(self.tabs.len());
         // The canvas's scroll state belongs to the old window; carry the position over.
         tab.view.pending_offset.get_or_insert(tab.view.offset);
@@ -310,7 +311,9 @@ impl Window {
             if index <= self.active {
                 self.active += 1;
             }
-            self.activate(ctx, shared, index);
+            if activate {
+                self.activate(ctx, shared, index);
+            }
         }
     }
 
@@ -531,7 +534,8 @@ impl Window {
         let Some(tab) = self.tabs.get_mut(self.active) else { return };
         let DocState::Ready(layout) = &tab.doc else { return };
         let view = &mut tab.view;
-        if view.zoom == 0.0 {
+        // The viewport is empty until the tab has been laid out once.
+        if view.zoom == 0.0 || view.viewport.width() <= 0.0 || view.viewport.height() <= 0.0 {
             return;
         }
         let zoom = match command {
@@ -566,7 +570,7 @@ impl Window {
             None => tab.rotations.turn_all(clockwise),
         }
         shared.history.set_rotations(&tab.path, &tab.rotations, history::now());
-        reopen(ctx, shared, tab, restore, self.viewport);
+        reopen(ctx, shared, tab, restore, self.viewport, true);
     }
 
     /// Writes the active tab's text boxes into its PDF, on a thread of its own as PDFKit
@@ -627,7 +631,7 @@ impl Window {
     /// Takes in finished saves: a saved tab reopens, so its pages and boxes are read from the
     /// file as it now is.
     fn check_saves(&mut self, ctx: &Context, shared: &mut Shared) {
-        for tab in &mut self.tabs {
+        for (index, tab) in self.tabs.iter_mut().enumerate() {
             let Some(Saving::Running(result)) = &tab.text_boxes.saving else { continue };
             let result = match result.try_recv() {
                 Ok(result) => result,
@@ -643,7 +647,7 @@ impl Window {
                         DocState::Ready(layout) if tab.view.zoom > 0.0 => Some(tab.view.place(layout)),
                         _ => tab.restore,
                     };
-                    reopen(ctx, shared, tab, restore, self.viewport);
+                    reopen(ctx, shared, tab, restore, self.viewport, index == self.active);
                 }
                 Err(e) => tab.text_boxes.saving = Some(Saving::Failed(e)),
             }
@@ -1136,7 +1140,16 @@ fn save_job(
     })
 }
 
-fn reopen(ctx: &Context, shared: &mut Shared, tab: &mut Tab, restore: Option<history::Place>, viewport: ViewportId) {
+/// Reopens `tab`'s file. A search is carried over; a background tab's stays idle until the tab
+/// is shown, when its pending edit starts the search.
+fn reopen(
+    ctx: &Context,
+    shared: &mut Shared,
+    tab: &mut Tab,
+    restore: Option<history::Place>,
+    viewport: ViewportId,
+    active: bool,
+) {
     shared.renderer.forget(tab.id);
     shared.cache.evict_doc(tab.id);
     shared.failed.retain(|k| k.doc() != tab.id);
@@ -1160,6 +1173,9 @@ fn reopen(ctx: &Context, shared: &mut Shared, tab: &mut Tab, restore: Option<his
         search.query = old.query.clone();
         search.focus = false;
         search.edited(ctx.input(|i| i.time));
+        if !active {
+            search.suspend();
+        }
         tab.search = Some(search);
     }
 }
