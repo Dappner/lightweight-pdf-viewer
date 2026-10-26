@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Generates src/case_folding.rs from Unicode's CaseFolding.txt (full folding: statuses C and F).
 
-    scripts/case-folding.py [CaseFolding.txt]   # downloads the latest if no file is given
+    scripts/case-folding.py [CaseFolding.txt]   # downloads Unicode 18.0.0 if no file is given
 """
 import sys
 import urllib.request
 
-URL = "https://www.unicode.org/Public/UCD/latest/ucd/CaseFolding.txt"
+URL = "https://www.unicode.org/Public/18.0.0/ucd/CaseFolding.txt"  # keep in step with src/case_folding.rs
 
 text = open(sys.argv[1]).read() if len(sys.argv) > 1 else urllib.request.urlopen(URL).read().decode()
 version = text.splitlines()[0].lstrip("# ").strip()
