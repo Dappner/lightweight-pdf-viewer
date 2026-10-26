@@ -4,6 +4,8 @@ A small, fast PDF viewer for macOS, with tabs.
 
 Open as many PDFs as you like. Tabs you aren't looking at use almost no memory or CPU.
 
+![Lightweight PDF showing NASA's Earth at Night, with two more PDFs open in tabs](docs/screenshot.jpg)
+
 ## Why
 
 Most PDF apps are heavy. This one does one thing: shows PDFs, quickly and cheaply.
