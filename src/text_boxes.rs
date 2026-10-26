@@ -352,6 +352,17 @@ struct Unsaved {
     added_highlights: BTreeMap<u32, Vec<Highlight>>,
 }
 
+/// [`Unsaved`], borrowed to be written without copying the edits.
+#[derive(Serialize)]
+struct UnsavedRef<'a> {
+    pdf: &'a Path,
+    fingerprint: Option<Fingerprint>,
+    pages: &'a BTreeMap<u32, Vec<TextBox>>,
+    added: &'a BTreeMap<u32, Vec<TextBox>>,
+    highlights: &'a BTreeMap<u32, Vec<Highlight>>,
+    added_highlights: &'a BTreeMap<u32, Vec<Highlight>>,
+}
+
 /// One page's boxes to write into the PDF.
 pub struct PageSave {
     pub page: u32,
@@ -369,6 +380,18 @@ impl PageSave {
     /// `page`'s `boxes`, leaving its highlights as they are.
     pub fn boxes(page: u32, boxes: Vec<(TextBox, Rect)>, complete: bool) -> Self {
         Self { page, boxes, complete, highlights: Vec::new(), highlights_complete: false }
+    }
+}
+
+/// How many closed tabs' saves are still running, with the condition their end signals.
+static DETACHED: (std::sync::Mutex<usize>, std::sync::Condvar) = (std::sync::Mutex::new(0), std::sync::Condvar::new());
+
+/// Waits for the saves of closed tabs (see [`TextBoxes::detach_saving`]), so quitting
+/// doesn't cut one off halfway through writing a PDF.
+pub fn wait_for_detached_saves() {
+    let mut running = DETACHED.0.lock().unwrap();
+    while *running > 0 {
+        running = DETACHED.1.wait(running).unwrap();
     }
 }
 
@@ -419,7 +442,7 @@ pub fn dir() -> Option<PathBuf> {
 impl TextBoxes {
     /// The boxes of the PDF at `pdf`, with any edits left unsaved in `dir`.
     pub fn load(pdf: &Path, dir: Option<&Path>) -> Self {
-        let store = dir.map(|d| d.join(format!("{:016x}.json", fnv(pdf.as_os_str().as_encoded_bytes()))));
+        let store = dir.map(|d| d.join(format!("{:016x}.json", crate::text::fnv(crate::text::FNV_OFFSET, pdf.as_os_str().as_encoded_bytes()))));
         let read = |s: &Path| std::fs::read(s).ok().and_then(|bytes| serde_json::from_slice::<Unsaved>(&bytes).ok());
         let mut this = Self {
             pdf: pdf.to_owned(),
@@ -442,11 +465,10 @@ impl TextBoxes {
         let mut moved_from = None;
         if unsaved.is_none()
             && let Some(dir) = dir
+            && let Some((edits, source)) = moved_here(dir, pdf, read)
         {
-            if let Some((edits, source)) = moved_here(dir, pdf, read) {
-                unsaved = Some(edits);
-                moved_from = Some(source);
-            }
+            unsaved = Some(edits);
+            moved_from = Some(source);
         }
         if let Some(unsaved) = unsaved {
             let current = Fingerprint::of(pdf);
@@ -564,8 +586,14 @@ impl TextBoxes {
         }
         let before = self.edited.get(&page).cloned();
         let file = self.file.get(&page).cloned().unwrap_or_default();
-        let boxes = self.edited.entry(page).or_insert(file);
+        let boxes = self.edited.entry(page).or_insert_with(|| file.clone());
         let result = f(boxes);
+        if *boxes == *before.as_ref().unwrap_or(&file) {
+            if before.is_none() {
+                self.edited.remove(&page);
+            }
+            return result;
+        }
         self.undo.push(Undo::Boxes(page, before));
         self.persist();
         result
@@ -578,7 +606,14 @@ impl TextBoxes {
         }
         let before = self.edited_highlights.get(&page).cloned();
         let file = self.file_highlights.get(&page).cloned().unwrap_or_default();
-        f(self.edited_highlights.entry(page).or_insert(file));
+        let highlights = self.edited_highlights.entry(page).or_insert_with(|| file.clone());
+        f(highlights);
+        if *highlights == *before.as_ref().unwrap_or(&file) {
+            if before.is_none() {
+                self.edited_highlights.remove(&page);
+            }
+            return;
+        }
         self.undo.push(Undo::Highlights(page, before));
         self.persist();
     }
@@ -822,19 +857,42 @@ impl TextBoxes {
         }
     }
 
+    /// Lets a save under way finish without waiting, as when the tab closes: the save
+    /// goes on in the background, and once the PDF has the edits the store goes, or they'd
+    /// be added again on top of the file's own. If the save fails the store stays, so the
+    /// edits are offered again when the PDF is next opened. [`wait_for_detached_saves`]
+    /// holds the quit until they're done.
+    pub fn detach_saving(&mut self) {
+        let Some(Saving::Running(result)) = self.saving.take() else { return };
+        let store = self.store.clone();
+        *DETACHED.0.lock().unwrap() += 1;
+        let spawned = std::thread::Builder::new().name("save-wait".into()).spawn(move || {
+            if let (Ok(Ok(_)), Some(store)) = (result.recv(), store) {
+                let _ = std::fs::remove_file(store);
+            }
+            *DETACHED.0.lock().unwrap() -= 1;
+            DETACHED.1.notify_all();
+        });
+        if spawned.is_err() {
+            // The edits stay in the store, but the count must not hold the quit forever.
+            *DETACHED.0.lock().unwrap() -= 1;
+            DETACHED.1.notify_all();
+        }
+    }
+
     /// Writes the unsaved edits to the store, or removes it once there are none.
     fn persist(&self) -> bool {
         let Some(store) = &self.store else { return true };
         if !self.unsaved() {
             return std::fs::remove_file(store).is_ok() || !store.exists();
         }
-        let unsaved = Unsaved {
-            pdf: self.pdf.clone(),
+        let unsaved = UnsavedRef {
+            pdf: &self.pdf,
             fingerprint: self.fingerprint,
-            pages: self.edited.clone(),
-            added: self.added.clone(),
-            highlights: self.edited_highlights.clone(),
-            added_highlights: self.added_highlights.clone(),
+            pages: &self.edited,
+            added: &self.added,
+            highlights: &self.edited_highlights,
+            added_highlights: &self.added_highlights,
         };
         serde_json::to_vec(&unsaved).is_ok_and(|json| crate::config::write_atomically(store, &json))
     }
@@ -884,11 +942,6 @@ fn moved_here(dir: &Path, pdf: &Path, read: impl Fn(&Path) -> Option<Unsaved>) -
         }
     }
     None
-}
-
-/// FNV-1a: names the file of unsaved edits, the same across launches and Rust versions.
-fn fnv(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3))
 }
 
 #[cfg(test)]
@@ -1198,7 +1251,7 @@ mod tests {
         let source_store = boxes.store.clone().unwrap();
         let renamed = dir.join("renamed.pdf");
         std::fs::rename(&original, &renamed).unwrap();
-        let target_store = dir.join(format!("{:016x}.json", fnv(renamed.as_os_str().as_encoded_bytes())));
+        let target_store = dir.join(format!("{:016x}.json", crate::text::fnv(crate::text::FNV_OFFSET, renamed.as_os_str().as_encoded_bytes())));
         std::fs::create_dir(&target_store).unwrap();
 
         assert_eq!(TextBoxes::load(&renamed, Some(&dir)).page(0).unwrap()[0].text, "Note");
